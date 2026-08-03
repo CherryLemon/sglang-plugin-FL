@@ -12,10 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-[default.extend-words]
-# Ascend CANN is Huawei's official toolkit name
-CANN = "CANN"
-cann = "cann"
-# SGLang env var uses "INBALANCE" (upstream spelling)
-INBALANCE = "INBALANCE"
-lod = "lod"
+"""Patch implementations imported by ``patch.py``."""
