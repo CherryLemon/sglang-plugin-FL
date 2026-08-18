@@ -1,6 +1,6 @@
 # Tests
 
-Platform-agnostic test suite for the sglang-plugin-FL project. All tests are designed to run on NVIDIA CUDA (and future Ascend NPU) without modification.
+Platform-agnostic test suite for the sglang-plugin-FL project. Functional tests dynamically select the active accelerator, including CUDA, MUSA, Ascend NPU, and other FlagGems-supported devices.
 
 ## Architecture Overview
 
@@ -70,7 +70,7 @@ tests/
 │       └── test_concurrent_smoke.py# N-way async generation (text/vl/mixed)
 │
 ├── functional_tests/               # Component-level GPU tests (no model files)
-│   ├── conftest.py                 # `device` fixture (cuda, skip if absent)
+│   ├── conftest.py                 # Platform-aware accelerator `device` fixture
 │   ├── ops/
 │   │   └── test_ops_correctness.py # dispatch.call_op vs reference backend
 │   ├── compilation/
@@ -634,7 +634,7 @@ def test_my_kernel(device):
 
 | Fixture              | Scope    | Source                                  | Description                                       |
 | -------------------- | -------- | --------------------------------------- | ------------------------------------------------- |
-| `device`             | session  | `tests/functional_tests/conftest.py`    | `torch.device("cuda")`, skips if CUDA unavailable |
+| `device`             | session  | `tests/functional_tests/conftest.py`    | Active FlagGems accelerator (`cuda`, `musa`, `npu`, etc.) |
 | `registry`           | function | `tests/unit_tests/dispatch/conftest.py` | Fresh `OpRegistry`                                |
 | `make_impl`          | function | `tests/unit_tests/dispatch/conftest.py` | Factory for `OpImpl` instances                    |
 | `dummy_fn`           | function | `tests/unit_tests/dispatch/conftest.py` | Simple callable for `OpImpl`                      |
