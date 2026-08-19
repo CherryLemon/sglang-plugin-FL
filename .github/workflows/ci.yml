@@ -90,7 +90,18 @@ jobs:
     secrets: inherit
 
   # ============================================================
-  # Job 6b: Moore Threads MUSA platform testing
+  # Job 6b: Ascend platform testing
+  # ============================================================
+  test-ascend:
+    needs: discover
+    if: contains(fromJson(needs.discover.outputs.platforms), 'ascend')
+    uses: ./.github/workflows/_platform_test.yml
+    with:
+      platform: ascend
+    secrets: inherit
+      
+  # ============================================================
+  # Job 6c: Moore Threads MUSA platform testing
   # ============================================================
   test-musa:
     needs: discover
