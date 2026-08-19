@@ -529,7 +529,7 @@ The plugin scans `dispatch/backends/vendor/*/register_ops.py` at startup. If `is
 
 ### Moore Threads (MUSA)
 
-#### Performance profiling with msys and mcu
+#### Performance profiling with msys
 
 The MThreads backend replaces the CUDA assumptions in SGLang v0.5.11's
 existing profiling endpoint:
@@ -569,26 +569,6 @@ profiler API even when msys accepts the marker. The plugin clears that sticky
 runtime error so it cannot poison the next TorchMUSA kernel. Treat the
 generated `.msys-rep` as the source of truth. Moore Perf System 1.8.0 was
 observed to finalize the report after the wrapped server exits.
-
-`mcu` is a launch-only, application-replay kernel profiler and cannot attach
-to a live server, so mapping it to `/start_profile` would have incorrect
-semantics. Run it against a deterministic offline workload or minimal kernel
-reproducer instead:
-
-```bash
-/data/tools/bin/mcu \
-  --devices 0 \
-  -k regex:"hot_kernel|gemm" \
-  --launch-skip 0 --launch-count 1 \
-  --sections SpeedOfLight,LaunchStats,MemoryWorkloadAnalysis \
-  -o hot-kernel.mcu-rep \
-  python examples/qwen3_6_27b_offline_inference.py
-```
-
-Use msys to identify cumulative hotspots first, then narrow mcu collection to
-one to three kernels. Full sections relaunch the whole application repeatedly,
-so inputs, launch order, and random seeds must be deterministic. Use an
-equivalent eager reproducer for workloads that normally execute under Graph.
 
 ## Project Structure
 

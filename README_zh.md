@@ -548,7 +548,7 @@ def register_builtins(registry) -> None:
 
 ### 摩尔线程（MUSA）
 
-#### 性能分析（msys / mcu）
+#### 性能分析（msys）
 
 MThreads 后端会补齐 SGLang v0.5.11 profiling 实现中的 CUDA 假设：
 
@@ -581,20 +581,6 @@ curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 `SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，避免下一次 TorchMUSA kernel 被误报为失败。以生成的 `.msys-rep` 为最终判断依据。Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
-
-`mcu` 是启动式、application-replay kernel profiler，不支持 attach 到已运行服务，因此不能实现有正确语义的 `/start_profile`。应对确定性离线脚本或最小 kernel 复现使用：
-
-```bash
-/data/tools/bin/mcu \
-  --devices 0 \
-  -k regex:"hot_kernel|gemm" \
-  --launch-skip 0 --launch-count 1 \
-  --sections SpeedOfLight,LaunchStats,MemoryWorkloadAnalysis \
-  -o hot-kernel.mcu-rep \
-  python examples/qwen3_6_27b_offline_inference.py
-```
-
-完整 section 需要多次重启整个应用。输入、kernel 顺序和随机种子必须确定；先由 msys 找到累计热点，再用 kernel filter 缩到 1–3 个候选。Graph 工作负载应准备等价 eager 复现后再交给当前版本的 mcu。
 
 ## 项目结构
 
