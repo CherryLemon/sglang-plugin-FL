@@ -322,6 +322,67 @@ SGLANG_FL_CONFIG=./my_config.yaml SGLANG_FL_PREFER=reference \
 
 ## Debugging & Diagnostics
 
+### MUSA profiling with msys and mcu
+
+On Moore Threads devices, the plugin replaces the CUDA assumptions in
+SGLang v0.5.11's existing profiling endpoint:
+
+| SGLang activity | MUSA behavior | Purpose |
+|---|---|---|
+| `GPU` or `MUSA` | `torch.profiler.ProfilerActivity.MUSA` | PyTorch/MUSA Chrome traces |
+| `MSYS` or `MUSA_PROFILER` | `musaProfilerStart/Stop` | msys capture-range control |
+| `CUDA_PROFILER` | Mapped to `musaProfilerStart/Stop` on MUSA | Backward-compatible clients |
+
+Launch the server under msys, then use SGLang's existing endpoints to delimit
+the steady-state capture:
+
+```bash
+SGLANG_PROFILE_V2=0 /data/tools/bin/msys profile \
+  --trace=musa \
+  --capture-range=musaProfilerApi \
+  --capture-range-end=stop-shutdown \
+  -o sglang.msys-rep \
+  python -m sglang.launch_server \
+    --model-path /path/to/model \
+    --port 30000 \
+    --disable-piecewise-cuda-graph
+
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"activities":["MSYS"]}'
+
+# Send the warmed-up representative request(s).
+
+curl -X POST http://127.0.0.1:30000/stop_profile
+```
+
+SGLang v0.5.11 requires `SGLANG_PROFILE_V2=0` for manual start/stop; V2 only
+supports stage-based triggering. MUSA 4.3 may return error 801 from the
+profiler API even when msys accepts the marker. The plugin clears that sticky
+runtime error so it cannot poison the next TorchMUSA kernel. Treat the
+generated `.msys-rep` as the source of truth. Moore Perf System 1.8.0 was
+observed to finalize the report after the wrapped server exits.
+
+`mcu` is a launch-only, application-replay kernel profiler and cannot attach
+to a live server, so mapping it to `/start_profile` would have incorrect
+semantics. Run it against a deterministic offline workload or minimal kernel
+reproducer instead:
+
+```bash
+/data/tools/bin/mcu \
+  --devices 0 \
+  -k regex:"hot_kernel|gemm" \
+  --launch-skip 0 --launch-count 1 \
+  --sections SpeedOfLight,LaunchStats,MemoryWorkloadAnalysis \
+  -o hot-kernel.mcu-rep \
+  python examples/qwen3_6_27b_offline_inference.py
+```
+
+Use msys to identify cumulative hotspots first, then narrow mcu collection to
+one to three kernels. Full sections relaunch the whole application repeatedly,
+so inputs, launch order, and random seeds must be deterministic. Use an
+equivalent eager reproducer for workloads that normally execute under Graph.
+
 ### Dispatch Log
 
 See which backend each fused op resolved to (written at server startup):
