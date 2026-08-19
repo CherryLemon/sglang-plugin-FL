@@ -14,7 +14,9 @@
 
 import logging
 
-import sglang_fl.profiler as musa_profiler
+from sglang_fl.dispatch.backends.vendor.mthreads.patches import (
+    profiler as musa_profiler,
+)
 
 
 class _FakeFunction:
@@ -43,7 +45,10 @@ def test_musa_profiler_api_clears_sticky_runtime_error(monkeypatch, caplog):
     monkeypatch.setattr(musa_profiler.ctypes, "CDLL", lambda _name: library)
 
     controller = musa_profiler.MusaProfilerApi()
-    with caplog.at_level(logging.WARNING, logger="sglang_fl.profiler"):
+    with caplog.at_level(
+        logging.WARNING,
+        logger="sglang_fl.dispatch.backends.vendor.mthreads.patches.profiler",
+    ):
         assert controller.start() == 801
         assert controller.stop() == 801
 

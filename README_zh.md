@@ -341,54 +341,6 @@ SGLANG_FL_CONFIG=./my_config.yaml SGLANG_FL_PREFER=reference \
 
 ## 调试与诊断
 
-### MUSA 性能分析（msys / mcu）
-
-在摩尔线程平台上，插件会补齐 SGLang v0.5.11 profiling 实现中的 CUDA 假设：
-
-| SGLang activity | MUSA 行为 | 用途 |
-|---|---|---|
-| `GPU` 或 `MUSA` | `torch.profiler.ProfilerActivity.MUSA` | 生成 PyTorch/MUSA Chrome trace |
-| `MSYS` 或 `MUSA_PROFILER` | `musaProfilerStart/Stop` | 控制 msys capture range |
-| `CUDA_PROFILER` | 在 MUSA 上兼容映射到 `musaProfilerStart/Stop` | 兼容已有 SGLang 客户端 |
-
-用 msys 包住服务进程，再通过 SGLang 原有端点控制采集窗口：
-
-```bash
-SGLANG_PROFILE_V2=0 /data/tools/bin/msys profile \
-  --trace=musa \
-  --capture-range=musaProfilerApi \
-  --capture-range-end=stop-shutdown \
-  -o sglang.msys-rep \
-  python -m sglang.launch_server \
-    --model-path /path/to/model \
-    --port 30000 \
-    --disable-piecewise-cuda-graph
-
-curl -X POST http://127.0.0.1:30000/start_profile \
-  -H 'Content-Type: application/json' \
-  -d '{"activities":["MSYS"]}'
-
-# 发送需要采集的、已经完成 warmup 的代表性请求
-
-curl -X POST http://127.0.0.1:30000/stop_profile
-```
-
-`SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，避免下一次 TorchMUSA kernel 被误报为失败。以生成的 `.msys-rep` 为最终判断依据。Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
-
-`mcu` 是启动式、application-replay kernel profiler，不支持 attach 到已运行服务，因此不能实现有正确语义的 `/start_profile`。应对确定性离线脚本或最小 kernel 复现使用：
-
-```bash
-/data/tools/bin/mcu \
-  --devices 0 \
-  -k regex:"hot_kernel|gemm" \
-  --launch-skip 0 --launch-count 1 \
-  --sections SpeedOfLight,LaunchStats,MemoryWorkloadAnalysis \
-  -o hot-kernel.mcu-rep \
-  python examples/qwen3_6_27b_offline_inference.py
-```
-
-完整 section 需要多次重启整个应用。输入、kernel 顺序和随机种子必须确定；先由 msys 找到累计热点，再用 kernel filter 缩到 1–3 个候选。Graph 工作负载应准备等价 eager 复现后再交给当前版本的 mcu。
-
 ### Dispatch 日志
 
 查看每个融合算子解析到了哪个后端（服务启动时写入）：
@@ -591,7 +543,58 @@ def register_builtins(registry) -> None:
 |------|------|---------|
 | NVIDIA CUDA | `vendor/cuda/` | `sgl_kernel` 可导入 |
 | 华为昇腾 | `vendor/ascend/` | `torch_npu` 可导入 |
+| 摩尔线程 MUSA | `vendor/mthreads/` | `torch.musa` 可用 |
 | 模板 | `vendor/template/` | 始终 False（仅供参考） |
+
+### 摩尔线程（MUSA）
+
+#### 性能分析（msys / mcu）
+
+MThreads 后端会补齐 SGLang v0.5.11 profiling 实现中的 CUDA 假设：
+
+| SGLang activity | MUSA 行为 | 用途 |
+|---|---|---|
+| `GPU` 或 `MUSA` | `torch.profiler.ProfilerActivity.MUSA` | 生成 PyTorch/MUSA Chrome trace |
+| `MSYS` 或 `MUSA_PROFILER` | `musaProfilerStart/Stop` | 控制 msys capture range |
+| `CUDA_PROFILER` | 在 MUSA 上兼容映射到 `musaProfilerStart/Stop` | 兼容已有 SGLang 客户端 |
+
+用 msys 包住服务进程，再通过 SGLang 原有端点控制采集窗口：
+
+```bash
+SGLANG_PROFILE_V2=0 /data/tools/bin/msys profile \
+  --trace=musa \
+  --capture-range=musaProfilerApi \
+  --capture-range-end=stop-shutdown \
+  -o sglang.msys-rep \
+  python -m sglang.launch_server \
+    --model-path /path/to/model \
+    --port 30000 \
+    --disable-piecewise-cuda-graph
+
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"activities":["MSYS"]}'
+
+# 发送需要采集的、已经完成 warmup 的代表性请求
+
+curl -X POST http://127.0.0.1:30000/stop_profile
+```
+
+`SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，避免下一次 TorchMUSA kernel 被误报为失败。以生成的 `.msys-rep` 为最终判断依据。Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
+
+`mcu` 是启动式、application-replay kernel profiler，不支持 attach 到已运行服务，因此不能实现有正确语义的 `/start_profile`。应对确定性离线脚本或最小 kernel 复现使用：
+
+```bash
+/data/tools/bin/mcu \
+  --devices 0 \
+  -k regex:"hot_kernel|gemm" \
+  --launch-skip 0 --launch-count 1 \
+  --sections SpeedOfLight,LaunchStats,MemoryWorkloadAnalysis \
+  -o hot-kernel.mcu-rep \
+  python examples/qwen3_6_27b_offline_inference.py
+```
+
+完整 section 需要多次重启整个应用。输入、kernel 顺序和随机种子必须确定；先由 msys 找到累计热点，再用 kernel filter 缩到 1–3 个候选。Graph 工作负载应准备等价 eager 复现后再交给当前版本的 mcu。
 
 ## 项目结构
 
@@ -601,7 +604,6 @@ sglang_fl/
 └── sglang_fl/
     ├── __init__.py                   # 插件入口：FlagGems + dispatch 初始化 + communicator hooks
     ├── platform.py                   # PlatformFL（设备标识、内存、graph capture）
-    ├── profiler.py                   # MUSA torch profiler + msys capture-range 适配
     ├── distributed/                  # 通信模块（与 vllm-plugin-FL 对齐）
     │   ├── __init__.py
     │   ├── communicator.py           # CommunicatorFL（FlagCX / torch.distributed 封装）
@@ -639,6 +641,10 @@ sglang_fl/
             └── vendor/               # VENDOR 后端（自动发现）
                 ├── ascend/           # 华为昇腾 NPU (torch_npu)
                 ├── cuda/             # NVIDIA CUDA (sgl_kernel)
+                ├── mthreads/         # 摩尔线程 MUSA
+                │   ├── patch.py      # MUSA patch 统一入口
+                │   └── patches/
+                │       └── profiler.py # TorchMUSA + msys capture-range 适配
                 └── template/         # 新厂商模板
 ```
 

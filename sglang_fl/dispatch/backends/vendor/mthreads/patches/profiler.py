@@ -23,7 +23,8 @@ implementation in v0.5.11 assumes CUDA in two places:
 TorchMUSA exposes a PrivateUse1/MUSA profiler activity and the MUSA runtime
 provides the equivalent ``musaProfilerStart``/``musaProfilerStop`` markers.
 This module patches those two implementation details without changing the
-HTTP API or SGLang core.
+HTTP API or SGLang core. It lives under the Moore Threads vendor package so
+MUSA-specific runtime dependencies do not appear to be platform-neutral APIs.
 """
 
 from __future__ import annotations
