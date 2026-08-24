@@ -49,6 +49,7 @@ _DIST_BACKEND_MAP = {
     "cambricon": "cncl",
     "mthreads": "mccl",
     "thead": "nccl",
+    "enflame": "eccl"
     "tsingmicro": "tccl",
 }
 
@@ -58,6 +59,7 @@ _ATTN_BACKEND_MAP = {
     "nvidia": "flashinfer",
     "ascend": "ascend",
     "mthreads": "fa3",
+    "enflame": "fa3"
     "kunlunxin": "kunlunxin",
     "iluvatar": "triton",
 }
@@ -304,8 +306,9 @@ class PlatformFL(SRTPlatform):
         - npu:  torch.npu.NPUGraph (via NPUGraphRunner override)
         - musa: torch_musa proxies torch.cuda.CUDAGraph, so the default
                 CudaGraphRunner works unchanged
+        - gcu:  CudaGraphRunner overrides _capture_graph
         """
-        return self._device_type in ("cuda", "npu", "musa")
+        return self._device_type in ("cuda", "npu", "musa", "gcu")
 
     def support_piecewise_cuda_graph(self) -> bool:
         return self._device_type == "cuda"
@@ -372,6 +375,14 @@ class PlatformFL(SRTPlatform):
             server_args.mm_attention_backend = "sdpa"
             server_args.disable_cuda_graph = False
         if self._vendor_name == "nvidia":
+            return
+        if self._device_type == "gcu":
+            server_args.device = "gcu"
+            server_args.attention_backend = "fa3"
+            server_args.mm_attention_backend = "fa3"
+            server_args.page_size = 64
+            server_args.watchdog_timeout = 100000
+            server_args.disable_radix_cache = True
             return
         if (
             not hasattr(server_args, "attention_backend")
