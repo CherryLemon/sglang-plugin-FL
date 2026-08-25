@@ -550,13 +550,18 @@ def register_builtins(registry) -> None:
 
 #### 性能分析（msys）
 
-MThreads 后端会补齐 SGLang v0.5.11 profiling 实现中的 CUDA 假设：
+MThreads 后端让 SGLang v0.5.11 继续管理 profiler 生命周期，只在 MUSA
+worker 中重定向两个依赖 CUDA 的末端接口：
 
 | SGLang activity | MUSA 行为 | 用途 |
 |---|---|---|
-| `GPU` 或 `MUSA` | `torch.profiler.ProfilerActivity.MUSA` | 生成 PyTorch/MUSA Chrome trace |
-| `MSYS` 或 `MUSA_PROFILER` | `musaProfilerStart/Stop` | 控制 msys capture range |
-| `CUDA_PROFILER` | 在 MUSA 上兼容映射到 `musaProfilerStart/Stop` | 兼容已有 SGLang 客户端 |
+| `GPU` | `torch.profiler.ProfilerActivity.PrivateUse1`（`MUSA`） | 生成 PyTorch/MUSA Chrome trace |
+| `CUDA_PROFILER` | `musaProfilerStart/Stop` | 控制 msys capture range |
+
+该适配严格面向 SGLang v0.5.11。`PlatformFL.init_backend` 的 MThreads 分支
+沿用 SGLang 已有的 `torch_npu` 模式，重定向 Torch activity 和 runtime
+marker API，不替换 legacy 或 profile-v2 实现；另有一个带版本保护的小型
+兼容层，为 v0.5.11 的 profiler 失败路径补充事务式清理。
 
 用 msys 包住服务进程，再通过 SGLang 原有端点控制采集窗口：
 
@@ -573,14 +578,14 @@ SGLANG_PROFILE_V2=0 /data/tools/bin/msys profile \
 
 curl -X POST http://127.0.0.1:30000/start_profile \
   -H 'Content-Type: application/json' \
-  -d '{"activities":["MSYS"]}'
+  -d '{"activities":["CUDA_PROFILER"]}'
 
 # 发送需要采集的、已经完成 warmup 的代表性请求
 
 curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
-`SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，避免下一次 TorchMUSA kernel 被误报为失败。以生成的 `.msys-rep` 为最终判断依据。Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
+`SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，并且只把 801 作为已验证的 msys 兼容情况继续执行，其他非零错误在清理后抛出。首次使用 `CUDA_PROFILER` marker 时，插件会检查当前 `libmusart.so` 的必需符号；marker 报错时，如果接口可用，诊断信息会包含 runtime 版本。该路径已在 MUSA Runtime 4.3.x、Torch/TorchMUSA 2.9.0 和 Moore Perf System 1.8.0 上验证。以生成的 `.msys-rep` 为最终判断依据；Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
 
 ## 项目结构
 
@@ -630,7 +635,8 @@ sglang_fl/
                 ├── mthreads/         # 摩尔线程 MUSA
                 │   ├── patch.py      # MUSA patch 统一入口
                 │   └── patches/
-                │       └── profiler.py # TorchMUSA + msys capture-range 适配
+                │       ├── profiler.py # TorchMUSA + msys API 重定向
+                │       └── sglang_0_5_11_profiler_lifecycle.py # 失败回滚兼容层
                 └── template/         # 新厂商模板
 ```
 

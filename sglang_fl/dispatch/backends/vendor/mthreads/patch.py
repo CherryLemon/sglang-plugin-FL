@@ -18,7 +18,6 @@ import logging
 from functools import wraps
 
 from .patches.moe_schedule import apply_musa_moe_schedule_patch
-from .patches.profiler import apply_musa_profiler_patches
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +116,6 @@ def apply_musa_patches() -> None:
     _patch_pp_launch_batch_add_sync()
 
     apply_musa_moe_schedule_patch()
-    apply_musa_profiler_patches()
     _patches_applied = True
     logger.info("All MUSA runtime patches applied successfully")
 
