@@ -18,6 +18,8 @@ import logging
 from functools import wraps
 
 from .patches.moe_schedule import apply_musa_moe_schedule_patch
+from .patches.mrope_positions import apply_musa_mrope_device_positions_patch
+
 logger = logging.getLogger(__name__)
 
 _patches_applied = False
@@ -114,8 +116,9 @@ def apply_musa_patches() -> None:
     _patch_pp_send_recv_order()
     _patch_pp_launch_batch_add_sync()
     apply_musa_moe_schedule_patch()
+    apply_musa_mrope_device_positions_patch()
     _patches_applied = True
-    logger.info("All MUSA PP patches applied successfully")
+    logger.info("All MUSA runtime patches applied successfully")
 
 
 apply_musa_patches()
