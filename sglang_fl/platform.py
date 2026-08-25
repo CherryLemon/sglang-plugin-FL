@@ -49,7 +49,7 @@ _DIST_BACKEND_MAP = {
     "cambricon": "cncl",
     "mthreads": "mccl",
     "thead": "nccl",
-    "enflame": "eccl"
+    "enflame": "eccl",
     "tsingmicro": "tccl",
 }
 
@@ -59,7 +59,7 @@ _ATTN_BACKEND_MAP = {
     "nvidia": "flashinfer",
     "ascend": "ascend",
     "mthreads": "fa3",
-    "enflame": "fa3"
+    "enflame": "fa3",
     "kunlunxin": "kunlunxin",
     "iluvatar": "triton",
 }
