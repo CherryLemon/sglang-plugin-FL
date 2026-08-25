@@ -33,6 +33,15 @@ def test_target_shape_requires_measured_dimensions():
     weights = _tensor_shape(64, 8)
     assert topk_schedule._is_target_shape(weights, _tensor_shape(64, 256), 0, None)
     assert not topk_schedule._is_target_shape(weights, _tensor_shape(65, 256), 0, None)
+    assert topk_schedule._is_target_shape(
+        _tensor_shape(4095, 8), _tensor_shape(4095, 256), 0, None
+    )
+    assert topk_schedule._is_target_shape(
+        _tensor_shape(15360, 8), _tensor_shape(15360, 256), 0, None
+    )
+    assert not topk_schedule._is_target_shape(
+        _tensor_shape(16385, 8), _tensor_shape(16385, 256), 0, None
+    )
     assert not topk_schedule._is_target_shape(weights, _tensor_shape(64, 128), 0, None)
     assert not topk_schedule._is_target_shape(
         _tensor_shape(64, 4), _tensor_shape(64, 256), 0, None
