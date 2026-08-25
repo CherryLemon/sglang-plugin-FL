@@ -17,8 +17,6 @@ from __future__ import annotations
 import logging
 from functools import wraps
 
-from .patches.profiler import apply_musa_profiler_patches
-
 logger = logging.getLogger(__name__)
 
 _patches_applied = False
@@ -115,7 +113,6 @@ def apply_musa_patches() -> None:
     _patch_pp_send_recv_order()
     _patch_pp_launch_batch_add_sync()
 
-    apply_musa_profiler_patches()
     _patches_applied = True
     logger.info("All MUSA runtime patches applied successfully")
 
