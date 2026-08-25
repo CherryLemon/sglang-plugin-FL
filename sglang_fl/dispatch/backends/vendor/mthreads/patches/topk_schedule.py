@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 _ENV_NAME = "SGLANG_MUSA_TOPK_SCHEDULE"
 _PATCH_MARKER = "_sglang_fl_musa_topk_schedule"
-_TARGET_TOKEN_COUNTS = frozenset(
+_TARGET_GRAPH_TOKEN_COUNTS = frozenset(
     {
         # CUDA-graph capture batches.
         1,
@@ -49,12 +49,9 @@ _TARGET_TOKEN_COUNTS = frozenset(
         48,
         56,
         64,
-        # Chunked-prefill shapes observed with 1K-token prompts.
-        1024,
-        7168,
-        8192,
     }
 )
+_TARGET_PREFILL_TOKEN_RANGE = range(1024, 16385)
 
 
 def _enabled() -> bool:
@@ -89,9 +86,13 @@ def _is_target_shape(
     correction_bias: Any,
 ) -> bool:
     try:
+        num_tokens = int(gating_output.shape[0])
         return (
             gating_output.ndim == 2
-            and int(gating_output.shape[0]) in _TARGET_TOKEN_COUNTS
+            and (
+                num_tokens in _TARGET_GRAPH_TOKEN_COUNTS
+                or num_tokens in _TARGET_PREFILL_TOKEN_RANGE
+            )
             and int(gating_output.shape[1]) == 256
             and int(topk_weights.shape[-1]) == 8
             and not moe_softcapping
@@ -176,7 +177,7 @@ def apply_musa_topk_schedule_patch() -> bool:
     # This alias may already have been imported before vendor patches run.
     layer_topk.topk_softmax = wrapped
     logger.info(
-        "MUSA S5000 softmax TopK schedule enabled for E=256, K=8 measured shapes: "
-        "warps=1, stages=1"
+        "MUSA S5000 softmax TopK schedule enabled for E=256, K=8 graph shapes "
+        "and 1K-16K prefill: warps=1, stages=1"
     )
     return True
