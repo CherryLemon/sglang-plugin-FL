@@ -20,6 +20,7 @@ from functools import wraps
 from .patches.custom_allreduce_rmsnorm import (
     apply_musa_custom_allreduce_rmsnorm_patch,
 )
+from .patches.eventfd_completion import apply_musa_eventfd_completion_patch
 from .patches.gdn import apply_musa_gdn_launch_patch
 from .patches.moe_schedule import apply_musa_moe_schedule_patch
 from .patches.mrope_positions import apply_musa_mrope_device_positions_patch
@@ -122,6 +123,7 @@ def apply_musa_patches() -> None:
     _patch_pp_launch_batch_add_sync()
     apply_musa_gdn_launch_patch()
     apply_musa_custom_allreduce_rmsnorm_patch()
+    apply_musa_eventfd_completion_patch()
     apply_musa_moe_schedule_patch()
     apply_musa_mrope_device_positions_patch()
     apply_musa_topk_schedule_patch()
