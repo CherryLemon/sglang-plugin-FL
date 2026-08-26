@@ -17,6 +17,9 @@ from __future__ import annotations
 import logging
 from functools import wraps
 
+from .patches.custom_allreduce_rmsnorm import (
+    apply_musa_custom_allreduce_rmsnorm_patch,
+)
 from .patches.moe_schedule import apply_musa_moe_schedule_patch
 from .patches.mrope_positions import apply_musa_mrope_device_positions_patch
 from .patches.topk_schedule import apply_musa_topk_schedule_patch
@@ -116,6 +119,7 @@ def apply_musa_patches() -> None:
 
     _patch_pp_send_recv_order()
     _patch_pp_launch_batch_add_sync()
+    apply_musa_custom_allreduce_rmsnorm_patch()
     apply_musa_moe_schedule_patch()
     apply_musa_mrope_device_positions_patch()
     apply_musa_topk_schedule_patch()
