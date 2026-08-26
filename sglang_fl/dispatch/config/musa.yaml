@@ -25,3 +25,7 @@ flagos_blacklist:
   - _unique2
   - unique_dim
   - unique_consecutive
+  # On MTT S5000, FlagGems' rank-specialized pointwise copy kernels dominate
+  # long-prefill traces.  The native MUSA path is faster after its one-time
+  # shape specialization and also improves the graph-captured decode path.
+  - copy_

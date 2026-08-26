@@ -312,3 +312,12 @@ def test_build_config_env_flagos_blacklist_overrides_yaml(
     config = sglang_fl_module._build_config()
 
     assert config["flagos_blacklist"] == ["env_op", "other_op"]
+
+
+def test_musa_platform_uses_native_copy() -> None:
+    from sglang_fl.dispatch.config.utils import load_platform_config
+
+    config = load_platform_config("musa")
+
+    assert config is not None
+    assert "copy_" in config["flagos_blacklist"]
