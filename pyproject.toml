@@ -44,6 +44,9 @@ include = ["sglang_fl*"]
     "csrc/distributed/*.cpp",
     "csrc/norm/*.mu",
 ]
+"sglang_fl.dispatch.backends.vendor.mthreads.eventfd_completion" = [
+    "csrc/*.cpp",
+]
 
 [tool.ruff]
 # Folders excluded from lint + format. These hold pre-existing issues that are
