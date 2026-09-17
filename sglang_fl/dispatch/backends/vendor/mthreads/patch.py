@@ -252,6 +252,23 @@ def apply_musa_patches() -> None:
     _patch_pp_launch_batch_add_sync()
     _patch_multimodal_mask()
     _patch_fp32_tp_all_reduce()
+    # R2 retained integration; keep current upstream correctness patches above.
+    from .patches.custom_allreduce_rmsnorm import apply_musa_custom_allreduce_rmsnorm_patch
+
+    apply_musa_custom_allreduce_rmsnorm_patch()
+    from .patches.eventfd_completion import apply_musa_eventfd_completion_patch
+    from .patches.fmha_schedule import apply_musa_fmha_schedule_patch
+    from .patches.moe_schedule import apply_musa_moe_schedule_patch
+    from .patches.moe_combine import apply_musa_deterministic_moe_combine_patch
+    from .patches.mrope_positions import apply_musa_mrope_device_positions_patch
+    from .patches.topk_schedule import apply_musa_topk_schedule_patch
+
+    apply_musa_eventfd_completion_patch()
+    apply_musa_fmha_schedule_patch()
+    apply_musa_moe_schedule_patch()
+    apply_musa_deterministic_moe_combine_patch()
+    apply_musa_mrope_device_positions_patch()
+    apply_musa_topk_schedule_patch()
     _patches_applied = True
     logger.info("All MUSA PP patches applied successfully")
 
