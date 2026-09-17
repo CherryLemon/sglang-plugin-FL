@@ -196,6 +196,8 @@ def test_constructor_and_qwen_patch_are_idempotent(monkeypatch):
 
 def test_real_qwen_class_constructor_marker_without_self_config(monkeypatch):
     qwen_module = pytest.importorskip("sglang.srt.models.qwen2_moe")
+    if not hasattr(qwen_module, "get_tensor_model_parallel_world_size"):
+        pytest.skip("constructor integration requires the pinned MUSA SGLang 0.5.11 API")
     cls = qwen_module.Qwen2MoeSparseMoeBlock
 
     class FakeTopK:

@@ -24,4 +24,9 @@ def fused_moe_musa(
     layer: torch.nn.Module,
     dispatch_output,
 ):
+    from ..moe.dispatch import maybe_forward
+
+    candidate = maybe_forward(obj, layer, dispatch_output)
+    if candidate is not None:
+        return candidate
     return obj.forward_musa(layer, dispatch_output)
