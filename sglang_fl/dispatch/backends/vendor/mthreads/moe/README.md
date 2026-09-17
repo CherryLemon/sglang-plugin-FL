@@ -1,7 +1,10 @@
 # Qwen3.6 MUSA plugin-side integration
 
-Status: **offline-tested candidate; GPU correctness, dispatch, memory and
-performance revalidation are still required.** Historical service throughput
+Status: fixed-work GPU relocation and replay-refresh gates pass on the pinned
+image. **Full-service C4 generated-token parity has not passed:** repeated
+requests also diverge within the retained reference service, so this is not
+an established migration-specific regression, nor evidence of equivalence.
+Final-image performance acceptance is separate. Historical service throughput
 must not be attributed to this source layout before that validation.
 
 ## Baseline and ownership
@@ -68,7 +71,65 @@ Triton 3.2. No T3.2 compatibility overlay is part of this release candidate.
 The service also depends on the separately pinned MATE compatibility package;
 moving the MoE code does not replace or remove that dependency.
 
+Validated base image (not the final release image):
+
+```text
+harbor.baai.ac.cn/flagos-inner-models-release/flagrelease-bash-mthreads-tree_0.6.1_mthreads3.6-gems_5.3.0rc2-sgl_0.5.11-plugin_0.1.0-cx_0.13.0-python_3.10.12-torch_2.9.0-pcp_musa4.3.5-driver_3.3.5_server:202608182028
+Repo digest: sha256:9b9c082f9af577de9156414869ce93ed3a06dedf7bcf63e0dfed6be14560a339
+Image ID: sha256:871ac919ba253a0d750f52d613804963133612d63c7c8db139ef2b2c46884ae3
+```
+
+The tested interpreter provides TorchMUSA `2.9.0+ea1ca8d`; the image's system
+Python is not interchangeable with that environment. The MATE compatibility
+source mapping digest is
+`3e9670b579dd911d0967bfe07bd762e99554da35bfb5b11ab299016682de1387`.
+The immutable final image must carry both the plugin and that dependency;
+installing this wheel alone into an arbitrary runtime is not the validated
+service contract.
+
 ## Required validation before release
+
+Validated code snapshot: `b6995b4d72df142291fe00537055a55ab9f1a3bd`.
+
+- Local full platform suite: 200 passed, one pinned-image API check skipped;
+  nine subtests passed. On the pinned image the MUSA subset passes all 189
+  tests, including that API check, plus nine subtests.
+- All 12 production decode graph buckets (1, 2, 4, 8, 12, 16, 24, 32, 40,
+  48, 56, 64) and eager M2047/2048/2049/8192/16384: fixed synthetic A/W/routes
+  produce bitwise-identical BF16 outputs against the captured core-overlay
+  reference. Each decode graph refreshes A, expert IDs and routing weights
+  through fixed-address buffers (phase 0/1/0); all outputs match eager and the
+  other arm. Ten deterministic repeats per case pass.
+- The 512 MiB M16K scratch is pointer-stable and actually reused.
+- Shared gate-tail: 11 input cases, including zero, NaN and Inf, pass the
+  materialized MUSA oracle at logits/probability/output BF16 boundaries,
+  graph refresh, ten repeats and output sentinels. NaN/Inf masks are checked
+  separately from finite bitwise values. Both source layouts agree exactly.
+- Installed-wheel hook/import checks pass; all eight existing baseline core
+  files retain their hashes, and the extra shared helper is absent from core.
+
+These are source-relocation correctness results, not a formal model accuracy
+score, full-service route-equivalence claim or sanitizer/performance result.
+
+Full-model startup with the installed plugin and baseline image core passes
+at mem-fraction 0.970: both ranks reserve scratch before KV sizing and capture
+all 12 graph buckets. Initial C1 1024/32 requests match the retained service's
+generated tokens and output logprobs exactly. C4 1024/32 does not meet the
+generated-token parity or repeated-call determinism gate. Three subsequent
+interleaved runs per service reproduce reference self-drift as well as
+candidate self-drift; request IDs confirm output ordering. First-token
+logprobs already vary, so the mismatch cannot be assigned solely to the
+M4 decode gate-tail. The reference uses 0.965 on another card pair; these
+are functional checks, not a single-variable full-model causal experiment.
+Keep the failed records and leave formal accuracy/release acceptance open.
+
+Sanitized comparison records are identified by SHA256:
+
+```text
+initial MoE cases: a56bcdf808be54abcd18eb8967085c5af73b6c9ebcd64b354ed1004bdf0a0ed5
+remaining buckets: 286d35439bc68f1eefc4be9c12ff1f5313cb5c3d2e797cdabdfdc36fd60f4060
+shared gate: 8571424fdd2aa37748b2eac4051b7fbf1aa241988e31ac8511695bc6cb28b466
+```
 
 Run the platform unit tests; then on the pinned image verify installation and
 actual hook/dispatch hits, immutable baseline core hashes, loaded-weight and

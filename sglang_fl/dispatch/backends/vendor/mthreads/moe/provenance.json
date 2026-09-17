@@ -2,7 +2,7 @@
   "schema": "musa_plugin_relocation_v1",
   "source_core_commit": "612785ffdcaf35552f1ed433a981d596ca9fe900",
   "source_kind": "vendor image plus validated Qwen3.6 campaign delta",
-  "validation_status": "offline_only_pending_gpu_revalidation",
+  "validation_status": "fixed_work_gpu_relocation_pass_final_image_acceptance_pending",
   "files": {
     "fused_moe.py": {
       "source_path": "sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py",

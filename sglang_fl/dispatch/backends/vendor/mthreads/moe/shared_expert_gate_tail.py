@@ -1,10 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental MUSA shared-expert gate-tail fusion.
+"""Opt-in MUSA shared-expert gate-tail fusion.
 
-This module is deliberately not wired into the Qwen model path.  It is a
-default-off candidate for the small, bias-free shared-expert gate used by the
+The plugin's guarded shared-expert hook integrates this default-off kernel
+for the small, bias-free shared-expert gate used by the
 Qwen3.6 product shape (M=4, H=2048):
 
     F.linear(hidden, gate_weight)
@@ -21,7 +21,7 @@ sigmoid+multiply-only candidate) rather than relax a bitwise comparator.
 The implementation intentionally avoids allocations, host synchronization,
 or host-side scalar extraction on the candidate path.  A caller that is in a
 graph capture must provide a pointer-stable ``out`` buffer.  There is no model
-call-site integration in this file.  Correctness-only callers may provide
+call-site integration in this file itself.  Correctness-only callers may provide
 preallocated ``gate_logits_out`` and ``gate_prob_out`` buffers; ordinary
 production calls leave both unset, so no debug stores are emitted.
 """
