@@ -47,6 +47,22 @@ class _FakeTensor:
         self.recorded_streams.append(stream)
 
 
+@pytest.fixture(autouse=True)
+def _accept_fake_contract_tensors(monkeypatch):
+    """The entry guard checks ``torch.Tensor``; these unit tests use fakes.
+
+    Only ``_FakeTensor`` is widened.  Plain non-tensor objects still hit the
+    real ``isinstance`` check, so the rejection path stays testable.
+    """
+
+    real_is_tensor = moe_combine._is_tensor
+
+    def is_tensor(value):
+        return real_is_tensor(value) or isinstance(value, _FakeTensor)
+
+    monkeypatch.setattr(moe_combine, "_is_tensor", is_tensor)
+
+
 class _FakeStream:
     def __init__(self, name):
         self.name = name
@@ -436,6 +452,40 @@ def test_env_off_forces_combine_fallback(monkeypatch):
     assert result == "baseline"
     assert not launch_calls
     assert not context.used
+
+
+def test_non_tensor_reduction_inputs_keep_original_path(monkeypatch):
+    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
+    monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
+    context, _ = _context()
+    original_calls = []
+
+    def original(*args, **kwargs):
+        original_calls.append((args, kwargs))
+        return "baseline"
+
+    wrapped = moe_combine._wrap_moe_sum_reduce(original)
+    token = moe_combine._ACTIVE_CONTEXT.set(context)
+    try:
+        # Objects with no tensor attributes must not raise from the contract
+        # read that sits outside the launch guard.
+        result = wrapped(SimpleNamespace(), SimpleNamespace(), 1.0)
+    finally:
+        moe_combine._ACTIVE_CONTEXT.reset(token)
+
+    assert result == "baseline"
+    assert original_calls
+    assert not context.used
+
+
+def test_non_tensor_hidden_states_do_not_enter_optimization(monkeypatch):
+    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
+    monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
+    block, _ = _fake_block()
+
+    assert not moe_combine._model_contract_matches(
+        _fake_qwen_module(), block, SimpleNamespace(), None
+    )
 
 
 def test_shape_and_layout_mismatch_falls_back(monkeypatch):

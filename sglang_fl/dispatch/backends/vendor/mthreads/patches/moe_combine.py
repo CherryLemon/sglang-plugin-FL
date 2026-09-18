@@ -356,7 +356,19 @@ def _same_device(*tensors: Any) -> bool:
     return bool(devices) and all(device == devices[0] for device in devices[1:])
 
 
-def _shape(tensor: Any) -> tuple[int, ...]:
+def _is_tensor(value: Any) -> bool:
+    """Single entry object-category check before direct tensor attribute reads.
+
+    The contract paths read ``shape``/``dtype``/``device``/``is_contiguous``
+    directly.  Non-tensor inputs are rejected here and keep the original path,
+    instead of raising from an attribute read that sits outside the launch
+    guard.
+    """
+
+    return isinstance(value, torch.Tensor)
+
+
+def _shape(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(dim) for dim in tensor.shape)
 
 
@@ -371,6 +383,13 @@ def _contract_matches(
     if not _enabled() or _CANDIDATE_DISABLED:
         return False
     if context.decode_graph_dual_stream and _DECODE_GRAPH_CANDIDATE_DISABLED:
+        return False
+    if not (
+        _is_tensor(routed)
+        and _is_tensor(output)
+        and _is_tensor(context.shared_unweighted)
+        and _is_tensor(context.gate_logits)
+    ):
         return False
     routed_shape = _shape(routed)
     output_shape = _shape(output)
@@ -678,6 +697,8 @@ def _model_contract_matches(
     # ``should_allreduce_fusion`` is supported: the candidate preserves the
     # in-place destination and lets the downstream custom-AR owner retain it.
     if use_reduce_scatter:
+        return False
+    if not _is_tensor(hidden_states):
         return False
     # Qwen3.5/3.6 constructs ``alt_stream`` on MUSA even for eager execution.
     # The framework only consumes it in the capture-mode branch, which is

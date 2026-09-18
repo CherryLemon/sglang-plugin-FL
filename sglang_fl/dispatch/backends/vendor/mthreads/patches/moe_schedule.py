@@ -186,11 +186,13 @@ def _select_musa_moe_schedule(
     is_marlin,
     block_shape,
     per_channel_quant,
-) -> tuple[dict | None, bool]:
+) -> tuple[dict | None, dict, bool]:
     """Shared contract, then one explicit branch per measured schedule.
 
-    Returns ``(config, baseline_down)`` or ``(None, False)`` when no branch
-    matches and the original resolver must be used.
+    Each branch returns ``(base_config, additions, baseline_down)`` where
+    ``additions`` holds only its own options.  The caller copies ``base_config``
+    and applies ``additions``, so branches never mutate or leak `module-level
+    constants.  No branch matches -> ``(None, {}, False)``.
     """
 
     global _decode_match_logged, _prefill_match_logged, _prefill_m16k_match_logged
@@ -203,7 +205,7 @@ def _select_musa_moe_schedule(
         block_shape=block_shape,
         per_channel_quant=per_channel_quant,
     ):
-        return None, False
+        return None, {}, False
 
     if (
         os.environ.get(_R2_M4_BASELINE_ENV, "0") == "1"
@@ -220,12 +222,10 @@ def _select_musa_moe_schedule(
             _r2_m4_match_logged = True
         # R2 baseline has no independent down schedule. The core uses the
         # unchanged baseline config for W2, and copies W13 for BN64.
-        return dict(_R2_M4_BASELINE_CONFIG), True
+        return _R2_M4_BASELINE_CONFIG, {}, True
     if _enabled() and _on_s5000() and w2_shape[2] in (256, 512) and M == 64:
         backend_opt = w2_shape[2] == 256 and _backend_opt_enabled()
-        config = dict(_S5000_DECODE_CONFIG)
-        if backend_opt:
-            config["enable_backend_opt"] = True
+        additions = {"enable_backend_opt": True} if backend_opt else {}
         if not _decode_match_logged:
             logger.info(
                 "MUSA S5000 MoE decode schedule selected for "
@@ -237,9 +237,8 @@ def _select_musa_moe_schedule(
                 backend_opt,
             )
             _decode_match_logged = True
-        return config, False
+        return _S5000_DECODE_CONFIG, additions, False
     if _prefill_enabled() and _on_s5000() and w2_shape[2] == 256 and 2048 <= M <= 8192:
-        config = dict(_S5000_PREFILL_CONFIG)
         if not _prefill_match_logged:
             logger.info(
                 "MUSA S5000 MoE prefill schedule selected for "
@@ -250,9 +249,8 @@ def _select_musa_moe_schedule(
                 M,
             )
             _prefill_match_logged = True
-        return config, False
+        return _S5000_PREFILL_CONFIG, {}, False
     if _prefill_enabled() and _on_s5000() and w2_shape[2] == 256 and M == 16384:
-        config = dict(_S5000_PREFILL_M16K_CONFIG)
         if not _prefill_m16k_match_logged:
             logger.info(
                 "MUSA S5000 MoE exact M=16384 prefill schedule selected for "
@@ -262,15 +260,20 @@ def _select_musa_moe_schedule(
                 top_k,
             )
             _prefill_m16k_match_logged = True
-        return config, False
-    return None, False
+        return _S5000_PREFILL_M16K_CONFIG, {}, False
+    return None, {}, False
 
 
 def _schedule_result(
-    config: dict, baseline_down: bool, return_down_config: bool
+    base_config: dict,
+    additions: dict,
+    baseline_down: bool,
+    return_down_config: bool,
 ):
-    """Copy the selected config and build the caller's return shape."""
+    """Copy the selected module config and build the caller's return shape."""
 
+    config = dict(base_config)
+    config.update(additions)
     if not return_down_config:
         return config
     if baseline_down:
@@ -296,7 +299,7 @@ def _wrap_try_get_optimal_moe_config(original: Callable[..., Any]):
         per_channel_quant=False,
         return_down_config=False,
     ):
-        config, baseline_down = _select_musa_moe_schedule(
+        base_config, additions, baseline_down = _select_musa_moe_schedule(
             w1_shape,
             w2_shape,
             top_k,
@@ -306,7 +309,7 @@ def _wrap_try_get_optimal_moe_config(original: Callable[..., Any]):
             block_shape,
             per_channel_quant,
         )
-        if config is None:
+        if base_config is None:
             return original(
                 w1_shape,
                 w2_shape,
@@ -318,7 +321,9 @@ def _wrap_try_get_optimal_moe_config(original: Callable[..., Any]):
                 per_channel_quant=per_channel_quant,
                 return_down_config=return_down_config,
             )
-        return _schedule_result(config, baseline_down, return_down_config)
+        return _schedule_result(
+            base_config, additions, baseline_down, return_down_config
+        )
 
     setattr(wrapped, _PATCH_MARKER, True)
     return wrapped

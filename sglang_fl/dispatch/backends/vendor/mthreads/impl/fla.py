@@ -95,26 +95,25 @@ def _load_mate_gdn_api(key: str, spec: _MateLoaderSpec) -> Optional[Callable]:
     _MATE_GDN_CACHE[key] = None
     try:
         module = importlib.import_module(spec.module)
-    except (ImportError, OSError):
+        # Only the symbol lookup treats a missing attribute as "module
+        # present, function absent"; a module-init AttributeError still
+        # propagates as an unknown failure.
+        try:
+            function = getattr(module, spec.symbol)
+        except AttributeError:
+            logger.warning(
+                "MATE GDN %s module has no %s; using SGLang fallback",
+                spec.label,
+                spec.symbol,
+            )
+            return None
+        parameters = set(inspect.signature(function).parameters)
+    except (ImportError, OSError, TypeError, ValueError):
+        # The original loader treated these four exception classes as
+        # "MATE unavailable" across the whole load preparation, including a
+        # module initializer raising TypeError/ValueError.
         logger.info(
             "Compatible MATE GDN %s is unavailable; using SGLang fallback",
-            spec.label,
-        )
-        return None
-    try:
-        function = getattr(module, spec.symbol)
-    except AttributeError:
-        logger.warning(
-            "MATE GDN %s module has no %s; using SGLang fallback",
-            spec.label,
-            spec.symbol,
-        )
-        return None
-    try:
-        parameters = set(inspect.signature(function).parameters)
-    except (TypeError, ValueError):
-        logger.warning(
-            "MATE GDN %s signature is unreadable; using SGLang fallback",
             spec.label,
         )
         return None

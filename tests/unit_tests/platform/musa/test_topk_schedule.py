@@ -357,12 +357,18 @@ def _install_fake_triton(monkeypatch):
     from types import ModuleType
 
     class Config:
-        def __init__(self, all_kwargs):
-            self._all_kwargs = all_kwargs
+        def __init__(self, all_kwargs=None):
+            self._all_kwargs = dict(all_kwargs or topk_schedule._PINNED_OPTION_KWARGS)
             self.pre_hook = None
 
         def all_kwargs(self):
             return dict(self._all_kwargs)
+
+    class JITFunction:
+        arg_names = list(topk_schedule._EXPECTED_JIT_ARG_NAMES)
+
+        def run(self, *args, grid, warmup, **kwargs):
+            return None
 
     class Autotuner:
         def __init__(self):
@@ -370,10 +376,8 @@ def _install_fake_triton(monkeypatch):
             self.restore_value = []
             self.user_defined_pre_hook = False
             self.user_defined_post_hook = False
-            self.fn = None
-
-    class JITFunction:
-        pass
+            self.arg_names = list(topk_schedule._EXPECTED_JIT_ARG_NAMES)
+            self.fn = JITFunction()
 
     root = ModuleType("triton")
     runtime = ModuleType("triton.runtime")
@@ -398,27 +402,29 @@ def _install_fake_triton(monkeypatch):
 def test_verify_pinned_startup_rejects_standard_type_subclasses(monkeypatch):
     Config, Autotuner, JITFunction = _install_fake_triton(monkeypatch)
 
+    valid_config = Config()
+    valid_kernel = Autotuner()
+    # Baseline: with every contract valid, the standard types are accepted.
+    assert topk_schedule._verify_pinned_startup(valid_kernel, valid_config) is not None
+
     class ConfigSubclass(Config):
         pass
 
-    valid_config = Config(dict(topk_schedule._PINNED_OPTION_KWARGS))
-    assert (
-        topk_schedule._verify_pinned_startup(Autotuner(), ConfigSubclass({}))
-        is None
-    )
+    # Each case changes only the object identity; all other checks stay valid.
+    assert topk_schedule._verify_pinned_startup(
+        valid_kernel, ConfigSubclass()
+    ) is None
 
     class AutotunerSubclass(Autotuner):
         pass
 
-    assert (
-        topk_schedule._verify_pinned_startup(AutotunerSubclass(), valid_config)
-        is None
-    )
-
-    kernel = Autotuner()
+    assert topk_schedule._verify_pinned_startup(
+        AutotunerSubclass(), valid_config
+    ) is None
 
     class JITFunctionSubclass(JITFunction):
         pass
 
+    kernel = Autotuner()
     kernel.fn = JITFunctionSubclass()
     assert topk_schedule._verify_pinned_startup(kernel, valid_config) is None

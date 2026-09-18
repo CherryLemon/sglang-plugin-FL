@@ -53,12 +53,13 @@ def test_successful_load_is_cached(monkeypatch):
     assert fla._MATE_GDN_CACHE["decode"] is api
 
 
-def test_known_import_failure_is_not_retried(monkeypatch):
+@pytest.mark.parametrize("exc_type", [ImportError, OSError, TypeError, ValueError])
+def test_known_load_failure_is_not_retried(monkeypatch, exc_type):
     calls = []
 
     def fake_import(name):
         calls.append(name)
-        raise ImportError("no mate")
+        raise exc_type("known failure")
 
     _patch_import(monkeypatch, fake_import)
 
@@ -66,6 +67,20 @@ def test_known_import_failure_is_not_retried(monkeypatch):
     assert fla._load_mate_gdn_decode() is None
     assert calls == ["mate.gdn_decode"]
     assert "decode" in fla._MATE_GDN_CACHE
+    assert fla._MATE_GDN_CACHE["decode"] is None
+
+
+def test_unreadable_signature_is_unavailable(monkeypatch):
+    api = _make_api(fla._MATE_GDN_REQUIRED_PARAMETERS)
+    _patch_import(
+        monkeypatch,
+        lambda name: SimpleNamespace(gated_delta_rule_decode=api),
+    )
+    monkeypatch.setattr(
+        fla.inspect, "signature", lambda fn: (_ for _ in ()).throw(ValueError("bad"))
+    )
+
+    assert fla._load_mate_gdn_decode() is None
     assert fla._MATE_GDN_CACHE["decode"] is None
 
 

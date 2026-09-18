@@ -215,6 +215,8 @@ def test_backend_opt_stays_on_the_decode_256_config_copy(monkeypatch):
 
     decode = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 64)
     assert decode["enable_backend_opt"] is True
+    # Every branch returns a fresh copy of the module constant.
+    assert decode is not moe_schedule._S5000_DECODE_CONFIG
     # Module-level constants must never be mutated by a call.
     assert "enable_backend_opt" not in moe_schedule._S5000_DECODE_CONFIG
     assert "enable_backend_opt" not in moe_schedule._S5000_PREFILL_CONFIG
