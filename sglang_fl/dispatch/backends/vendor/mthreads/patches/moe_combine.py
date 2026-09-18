@@ -14,27 +14,31 @@
 
 """Shape-gated deterministic Qwen3.6 shared-expert combine for MUSA.
 
-The standalone screen showed that the three-kernel combine chain can be
-replaced by one ordered-FP32/no-atomic Triton kernel for the S5000 Qwen3.6
-TP2 contract.  This module keeps the product worktree untouched: it swaps the
-already-imported ``moe_sum_reduce`` symbol in SGLang's fused-MoE module and
-wraps the Qwen2Moe block that is reused by Qwen3.5/3.6.
+This module keeps the product worktree untouched: it swaps the already-imported
+``moe_sum_reduce`` symbol in SGLang's fused-MoE module and wraps the Qwen2Moe
+block that is reused by Qwen3.5/3.6.
 
 The model wrapper computes the shared expert *without* its sigmoid gate and
 places both tensors in a short-lived ContextVar.  The combine wrapper consumes
 that context only when the actual routed down-output and destination satisfy
-the measured contract.  Any miss or kernel exception delegates to the
-original routed reduction and the model wrapper performs the original
-sigmoid-weighted in-place add, so a shared expert can never be dropped.
+the measured contract.  Any miss or kernel exception delegates to the original
+routed reduction and the model wrapper performs the original sigmoid-weighted
+in-place add, so a shared expert can never be dropped.  The launch writes the
+complete TP-local output and preserves the caller's in-place destination and
+stream/event semantics.
 
 For exact decode-graph buckets M=40/M=64, an independent opt-in preserves
 Qwen's existing two-stream overlap.  The shared branch remains on the graph's
 primary stream and routed experts remain on ``alt_stream``.  At the routed
 reduce seam, the alternate stream waits for the already-enqueued shared branch
-and launches the same one-kernel combine.  The framework's existing final
+and launches the same one-kernel combine, so the fused consumer joins both
+producers immediately before reading them.  The framework's existing final
 alternate-to-primary join is retained.  Python and ContextVar state are used
 only while SGLang performs its two eager warmups and captures the graph; replay
 contains only the recorded stream dependencies and GPU kernels.
+
+See the MThreads plugin README section "Patch background and equivalence
+notes" for the combine screen behind this candidate.
 """
 
 from __future__ import annotations
@@ -84,33 +88,41 @@ class _MoeModelContract:
     matches: bool
 
 
-def _config_string(config: Any, name: str) -> str | None:
-    try:
-        value = getattr(config, name, None)
-    except Exception:  # noqa: BLE001 - malformed config must fall back
-        return None
-    return value if type(value) is str else None
+def _typed_config_field(config: Any, name: str, expected_type: type) -> Any:
+    """Read one config field, keeping exact type constraints and no coercion."""
 
-
-def _config_int(config: Any, name: str) -> int | None:
-    try:
-        value = getattr(config, name, None)
-    except Exception:  # noqa: BLE001 - malformed config must fall back
-        return None
-    return value if type(value) is int else None
+    value = getattr(config, name, None)
+    return value if type(value) is expected_type else None
 
 
 def _model_contract_from_config(config: Any) -> _MoeModelContract:
-    """Copy only primitive contract fields; never retain the config object."""
+    """Copy only primitive contract fields; never retain the config object.
 
-    model_type = _config_string(config, "model_type")
-    hidden_size = _config_int(config, "hidden_size")
-    num_experts = _config_int(config, "num_experts")
-    num_experts_per_tok = _config_int(config, "num_experts_per_tok")
-    moe_intermediate_size = _config_int(config, "moe_intermediate_size")
-    shared_expert_intermediate_size = _config_int(
-        config, "shared_expert_intermediate_size"
-    )
+    All config reads are captured at this one extraction boundary: a missing
+    or unreadable field yields the non-matching contract, so an optional
+    optimization probe can never become a model construction failure.  Exact
+    field types are preserved and no implicit conversion is applied.
+    """
+
+    try:
+        model_type = _typed_config_field(config, "model_type", str)
+        hidden_size = _typed_config_field(config, "hidden_size", int)
+        num_experts = _typed_config_field(config, "num_experts", int)
+        num_experts_per_tok = _typed_config_field(
+            config, "num_experts_per_tok", int
+        )
+        moe_intermediate_size = _typed_config_field(
+            config, "moe_intermediate_size", int
+        )
+        shared_expert_intermediate_size = _typed_config_field(
+            config, "shared_expert_intermediate_size", int
+        )
+    except Exception:  # noqa: BLE001 - unreadable config must fall back
+        logger.debug(
+            "MUSA deterministic combine config contract unavailable", exc_info=True
+        )
+        return _MoeModelContract(None, None, None, None, None, None, False)
+
     matches = (
         model_type in {"qwen3_5_moe_text", "qwen3_5_moe"}
         and hidden_size == _HIDDEN
@@ -190,8 +202,9 @@ _TRITON_KERNEL = None
 # original reduction remains available for the rest of the process.
 _CANDIDATE_DISABLED = False
 _DECODE_GRAPH_CANDIDATE_DISABLED = False
-_SUCCESS_LOGGED: set[int] = set()
-_DECODE_GRAPH_SUCCESS_LOGGED: set[int] = set()
+# One launch-submitted record per combine execution path (eager/prefill and
+# decode-graph); the two entries are independent.
+_SUCCESS_LOGGED: set[str] = set()
 _SUCCESS_LOG_LOCK = Lock()
 _DEVICE_NAME_CACHE: dict[tuple[str | None, str], str] = {}
 _DEVICE_NAME_CACHE_LOCK = Lock()
@@ -226,48 +239,31 @@ def _distributed_rank() -> int:
     return -1
 
 
-def _log_success_once(token_num: int) -> None:
-    """Emit one minimal success marker per supported token shape."""
+def _log_success_once(path: str) -> None:
+    """Emit one launch-submitted marker for each combine execution path.
 
-    if token_num in _SUCCESS_LOGGED:
-        return
+    This records that the launch was submitted, not that asynchronous
+    execution or graph replay has been verified.
+    """
+
     with _SUCCESS_LOG_LOCK:
-        if token_num in _SUCCESS_LOGGED:
+        if path in _SUCCESS_LOGGED:
             return
-        _SUCCESS_LOGGED.add(token_num)
+        _SUCCESS_LOGGED.add(path)
     logger.info(
-        "MUSA deterministic MoE combine launch succeeded: rank=%s M=%s",
+        "MUSA deterministic MoE %s combine launch submitted: rank=%s",
+        path,
         _distributed_rank(),
-        token_num,
-    )
-
-
-def _log_decode_graph_success_once(token_num: int) -> None:
-    """Emit proof that the exact dual-stream capture path reached its kernel."""
-
-    if token_num in _DECODE_GRAPH_SUCCESS_LOGGED:
-        return
-    with _SUCCESS_LOG_LOCK:
-        if token_num in _DECODE_GRAPH_SUCCESS_LOGGED:
-            return
-        _DECODE_GRAPH_SUCCESS_LOGGED.add(token_num)
-    logger.info(
-        "MUSA deterministic MoE decode-graph combine launch succeeded: rank=%s M=%s",
-        _distributed_rank(),
-        token_num,
     )
 
 
 def _device_cache_key(device: Any) -> tuple[str | None, str]:
-    try:
-        return getattr(device, "type", None), str(device)
-    except Exception:  # noqa: BLE001 - cache key failure must still fall back
-        return getattr(device, "type", None), f"{type(device).__name__}:{id(device)}"
+    return device.type, str(device)
 
 
 def _device_name(tensor: torch.Tensor) -> str:
-    device = getattr(tensor, "device", None)
-    if getattr(device, "type", None) != "musa":
+    device = tensor.device
+    if device.type != "musa":
         return ""
     cache_key = _device_cache_key(device)
     with _DEVICE_NAME_CACHE_LOCK:
@@ -348,26 +344,20 @@ def _is_deepep(qwen2_module: Any) -> bool:
 
 
 def _is_bf16(tensor: Any) -> bool:
-    return getattr(tensor, "dtype", None) == getattr(torch, "bfloat16", object())
+    return tensor.dtype == torch.bfloat16
 
 
 def _is_contiguous(tensor: Any) -> bool:
-    try:
-        return bool(tensor.is_contiguous())
-    except Exception:  # noqa: BLE001 - malformed tensor means fallback
-        return False
+    return bool(tensor.is_contiguous())
 
 
 def _same_device(*tensors: Any) -> bool:
-    devices = [getattr(tensor, "device", None) for tensor in tensors]
+    devices = [tensor.device for tensor in tensors]
     return bool(devices) and all(device == devices[0] for device in devices[1:])
 
 
-def _shape(tensor: Any) -> tuple[int, ...] | None:
-    try:
-        return tuple(int(dim) for dim in tensor.shape)
-    except Exception:  # noqa: BLE001 - malformed tensor means fallback
-        return None
+def _shape(tensor: Any) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in tensor.shape)
 
 
 def _contract_matches(
@@ -386,8 +376,6 @@ def _contract_matches(
     output_shape = _shape(output)
     shared_shape = _shape(context.shared_unweighted)
     gate_shape = _shape(context.gate_logits)
-    if routed_shape is None or output_shape is None:
-        return False
     token_num = routed_shape[0] if routed_shape else -1
     supported_tokens = (
         _DECODE_GRAPH_SUPPORTED_TOKENS
@@ -422,7 +410,7 @@ def _contract_matches(
         return False
     if not _same_device(routed, output, context.shared_unweighted, context.gate_logits):
         return False
-    if getattr(getattr(routed, "device", None), "type", None) != "musa":
+    if routed.device.type != "musa":
         return False
     return "S5000" in _device_name(routed).upper()
 
@@ -641,12 +629,11 @@ def _wrap_moe_sum_reduce(original: Callable[..., Any]) -> Callable[..., Any]:
 
         # The launch is asynchronous but the caller's stream/event semantics
         # are unchanged.  The model wrapper skips the shared add only after the
-        # launch was submitted successfully.
+        # launch was submitted.
         context.used = True
-        if context.decode_graph_dual_stream:
-            _log_decode_graph_success_once(int(routed.shape[0]))
-        else:
-            _log_success_once(int(routed.shape[0]))
+        _log_success_once(
+            "decode-graph" if context.decode_graph_dual_stream else "eager/prefill"
+        )
         return None
 
     setattr(wrapped, _PATCH_MARKER, True)
@@ -697,13 +684,13 @@ def _model_contract_matches(
     # rejected above. Presence of the handle alone must therefore not make
     # the measured eager path miss the contract.
     hidden_shape = _shape(hidden_states)
-    if hidden_shape is None or hidden_shape[1:] != (_HIDDEN,):
+    if hidden_shape[1:] != (_HIDDEN,):
         return False
     if hidden_shape[0] not in supported_tokens:
         return False
     if not _is_bf16(hidden_states) or not _is_contiguous(hidden_states):
         return False
-    if getattr(hidden_states.device, "type", None) != "musa":
+    if hidden_states.device.type != "musa":
         return False
     if "S5000" not in _device_name(hidden_states).upper():
         return False
@@ -950,54 +937,46 @@ def _make_qwen_forward(
     return wrapped
 
 
-def _patch_fused_moe() -> bool:
+def _restore_installation(
+    fused_module: Any,
+    qwen_cls: Any,
+    old_fused: Any,
+    old_init: Any,
+    old_forward: Any,
+) -> bool:
+    """Restore the three pre-install objects and report full success.
+
+    The restored values are exactly the objects that were live immediately
+    before installation, including any wrapper already in place.  The code
+    never unwraps through ``__wrapped__`` to an earlier function.
+    """
+
+    restored = True
     try:
-        module = importlib.import_module(
-            "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe"
+        fused_module.moe_sum_reduce = old_fused
+    except Exception:
+        restored = False
+        logger.warning(
+            "MUSA deterministic combine failed to restore fused_moe.moe_sum_reduce",
+            exc_info=True,
         )
-    except ImportError as exc:
-        logger.debug("MUSA deterministic combine fused_moe patch skipped: %s", exc)
-        return False
-
-    original = getattr(module, "moe_sum_reduce", None)
-    if original is None:
-        logger.debug("MUSA deterministic combine: fused_moe has no moe_sum_reduce")
-        return False
-    module.moe_sum_reduce = _wrap_moe_sum_reduce(original)
-    return True
-
-
-def _patch_qwen_block() -> bool:
     try:
-        module = importlib.import_module("sglang.srt.models.qwen2_moe")
-    except ImportError as exc:
-        logger.debug("MUSA deterministic combine Qwen patch skipped: %s", exc)
-        return False
-
-    cls = getattr(module, "Qwen2MoeSparseMoeBlock", None)
-    original_init = getattr(cls, "__init__", None) if cls is not None else None
-    original_forward = getattr(cls, "forward", None) if cls is not None else None
-    if original_init is None or original_forward is None:
-        logger.debug("MUSA deterministic combine: Qwen2MoeSparseMoeBlock unavailable")
-        return False
+        qwen_cls.__init__ = old_init
+    except Exception:
+        restored = False
+        logger.warning(
+            "MUSA deterministic combine failed to restore Qwen2MoeSparseMoeBlock.__init__",
+            exc_info=True,
+        )
     try:
-        wrapped_init = _make_qwen_init(original_init)
-        wrapped_forward = _make_qwen_forward(module, original_forward)
-        cls.__init__ = wrapped_init
-        cls.forward = wrapped_forward
-    except Exception as exc:  # noqa: BLE001 - never leave a partial class patch
-        cls.__init__ = original_init
-        cls.forward = original_forward
-        logger.warning("MUSA deterministic combine Qwen patch failed: %s", exc)
-        return False
-    if not getattr(cls.__init__, _PATCH_MARKER, False) or not getattr(
-        cls.forward, _PATCH_MARKER, False
-    ):
-        cls.__init__ = original_init
-        cls.forward = original_forward
-        logger.warning("MUSA deterministic combine Qwen patch incomplete")
-        return False
-    return True
+        qwen_cls.forward = old_forward
+    except Exception:
+        restored = False
+        logger.warning(
+            "MUSA deterministic combine failed to restore Qwen2MoeSparseMoeBlock.forward",
+            exc_info=True,
+        )
+    return restored
 
 
 def apply_musa_deterministic_moe_combine_patch() -> bool:
@@ -1026,34 +1005,47 @@ def apply_musa_deterministic_moe_combine_patch() -> bool:
         logger.warning("MUSA deterministic combine patch targets unavailable: %s", exc)
         return False
 
-    patched_fused_moe = _patch_fused_moe()
-    patched_qwen = _patch_qwen_block()
-    if not patched_fused_moe or not patched_qwen:
-        fused_module.moe_sum_reduce = old_fused
-        qwen_cls.__init__ = old_init
-        qwen_cls.forward = old_forward
-        logger.warning(
-            "MUSA deterministic combine rolled back partial patch: "
-            "fused_moe=%s qwen=%s",
-            patched_fused_moe,
-            patched_qwen,
-        )
+    # Build every wrapper before touching an install point.  The wrapper
+    # builders are idempotent via their own marker check, so repeated
+    # installation returns the existing wrappers and never adds a layer.
+    try:
+        new_fused = _wrap_moe_sum_reduce(old_fused)
+        new_init = _make_qwen_init(old_init)
+        new_forward = _make_qwen_forward(qwen_module, old_forward)
+    except Exception as exc:
+        logger.warning("MUSA deterministic combine wrapper build failed: %s", exc)
         return False
-    if patched_fused_moe and patched_qwen:
-        logger.info(
-            "MUSA deterministic MoE combine applied for Qwen3.6 TP2 BF16 "
-            "M=2048/4096/6144/8192/16384 "
-            "(M2048 BM2/BD512/W8/S1; larger BM1/BD2048/W16/S1); "
-            "decode-graph B40/B64=%s",
-            "enabled" if _decode_graph_enabled() else "disabled",
-        )
-    else:
-        logger.warning(
-            "MUSA deterministic MoE combine patch incomplete: fused_moe=%s qwen=%s",
-            patched_fused_moe,
-            patched_qwen,
-        )
-    return patched_fused_moe and patched_qwen
+
+    # Publish the three wrappers together; restore the exact pre-install
+    # objects if any assignment fails.
+    try:
+        fused_module.moe_sum_reduce = new_fused
+        qwen_cls.__init__ = new_init
+        qwen_cls.forward = new_forward
+    except Exception as exc:
+        if _restore_installation(
+            fused_module, qwen_cls, old_fused, old_init, old_forward
+        ):
+            logger.warning(
+                "MUSA deterministic combine rolled back after install error: %s",
+                exc,
+            )
+        else:
+            logger.error(
+                "MUSA deterministic combine install failed and rollback was "
+                "incomplete: %s",
+                exc,
+            )
+        return False
+
+    logger.info(
+        "MUSA deterministic MoE combine applied for Qwen3.6 TP2 BF16 "
+        "M=2048/4096/6144/8192/16384 "
+        "(M2048 BM2/BD512/W8/S1; larger BM1/BD2048/W16/S1); "
+        "decode-graph B40/B64=%s",
+        "enabled" if _decode_graph_enabled() else "disabled",
+    )
+    return True
 
 
 __all__ = [

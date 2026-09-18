@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -170,7 +171,39 @@ def test_constructor_marker_mismatch_and_init_failure():
         RealLikeQwen2MoeSparseMoeBlock.__init__ = original
 
 
-def test_constructor_and_qwen_patch_are_idempotent(monkeypatch):
+def test_unreadable_config_field_yields_non_matching_contract():
+    class ExplodingConfig:
+        @property
+        def hidden_size(self):
+            raise RuntimeError("cannot read")
+
+    marker = moe_combine._model_contract_from_config(ExplodingConfig())
+
+    assert not marker.matches
+    assert marker.hidden_size is None
+
+
+def test_unreadable_config_does_not_break_construction():
+    class ExplodingConfig:
+        @property
+        def hidden_size(self):
+            raise RuntimeError("cannot read")
+
+    class RealLikeQwen2MoeSparseMoeBlock:
+        def __init__(self, layer_id, config):
+            self.layer_id = layer_id
+
+    wrapped = moe_combine._make_qwen_init(
+        RealLikeQwen2MoeSparseMoeBlock.__init__
+    )
+    instance = RealLikeQwen2MoeSparseMoeBlock.__new__(RealLikeQwen2MoeSparseMoeBlock)
+    wrapped(instance, 0, ExplodingConfig())
+
+    marker = getattr(instance, moe_combine._MODEL_CONTRACT_MARKER)
+    assert not marker.matches
+
+
+def test_full_install_is_idempotent(monkeypatch):
     class FakeQwenBlock:
         def __init__(self, layer_id, config):
             self.layer_id = layer_id
@@ -178,18 +211,25 @@ def test_constructor_and_qwen_patch_are_idempotent(monkeypatch):
         def forward(self, hidden_states, *args, **kwargs):
             return hidden_states
 
-    fake_module = SimpleNamespace(Qwen2MoeSparseMoeBlock=FakeQwenBlock)
-    monkeypatch.setattr(
-        moe_combine.importlib,
-        "import_module",
-        lambda name: fake_module,
+    original_reduce = lambda *args, **kwargs: "reduce"
+    fused_module = _apply_targets(monkeypatch, original_reduce, FakeQwenBlock)
+
+    assert moe_combine.apply_musa_deterministic_moe_combine_patch()
+    first = (
+        fused_module.moe_sum_reduce,
+        FakeQwenBlock.__init__,
+        FakeQwenBlock.forward,
     )
-    assert moe_combine._patch_qwen_block()
-    first_init = FakeQwenBlock.__init__
-    first_forward = FakeQwenBlock.forward
-    assert moe_combine._patch_qwen_block()
-    assert FakeQwenBlock.__init__ is first_init
-    assert FakeQwenBlock.forward is first_forward
+    assert all(getattr(obj, moe_combine._PATCH_MARKER, False) for obj in first)
+
+    # Repeated full installation must reuse the existing wrappers.
+    assert moe_combine.apply_musa_deterministic_moe_combine_patch()
+    assert (
+        fused_module.moe_sum_reduce,
+        FakeQwenBlock.__init__,
+        FakeQwenBlock.forward,
+    ) == first
+
     instance = FakeQwenBlock(0, _valid_config())
     assert getattr(instance, moe_combine._MODEL_CONTRACT_MARKER).matches
 
@@ -241,7 +281,17 @@ def test_real_qwen_class_constructor_marker_without_self_config(monkeypatch):
 
     original_init = cls.__init__
     original_forward = cls.forward
-    assert moe_combine._patch_qwen_block()
+    fused_module = SimpleNamespace(moe_sum_reduce=lambda *args, **kwargs: None)
+    real_import = moe_combine.importlib.import_module
+
+    def import_module(name):
+        if name.endswith("triton_utils.fused_moe"):
+            return fused_module
+        return real_import(name)
+
+    monkeypatch.setattr(moe_combine.importlib, "import_module", import_module)
+    monkeypatch.setattr(moe_combine.torch, "musa", SimpleNamespace(), raising=False)
+    assert moe_combine.apply_musa_deterministic_moe_combine_patch()
     try:
         config = _valid_config(norm_topk_prob=False, hidden_act="silu")
         instance = cls(layer_id=0, config=config)
@@ -253,9 +303,7 @@ def test_real_qwen_class_constructor_marker_without_self_config(monkeypatch):
         cls.forward = original_forward
 
 
-def test_apply_rolls_back_partial_three_seam_patch(monkeypatch):
-    original_reduce = lambda *args, **kwargs: None
-
+def test_wrapper_build_failure_leaves_targets_unmodified(monkeypatch, caplog):
     class FakeQwenBlock:
         def __init__(self, layer_id, config):
             self.layer_id = layer_id
@@ -263,8 +311,28 @@ def test_apply_rolls_back_partial_three_seam_patch(monkeypatch):
         def forward(self, hidden_states, *args, **kwargs):
             return hidden_states
 
-    fused_module = SimpleNamespace(moe_sum_reduce=original_reduce)
-    qwen_module = SimpleNamespace(Qwen2MoeSparseMoeBlock=FakeQwenBlock)
+    original_reduce = lambda *args, **kwargs: None
+    fused_module = _apply_targets(monkeypatch, original_reduce, FakeQwenBlock)
+    old_init, old_forward = FakeQwenBlock.__init__, FakeQwenBlock.forward
+
+    def boom(module, original):
+        raise RuntimeError("wrapper construction failed")
+
+    monkeypatch.setattr(moe_combine, "_make_qwen_forward", boom)
+
+    with caplog.at_level(logging.WARNING, logger=moe_combine.__name__):
+        assert not moe_combine.apply_musa_deterministic_moe_combine_patch()
+
+    # The build stage runs before any install point is touched.
+    assert fused_module.moe_sum_reduce is original_reduce
+    assert FakeQwenBlock.__init__ is old_init
+    assert FakeQwenBlock.forward is old_forward
+    assert "wrapper build failed" in caplog.text
+
+
+def _apply_targets(monkeypatch, fused_reduce, qwen_cls):
+    fused_module = SimpleNamespace(moe_sum_reduce=fused_reduce)
+    qwen_module = SimpleNamespace(Qwen2MoeSparseMoeBlock=qwen_cls)
 
     def import_module(name):
         if name.endswith("triton_utils.fused_moe"):
@@ -272,12 +340,57 @@ def test_apply_rolls_back_partial_three_seam_patch(monkeypatch):
         return qwen_module
 
     monkeypatch.setattr(moe_combine.importlib, "import_module", import_module)
-    monkeypatch.setattr(moe_combine, "_patch_qwen_block", lambda: False)
     monkeypatch.setattr(moe_combine.torch, "musa", SimpleNamespace(), raising=False)
-    assert not moe_combine.apply_musa_deterministic_moe_combine_patch()
-    assert fused_module.moe_sum_reduce is original_reduce
-    assert not getattr(FakeQwenBlock.__init__, moe_combine._PATCH_MARKER, False)
-    assert not getattr(FakeQwenBlock.forward, moe_combine._PATCH_MARKER, False)
+    return fused_module
+
+
+def test_partial_assignment_failure_restores_pre_install_objects(monkeypatch, caplog):
+    state = {"failed": False}
+
+    class _FailForwardOnce(type):
+        def __setattr__(cls, name, value):
+            if name == "forward" and not state["failed"]:
+                state["failed"] = True
+                raise RuntimeError("forward assignment failed")
+            super().__setattr__(name, value)
+
+    class FakeQwenBlock(metaclass=_FailForwardOnce):
+        def __init__(self, layer_id, config):
+            self.layer_id = layer_id
+
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states
+
+    # The pre-install seam may already hold a wrapper; it must be restored
+    # as-is rather than unwrapped to an earlier function.
+    existing_wrapper = lambda *args, **kwargs: "already wrapped"
+    fused_module = _apply_targets(monkeypatch, existing_wrapper, FakeQwenBlock)
+    old_init, old_forward = FakeQwenBlock.__init__, FakeQwenBlock.forward
+
+    with caplog.at_level(logging.WARNING, logger=moe_combine.__name__):
+        assert not moe_combine.apply_musa_deterministic_moe_combine_patch()
+
+    assert fused_module.moe_sum_reduce is existing_wrapper
+    assert FakeQwenBlock.__init__ is old_init
+    assert FakeQwenBlock.forward is old_forward
+    assert "rolled back" in caplog.text
+
+
+def test_restore_installation_reports_incomplete_rollback(caplog):
+    fused_module = SimpleNamespace(moe_sum_reduce="installed")
+
+    class _RefusingTarget:
+        def __setattr__(self, name, value):
+            raise RuntimeError("assignment refused")
+
+    with caplog.at_level(logging.WARNING, logger=moe_combine.__name__):
+        restored = moe_combine._restore_installation(
+            fused_module, _RefusingTarget(), "old", object(), object()
+        )
+
+    assert restored is False
+    assert fused_module.moe_sum_reduce == "old"
+    assert "failed to restore" in caplog.text
 
 
 def test_device_name_cache_is_per_device(monkeypatch):

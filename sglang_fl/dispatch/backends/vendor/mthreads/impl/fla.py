@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import logging
 import os
 from collections.abc import Callable
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -58,12 +59,76 @@ _MATE_GDN_PREFILL_REQUIRED_PARAMETERS = {
     "chunk_size",
     "is_log_space",
 }
-_mate_gdn_decode: Optional[Callable] = None
-_mate_gdn_import_attempted = False
 _mate_gdn_match_logged = False
-_mate_gdn_prefill: Callable | None = None
-_mate_gdn_prefill_import_attempted = False
 _mate_gdn_prefill_match_logged = False
+
+
+class _MateLoaderSpec(NamedTuple):
+    """Import target and required parameter set for one MATE GDN API."""
+
+    module: str
+    symbol: str
+    required: frozenset[str]
+    label: str
+
+
+# Tri-state load cache, one key per API:
+#   key absent     -> load not yet attempted
+#   value is None  -> attempt started and not yet successful, or unavailable
+#   value callable -> successfully loaded
+_MATE_GDN_CACHE: dict[str, Optional[Callable]] = {}
+
+
+def _load_mate_gdn_api(key: str, spec: _MateLoaderSpec) -> Optional[Callable]:
+    """Load one MATE GDN API once, without making MATE a hard dependency.
+
+    The attempt is recorded before importing so a known failure or an
+    uncaught exception is not retried.  Only the symbol lookup treats a
+    missing attribute as "module present, function absent"; nothing else
+    swallows ``AttributeError``.  Cached here is the load result only, never
+    the environment admission result.
+    """
+
+    if key in _MATE_GDN_CACHE:
+        return _MATE_GDN_CACHE[key]
+
+    _MATE_GDN_CACHE[key] = None
+    try:
+        module = importlib.import_module(spec.module)
+    except (ImportError, OSError):
+        logger.info(
+            "Compatible MATE GDN %s is unavailable; using SGLang fallback",
+            spec.label,
+        )
+        return None
+    try:
+        function = getattr(module, spec.symbol)
+    except AttributeError:
+        logger.warning(
+            "MATE GDN %s module has no %s; using SGLang fallback",
+            spec.label,
+            spec.symbol,
+        )
+        return None
+    try:
+        parameters = set(inspect.signature(function).parameters)
+    except (TypeError, ValueError):
+        logger.warning(
+            "MATE GDN %s signature is unreadable; using SGLang fallback",
+            spec.label,
+        )
+        return None
+    missing = spec.required - parameters
+    if missing:
+        logger.warning(
+            "MATE GDN %s API is missing required parameters %s; "
+            "using SGLang fallback",
+            spec.label,
+            sorted(missing),
+        )
+        return None
+    _MATE_GDN_CACHE[key] = function
+    return function
 
 
 def _mate_gdn_enabled() -> bool:
@@ -89,53 +154,30 @@ def _mate_gdn_prefill_enabled() -> bool:
     }
 
 
+_MATE_GDN_DECODE_SPEC = _MateLoaderSpec(
+    module="mate.gdn_decode",
+    symbol="gated_delta_rule_decode",
+    required=frozenset(_MATE_GDN_REQUIRED_PARAMETERS),
+    label="decode",
+)
+_MATE_GDN_PREFILL_SPEC = _MateLoaderSpec(
+    module="mate.gdn_prefill",
+    symbol="chunk_gated_delta_rule",
+    required=frozenset(_MATE_GDN_PREFILL_REQUIRED_PARAMETERS),
+    label="prefill",
+)
+
+
 def _load_mate_gdn_decode() -> Optional[Callable]:
     """Load a compatible MATE GDN API once, without making MATE mandatory."""
-    global _mate_gdn_decode, _mate_gdn_import_attempted
-    if _mate_gdn_import_attempted:
-        return _mate_gdn_decode
 
-    _mate_gdn_import_attempted = True
-    try:
-        from mate.gdn_decode import gated_delta_rule_decode
-
-        parameters = set(inspect.signature(gated_delta_rule_decode).parameters)
-        missing = _MATE_GDN_REQUIRED_PARAMETERS - parameters
-        if missing:
-            logger.warning(
-                "MATE GDN API is missing required parameters %s; using SGLang fallback",
-                sorted(missing),
-            )
-            return None
-        _mate_gdn_decode = gated_delta_rule_decode
-    except (ImportError, OSError, TypeError, ValueError):
-        logger.info("Compatible MATE GDN decode is unavailable; using SGLang fallback")
-    return _mate_gdn_decode
+    return _load_mate_gdn_api("decode", _MATE_GDN_DECODE_SPEC)
 
 
 def _load_mate_gdn_prefill() -> Callable | None:
     """Load the matched MATE chunk-prefill API once when it is compatible."""
-    global _mate_gdn_prefill, _mate_gdn_prefill_import_attempted
-    if _mate_gdn_prefill_import_attempted:
-        return _mate_gdn_prefill
 
-    _mate_gdn_prefill_import_attempted = True
-    try:
-        from mate.gdn_prefill import chunk_gated_delta_rule
-
-        parameters = set(inspect.signature(chunk_gated_delta_rule).parameters)
-        missing = _MATE_GDN_PREFILL_REQUIRED_PARAMETERS - parameters
-        if missing:
-            logger.warning(
-                "MATE GDN prefill API is missing required parameters %s; "
-                "using SGLang fallback",
-                sorted(missing),
-            )
-            return None
-        _mate_gdn_prefill = chunk_gated_delta_rule
-    except (ImportError, OSError, TypeError, ValueError):
-        logger.info("Compatible MATE GDN prefill is unavailable; using SGLang fallback")
-    return _mate_gdn_prefill
+    return _load_mate_gdn_api("prefill", _MATE_GDN_PREFILL_SPEC)
 
 
 def _is_s5000(device: torch.device) -> bool:

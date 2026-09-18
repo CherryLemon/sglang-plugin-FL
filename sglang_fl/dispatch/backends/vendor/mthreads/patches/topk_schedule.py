@@ -14,37 +14,28 @@
 
 """Skip cold softmax-TopK autotuning for measured MTT S5000 shapes.
 
-The MUSA kernel carries fifteen launch configurations.  Autotuning them also
-flushes a 256 MiB cache buffer between candidates, making the first large
-prefill wave several seconds slower.  On MP31, ``warps=1, stages=1`` is the
-validated choice for Qwen3.6-35B-A3B's ``E=256, K=8`` graph and prefill shapes.
-
-Only those exact shapes are pinned.  Other models and shapes keep SGLang's
-normal autotuner.  Set ``SGLANG_MUSA_TOPK_SCHEDULE=off`` to disable the patch.
+On MP31, ``warps=1, stages=1`` is the validated choice for Qwen3.6-35B-A3B's
+``E=256, K=8`` graph and prefill shapes.  Only those exact shapes are pinned;
+other models and shapes keep SGLang's normal autotuner.  Set
+``SGLANG_MUSA_TOPK_SCHEDULE=off`` to disable the patch.
 
 The pinned path launches the kernel's underlying JIT function directly with
-the pinned options instead of mutating the shared ``kernel.configs`` list:
-the single-config autotuner branch would only forward the same arguments to
-the same ``fn.run`` call while touching shared tuner state, so the direct
-call is launch-equivalent with no global mutation.  See ``_pinned_launch``.
+the pinned options instead of mutating the shared ``kernel.configs`` list.
+The direct call forwards the same arguments to the same ``fn.run`` as the
+single-config autotuner branch, without the shared tuner-state writes that
+have no readers outside the tuner.
 
-Guard verification happens once at wrapper/application startup
-(``_verify_pinned_startup``), not on every target call.  The wrapper closes
+Guard verification happens exactly once in the install stage
+(``apply_musa_topk_schedule_patch``), not per target call.  The wrapper closes
 over the verified inner JIT object and an immutable (``MappingProxyType``)
-copy of the pinned option kwargs.  Per-call work is limited to the shape gate, the MUSA-device gate,
-and a cheap ``kernel.fn`` identity check (runtime replacement fails closed
-to the original path).  No ``configs[0] == selected`` constraint is imposed:
-the pinned path never reads ``kernel.configs``.
+copy of the pinned option kwargs.  Per-call work is limited to the shape gate,
+the MUSA-device gate, and a cheap ``kernel.fn`` identity check; runtime
+replacement fails closed to the original path.  No ``configs[0] == selected``
+constraint is imposed because the pinned path never reads ``kernel.configs``.
+A pinned launch error propagates and never re-runs the original.
 
-Stream behavior (MUSA Triton 3.6, read-only inspection): ``JITFunction.run``
-takes the caller current stream via ``driver.active.get_current_stream`` and
-launches on it, so the pinned direct call inherits the caller stream exactly
-like the autotuner branch would.  ``do_bench`` (``triton.testing.do_bench``
-via ``MusaDriver.get_benchmarker``) takes only the benchmark closure with no
-stream parameter and runs repeated calls on the caller stream; it does not
-create a dedicated reusable stream.  This fix only covers the pinned target
-path.  The raw fallback path still uses the stock autotuner/benchmark flow
-and its first-key host-state race is NOT claimed fixed.
+See the MThreads plugin README section "Patch background and equivalence
+notes" for the autotuning-cost and stream analysis behind this restriction.
 """
 
 from __future__ import annotations
@@ -254,18 +245,22 @@ def _inner_jit_abi_ok(inner: Any) -> bool:
 def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
     """Verify once at wrapper/application startup; return ctx or None.
 
-    Fail-closed checks: explicit Triton runtime class/package identity for
-    the tuner, the selected config, and the inner JIT function; the selected
-    config's ``all_kwargs()`` shape; the inner JIT parameter names, arity,
-    and order (``_inner_jit_abi_ok``) plus tuner/JIT ``arg_names``
-    consistency; empty reset/restore with no user hooks; and an ``fn.run``
-    signature supporting ``(*args, grid, warmup, **kwargs)``.  On success
-    returns ``{"inner_fn", "pinned_kwargs"}`` where ``pinned_kwargs`` is an
-    immutable ``MappingProxyType`` frozen copy.  ``kernel.configs`` is never
-    scanned and no ``configs[0] == selected`` constraint is imposed.
+    Fail-closed checks: exact type identity with the imported standard
+    ``Config``/``Autotuner``/``JITFunction`` (subclasses and look-alikes fail
+    closed); the selected config's ``all_kwargs()`` shape; the inner JIT
+    parameter names, arity, and order (``_inner_jit_abi_ok``) plus tuner/JIT
+    ``arg_names`` consistency; empty reset/restore with no user hooks; and an
+    ``fn.run`` signature supporting ``(*args, grid, warmup, **kwargs)``.  On
+    success returns ``{"inner_fn", "pinned_kwargs"}`` where ``pinned_kwargs``
+    is an immutable ``MappingProxyType`` frozen copy.  ``kernel.configs`` is
+    never scanned and no ``configs[0] == selected`` constraint is imposed.
     ``inner.pre_run_hooks`` is intentionally not a rejection reason: the
     direct ``inner.run`` call executes pre-run hooks internally, preserving
     them.
+
+    The pinned path calls the inner JIT directly and bypasses the outer
+    autotuner, so a subclass with an otherwise identical signature is not
+    sufficient evidence that its added semantics can be ignored.
     """
     try:
         import triton
@@ -277,13 +272,7 @@ def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
     try:
         if getattr(triton, "__name__", "") != "triton":
             return None
-        if type(selected_config).__name__ != "Config":
-            return None
-        if not str(getattr(type(selected_config), "__module__", "")).startswith(
-            "triton."
-        ):
-            return None
-        if not isinstance(selected_config, Config):
+        if type(selected_config) is not Config:
             return None
         try:
             all_kwargs = selected_config.all_kwargs()
@@ -295,11 +284,7 @@ def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
             return None
         if getattr(selected_config, "pre_hook", None) is not None:
             return None
-        if type(kernel).__name__ != "Autotuner":
-            return None
-        if not str(getattr(type(kernel), "__module__", "")).startswith("triton."):
-            return None
-        if not isinstance(kernel, Autotuner):
+        if type(kernel) is not Autotuner:
             return None
         if list(getattr(kernel, "reset_to_zero", None) or []) != []:
             return None
@@ -312,11 +297,7 @@ def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
         inner = getattr(kernel, "fn", None)
         if inner is None:
             return None
-        if type(inner).__name__ != "JITFunction":
-            return None
-        if not str(getattr(type(inner), "__module__", "")).startswith("triton."):
-            return None
-        if not isinstance(inner, JITFunction):
+        if type(inner) is not JITFunction:
             return None
         run = getattr(inner, "run", None)
         if not callable(run):
@@ -338,11 +319,6 @@ def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
         return None
 
 
-def _pinned_equivalence_ok(kernel: Any, selected_config: Any) -> bool:
-    """Bool alias kept for compatibility; see ``_verify_pinned_startup``."""
-    return _verify_pinned_startup(kernel, selected_config) is not None
-
-
 def _pinned_launch_closed(
     ctx: dict,
     topk_weights: Any,
@@ -354,20 +330,13 @@ def _pinned_launch_closed(
 ) -> None:
     """Launch the pinned config without touching shared tuner state.
 
-    Proven equivalent to the single-config autotuner branch for these exact
-    shapes: the ``[grid]`` proxy forwards ``grid``/``warmup`` into
-    ``Autotuner.run``, whose single-config branch only forwards every
-    argument plus the pinned options to ``inner.run`` while also writing
-    shared ``best_config``/``nargs`` state.  The direct call below passes the
-    identical positional/keyword arguments, grid, warmup flag, and the
-    immutable options mapping to the identical inner function object, and
-    returns ``None``
-    like the wrapped function.  Pre-run hooks are preserved because
-    ``inner.run`` executes them internally.  The pinned call inherits the
-    caller current stream exactly like the autotuner branch would.  Skipped
-    shared-state writes have no readers outside the tuner itself:
+    Passes the same positional/keyword arguments, grid, warmup flag and
+    immutable options mapping to the same inner function object as the
+    single-config autotuner branch would.  Pre-run hooks are preserved
+    because ``inner.run`` executes them internally; the pinned call inherits
+    the caller current stream.  Shared state writes are skipped because
     per-config hooks are empty, the tuner carries no run hooks, and
-    ``best_config`` is only consumed by the tuner's own log line.
+    ``best_config`` is only read by the tuner's own log line.
     """
     import triton
 
@@ -395,39 +364,12 @@ def _pinned_launch_closed(
     return None
 
 
-def _pinned_launch(
-    kernel: Any,
-    selected_config: Any,
-    topk_weights: Any,
-    topk_ids: Any,
-    gating_output: Any,
-    renormalize: bool,
-    moe_softcapping: float,
-    correction_bias: Any,
-) -> None:
-    """Compatibility entry point; verifies then launches, else fails closed."""
-    ctx = _verify_pinned_startup(kernel, selected_config)
-    if ctx is None:
-        raise RuntimeError("MUSA TopK pinned launch not verified; fail closed")
-    return _pinned_launch_closed(
-        ctx,
-        topk_weights,
-        topk_ids,
-        gating_output,
-        renormalize,
-        moe_softcapping,
-        correction_bias,
-    )
-
-
 def _make_topk_wrapper(
-    original: Callable[..., Any], kernel: Any, selected_config: Any
+    original: Callable[..., Any], kernel: Any, ctx: Optional[dict]
 ) -> Callable[..., Any]:
-    # Guard verification happens once here at wrapper creation, never per
-    # call.  The wrapper closes over the verified inner JIT object and the
-    # immutable pinned kwargs.
-    ctx = _verify_pinned_startup(kernel, selected_config)
-
+    # Reuse the installation-time verification and its immutable launch kwargs.
+    # ``ctx`` was verified exactly once by the install stage; the wrapper never
+    # re-runs ``_verify_pinned_startup``.
     @wraps(original)
     def wrapped(
         topk_weights: Any,
@@ -437,59 +379,37 @@ def _make_topk_wrapper(
         moe_softcapping: float = 0,
         correction_bias: Any = None,
     ) -> Any:
-        if not _is_target_shape(
-            topk_weights, gating_output, moe_softcapping, correction_bias
-        ):
-            return original(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-                moe_softcapping,
-                correction_bias,
+        # Admission is a short-circuit chain: a miss on the measured shape
+        # must not read the device or probe ``kernel.fn``.  A single exit
+        # keeps the fallback behavior identical for every miss.
+        can_launch = (
+            _is_target_shape(
+                topk_weights, gating_output, moe_softcapping, correction_bias
             )
-        if ctx is None:
-            return original(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-                moe_softcapping,
-                correction_bias,
-            )
-        if not _is_musa_launch_eligible(topk_weights, topk_ids, gating_output):
-            return original(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-                moe_softcapping,
-                correction_bias,
-            )
-        try:
-            live_inner = getattr(kernel, "fn", None)
-        except Exception:
-            return original(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-                moe_softcapping,
-                correction_bias,
-            )
-        if live_inner is not ctx["inner_fn"]:
-            # Runtime object replacement: fail closed to the original path.
-            return original(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-                moe_softcapping,
-                correction_bias,
-            )
+            and ctx is not None
+            and _is_musa_launch_eligible(topk_weights, topk_ids, gating_output)
+        )
+        if can_launch:
+            try:
+                live_inner = getattr(kernel, "fn", None)
+            except Exception:
+                can_launch = False
+            else:
+                # Runtime object replacement must retain the original path.
+                can_launch = live_inner is ctx["inner_fn"]
 
-        return _pinned_launch_closed(
-            ctx,
+        if can_launch:
+            # Only guard failures fall back; a launch exception must propagate.
+            return _pinned_launch_closed(
+                ctx,
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                moe_softcapping,
+                correction_bias,
+            )
+        return original(
             topk_weights,
             topk_ids,
             gating_output,
@@ -527,13 +447,14 @@ def apply_musa_topk_schedule_patch() -> bool:
 
     selected_config = triton.Config({}, num_warps=1, num_stages=1)
     kernel = musa_topk.topk_softmax_triton_kernel
-    if _verify_pinned_startup(kernel, selected_config) is None:
+    ctx = _verify_pinned_startup(kernel, selected_config)
+    if ctx is None:
         logger.warning("MUSA TopK schedule skipped: pinned startup guard failed")
         return False
     wrapped = _make_topk_wrapper(
         musa_topk.topk_softmax,
         kernel,
-        selected_config,
+        ctx,
     )
     musa_topk.topk_softmax = wrapped
     # This alias may already have been imported before vendor patches run.

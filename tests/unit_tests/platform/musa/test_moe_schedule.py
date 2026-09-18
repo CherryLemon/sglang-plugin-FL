@@ -174,6 +174,58 @@ def test_r2_m4_baseline_is_explicit_and_returns_independent_configs(monkeypatch)
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == expected
 
 
+def test_decode_accepts_canonical_intermediate_size_512(monkeypatch):
+    monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S5000")
+    monkeypatch.delenv("SGLANG_MUSA_MOE_DECODE_SCHEDULE", raising=False)
+
+    sentinel = object()
+    wrapped = moe_schedule._wrap_try_get_optimal_moe_config(lambda *a, **kw: sentinel)
+    w1_512 = (256, 1024, 2048)
+    w2_512 = (256, 2048, 512)
+
+    config, (down_config, max_block_m) = wrapped(
+        w1_512, w2_512, 8, None, 64, return_down_config=True
+    )
+
+    assert config == moe_schedule._S5000_DECODE_CONFIG
+    assert "enable_backend_opt" not in config
+    assert down_config == config
+    assert down_config is not config
+    assert max_block_m == 32
+
+
+def test_prefill_rejects_intermediate_size_512(monkeypatch):
+    monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S5000")
+    monkeypatch.delenv("SGLANG_MUSA_MOE_PREFILL_SCHEDULE", raising=False)
+
+    sentinel = object()
+    wrapped = moe_schedule._wrap_try_get_optimal_moe_config(lambda *a, **kw: sentinel)
+    assert wrapped((256, 1024, 2048), (256, 2048, 512), 8, None, 4096) is sentinel
+
+
+def test_backend_opt_stays_on_the_decode_256_config_copy(monkeypatch):
+    monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S5000")
+    monkeypatch.setattr(moe_schedule, "_backend_opt_enabled", lambda: True)
+    monkeypatch.delenv("SGLANG_MUSA_MOE_DECODE_SCHEDULE", raising=False)
+    monkeypatch.delenv("SGLANG_MUSA_MOE_PREFILL_SCHEDULE", raising=False)
+
+    wrapped = moe_schedule._wrap_try_get_optimal_moe_config(
+        lambda *a, **kw: {"original": True}
+    )
+
+    decode = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 64)
+    assert decode["enable_backend_opt"] is True
+    # Module-level constants must never be mutated by a call.
+    assert "enable_backend_opt" not in moe_schedule._S5000_DECODE_CONFIG
+    assert "enable_backend_opt" not in moe_schedule._S5000_PREFILL_CONFIG
+
+    prefill = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4096)
+    assert "enable_backend_opt" not in prefill
+
+    decode_512 = wrapped((256, 1024, 2048), (256, 2048, 512), 8, None, 64)
+    assert "enable_backend_opt" not in decode_512
+
+
 def test_r2_m4_restore_does_not_expand_shape_or_feature_contract(monkeypatch):
     monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S5000")
     monkeypatch.setenv("SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE", "1")

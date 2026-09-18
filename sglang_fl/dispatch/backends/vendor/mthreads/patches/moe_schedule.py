@@ -14,24 +14,19 @@
 
 """Robust fused-MoE scheduling for MTT S5000 decode and long prefill.
 
-TorchAda's bundled Triton 3.2 configuration uses eight warps and a K=128
-tile for the Qwen3.6-35B-A3B TP2 decode shape.  That configuration has a
-large performance cliff on some S5000 systems with Triton 3.6.  A four-warp,
-K=64 configuration is within a few percent of the old-system optimum and is
-about three times faster on the affected systems.
-
-Long-prefill profiling found that the generic M=64/N=64/K=32 configuration
-leaves expert-padding and occupancy performance on the table.  The measured
-M=32/N=128/K=64, eight-warp, one-stage schedule is 12-27% faster across
-8192-token random, balanced-shuffled, and block-boundary routes, and across
-2048/4096/6144/8192-token chunks.  A separate fixed-work confirmation covers
-only the exact M=16384 shape with M=64/N=128/K=64; no intermediate or adjacent
-token count is widened by this patch.
+TorchAda's bundled Triton 3.2 decode configuration has a large performance
+cliff on some S5000 systems with Triton 3.6.  A four-warp, K=64 configuration
+is the validated replacement for the measured decode shape, and the measured
+prefill schedules replace the generic tile for the long-prefill range and the
+exact M=16384 shape.
 
 Keep these as vendor monkeypatches: SGLang and TorchAda remain unmodified, and
 operators can disable decode and prefill independently. Patch both resolvers
 because SGLang v0.5.11 carries its own copy while some MUSA integration
 versions call TorchAda's runtime copy directly.
+
+See the MThreads plugin README section "Patch background and equivalence
+notes" for the measured tile numbers and Triton version history.
 """
 
 from __future__ import annotations
@@ -146,91 +141,143 @@ def _backend_opt_enabled() -> bool:
     return (major, minor) == (3, 6)
 
 
-def _matches_s5000_decode(
+def _matches_common_weight_contract(
     w1_shape,
     w2_shape,
     top_k: int,
     dtype,
-    M: int,
     *,
     block_shape=None,
     per_channel_quant: bool = False,
 ) -> bool:
-    """Match only the measured Qwen3.6-35B-A3B TP2 BF16 decode shape."""
+    """Shared measured weight, top-k, dtype and quantization contract.
+
+    Every schedule selects the same Qwen3.6 TP2 BF16 expert shapes.  Only
+    the token-count limits, the per-branch environment switches, the decode
+    intermediate-size window, the backend-opt toggle and the M4-only
+    ``is_marlin`` restriction remain branch-specific.
+    """
 
     return (
-        _enabled()
-        and "S5000" in _device_name().upper()
-        and len(w1_shape) == 3
+        len(w1_shape) == 3
         and len(w2_shape) == 3
         and w1_shape[0] == w2_shape[0] == 256
         and w1_shape[2] == w2_shape[1] == 2048
         and w1_shape[1] == 2 * w2_shape[2]
-        and w2_shape[2] in (256, 512)
         and top_k == 8
         and dtype is None
-        and M == 64
         and block_shape is None
         and not per_channel_quant
     )
 
 
-def _matches_s5000_prefill(
+def _on_s5000() -> bool:
+    """Read the current device; deliberately not cached at install time."""
+
+    return "S5000" in _device_name().upper()
+
+
+def _select_musa_moe_schedule(
     w1_shape,
     w2_shape,
-    top_k: int,
+    top_k,
     dtype,
-    M: int,
-    *,
-    block_shape=None,
-    per_channel_quant: bool = False,
-) -> bool:
-    """Match only the measured Qwen3.6 TP2 BF16 long-prefill range."""
+    M,
+    is_marlin,
+    block_shape,
+    per_channel_quant,
+) -> tuple[dict | None, bool]:
+    """Shared contract, then one explicit branch per measured schedule.
 
-    return (
-        _prefill_enabled()
-        and "S5000" in _device_name().upper()
-        and len(w1_shape) == 3
-        and len(w2_shape) == 3
-        and w1_shape[0] == w2_shape[0] == 256
-        and w1_shape[2] == w2_shape[1] == 2048
-        and w1_shape[1] == 2 * w2_shape[2]
+    Returns ``(config, baseline_down)`` or ``(None, False)`` when no branch
+    matches and the original resolver must be used.
+    """
+
+    global _decode_match_logged, _prefill_match_logged, _prefill_m16k_match_logged
+    global _r2_m4_match_logged
+    if not _matches_common_weight_contract(
+        w1_shape,
+        w2_shape,
+        top_k,
+        dtype,
+        block_shape=block_shape,
+        per_channel_quant=per_channel_quant,
+    ):
+        return None, False
+
+    if (
+        os.environ.get(_R2_M4_BASELINE_ENV, "0") == "1"
+        and _on_s5000()
         and w2_shape[2] == 256
-        and top_k == 8
-        and dtype is None
-        and 2048 <= M <= 8192
-        and block_shape is None
-        and not per_channel_quant
-    )
+        and M == 4
+        and not is_marlin
+    ):
+        if not _r2_m4_match_logged:
+            logger.info(
+                "Restored R2 M4 baseline MoE tile BM16/BN32/BK64/G1; "
+                "W13 BN64 remains a separate core opt-in"
+            )
+            _r2_m4_match_logged = True
+        # R2 baseline has no independent down schedule. The core uses the
+        # unchanged baseline config for W2, and copies W13 for BN64.
+        return dict(_R2_M4_BASELINE_CONFIG), True
+    if _enabled() and _on_s5000() and w2_shape[2] in (256, 512) and M == 64:
+        backend_opt = w2_shape[2] == 256 and _backend_opt_enabled()
+        config = dict(_S5000_DECODE_CONFIG)
+        if backend_opt:
+            config["enable_backend_opt"] = True
+        if not _decode_match_logged:
+            logger.info(
+                "MUSA S5000 MoE decode schedule selected for "
+                "w1=%s, w2=%s, top_k=%s, M=%s, backend_opt=%s",
+                tuple(w1_shape),
+                tuple(w2_shape),
+                top_k,
+                M,
+                backend_opt,
+            )
+            _decode_match_logged = True
+        return config, False
+    if _prefill_enabled() and _on_s5000() and w2_shape[2] == 256 and 2048 <= M <= 8192:
+        config = dict(_S5000_PREFILL_CONFIG)
+        if not _prefill_match_logged:
+            logger.info(
+                "MUSA S5000 MoE prefill schedule selected for "
+                "w1=%s, w2=%s, top_k=%s, M=%s",
+                tuple(w1_shape),
+                tuple(w2_shape),
+                top_k,
+                M,
+            )
+            _prefill_match_logged = True
+        return config, False
+    if _prefill_enabled() and _on_s5000() and w2_shape[2] == 256 and M == 16384:
+        config = dict(_S5000_PREFILL_M16K_CONFIG)
+        if not _prefill_m16k_match_logged:
+            logger.info(
+                "MUSA S5000 MoE exact M=16384 prefill schedule selected for "
+                "w1=%s, w2=%s, top_k=%s",
+                tuple(w1_shape),
+                tuple(w2_shape),
+                top_k,
+            )
+            _prefill_m16k_match_logged = True
+        return config, False
+    return None, False
 
 
-def _matches_s5000_m16k_prefill(
-    w1_shape,
-    w2_shape,
-    top_k: int,
-    dtype,
-    M: int,
-    *,
-    block_shape=None,
-    per_channel_quant: bool = False,
-) -> bool:
-    """Match only the measured exact M=16384 prefill shape."""
+def _schedule_result(
+    config: dict, baseline_down: bool, return_down_config: bool
+):
+    """Copy the selected config and build the caller's return shape."""
 
-    return (
-        _prefill_enabled()
-        and "S5000" in _device_name().upper()
-        and len(w1_shape) == 3
-        and len(w2_shape) == 3
-        and w1_shape[0] == w2_shape[0] == 256
-        and w1_shape[2] == w2_shape[1] == 2048
-        and w1_shape[1] == 2 * w2_shape[2]
-        and w2_shape[2] == 256
-        and top_k == 8
-        and dtype is None
-        and M == 16384
-        and block_shape is None
-        and not per_channel_quant
-    )
+    if not return_down_config:
+        return config
+    if baseline_down:
+        # M4 owns its return contract explicitly; the generic down assembly
+        # must not substitute a real down config here.
+        return config, (None, None)
+    return config, (dict(config), config["BLOCK_SIZE_M"])
 
 
 def _wrap_try_get_optimal_moe_config(original: Callable[..., Any]):
@@ -249,110 +296,29 @@ def _wrap_try_get_optimal_moe_config(original: Callable[..., Any]):
         per_channel_quant=False,
         return_down_config=False,
     ):
-        global _decode_match_logged, _prefill_match_logged, _prefill_m16k_match_logged
-        global _r2_m4_match_logged
-        if (
-            os.environ.get(_R2_M4_BASELINE_ENV, "0") == "1"
-            and "S5000" in _device_name().upper()
-            and tuple(w1_shape) == (256, 512, 2048)
-            and tuple(w2_shape) == (256, 2048, 256)
-            and top_k == 8
-            and dtype is None
-            and M == 4
-            and not is_marlin
-            and block_shape is None
-            and not per_channel_quant
-        ):
-            if not _r2_m4_match_logged:
-                logger.info("Restored R2 M4 baseline MoE tile BM16/BN32/BK64/G1; W13 BN64 remains a separate core opt-in")
-                _r2_m4_match_logged = True
-            config = dict(_R2_M4_BASELINE_CONFIG)
-            # R2 baseline has no independent down schedule. The core uses
-            # the unchanged baseline config for W2, and copies W13 for BN64.
-            return (config, (None, None)) if return_down_config else config
-        if _matches_s5000_decode(
+        config, baseline_down = _select_musa_moe_schedule(
             w1_shape,
             w2_shape,
             top_k,
             dtype,
             M,
-            block_shape=block_shape,
-            per_channel_quant=per_channel_quant,
-        ):
-            backend_opt = w2_shape[2] == 256 and _backend_opt_enabled()
-            config = dict(_S5000_DECODE_CONFIG)
-            if backend_opt:
-                config["enable_backend_opt"] = True
-            if not _decode_match_logged:
-                logger.info(
-                    "MUSA S5000 MoE decode schedule selected for "
-                    "w1=%s, w2=%s, top_k=%s, M=%s, backend_opt=%s",
-                    tuple(w1_shape),
-                    tuple(w2_shape),
-                    top_k,
-                    M,
-                    backend_opt,
-                )
-                _decode_match_logged = True
-            if return_down_config:
-                return config, (dict(config), config["BLOCK_SIZE_M"])
-            return config
-        if _matches_s5000_prefill(
-            w1_shape,
-            w2_shape,
-            top_k,
-            dtype,
-            M,
-            block_shape=block_shape,
-            per_channel_quant=per_channel_quant,
-        ):
-            config = dict(_S5000_PREFILL_CONFIG)
-            if not _prefill_match_logged:
-                logger.info(
-                    "MUSA S5000 MoE prefill schedule selected for "
-                    "w1=%s, w2=%s, top_k=%s, M=%s",
-                    tuple(w1_shape),
-                    tuple(w2_shape),
-                    top_k,
-                    M,
-                )
-                _prefill_match_logged = True
-            if return_down_config:
-                return config, (dict(config), config["BLOCK_SIZE_M"])
-            return config
-        if _matches_s5000_m16k_prefill(
-            w1_shape,
-            w2_shape,
-            top_k,
-            dtype,
-            M,
-            block_shape=block_shape,
-            per_channel_quant=per_channel_quant,
-        ):
-            config = dict(_S5000_PREFILL_M16K_CONFIG)
-            if not _prefill_m16k_match_logged:
-                logger.info(
-                    "MUSA S5000 MoE exact M=16384 prefill schedule selected for "
-                    "w1=%s, w2=%s, top_k=%s",
-                    tuple(w1_shape),
-                    tuple(w2_shape),
-                    top_k,
-                )
-                _prefill_m16k_match_logged = True
-            if return_down_config:
-                return config, (dict(config), config["BLOCK_SIZE_M"])
-            return config
-        return original(
-            w1_shape,
-            w2_shape,
-            top_k,
-            dtype,
-            M,
-            is_marlin=is_marlin,
-            block_shape=block_shape,
-            per_channel_quant=per_channel_quant,
-            return_down_config=return_down_config,
+            is_marlin,
+            block_shape,
+            per_channel_quant,
         )
+        if config is None:
+            return original(
+                w1_shape,
+                w2_shape,
+                top_k,
+                dtype,
+                M,
+                is_marlin=is_marlin,
+                block_shape=block_shape,
+                per_channel_quant=per_channel_quant,
+                return_down_config=return_down_config,
+            )
+        return _schedule_result(config, baseline_down, return_down_config)
 
     setattr(wrapped, _PATCH_MARKER, True)
     return wrapped

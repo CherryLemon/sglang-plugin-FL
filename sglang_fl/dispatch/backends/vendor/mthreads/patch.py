@@ -282,7 +282,9 @@ def apply_musa_patches() -> None:
 
     apply_musa_shared_expert_gate_tail_patch()
     _patches_applied = True
-    logger.info("All MUSA PP patches applied successfully")
+    # The install flow ran to completion; individual patches may still have
+    # declined or skipped based on device, environment or import contracts.
+    logger.info("MUSA patch install flow complete")
 
 
 apply_musa_patches()

@@ -86,6 +86,43 @@ The immutable final image must carry both the plugin and that dependency;
 installing this wheel alone into an arbitrary runtime is not the validated
 service contract.
 
+## Patch background and equivalence notes
+
+These notes record experiment, measurement and equivalence context that
+previously lived in the patch source. They describe the snapshot
+`b6995b4d72df142291fe00537055a55ab9f1a3bd`, not the refactored source, and
+must not be read as post-refactor validation or as a new performance claim.
+
+- **Softmax TopK schedule.** The MUSA kernel carries fifteen launch
+  configurations, and autotuning them also flushes a 256 MiB cache buffer
+  between candidates, making the first large prefill wave several seconds
+  slower on MP31. `warps=1, stages=1` is the measured choice for the
+  `E=256, K=8` graph and 1K-16K prefill shapes. The pinned path calls the
+  inner `JITFunction.run` directly instead of mutating `kernel.configs`; for a
+  single-config autotuner branch this forwards the same arguments to the same
+  `fn.run`, and the skipped shared-state writes have no readers outside the
+  tuner. `JITFunction.run` takes the caller current stream and `do_bench`
+  takes no stream parameter, so the pinned call inherits the caller stream;
+  the raw fallback path keeps the stock autotuner and its first-key host-state
+  race is not fixed.
+- **MoE schedule.** TorchAda's bundled Triton 3.2 uses eight warps and a K=128
+  tile for the Qwen3.6-35B-A3B TP2 decode shape, which has a large performance
+  cliff on some S5000 systems with Triton 3.6. A four-warp, K=64 configuration
+  is within a few percent of the old-system optimum and about three times
+  faster on the affected systems. Long-prefill profiling found the generic
+  M=64/N=64/K=32 tile left expert-padding and occupancy performance unused;
+  the measured M=32/N=128/K=64, eight-warp, one-stage schedule is 12-27%
+  faster across 8192-token random, balanced-shuffled and block-boundary
+  routes, and across 2048/4096/6144/8192-token chunks. The M=16384 schedule is
+  a separate fixed-work confirmation at M=64/N=128/K=64; no intermediate or
+  adjacent token count is widened.
+- **Deterministic combine.** The standalone screen showed the three-kernel
+  combine chain can be replaced by one ordered-FP32, no-atomic Triton kernel
+  for the S5000 Qwen3.6 TP2 contract. For decode-graph M=40/M=64, the opt-in
+  keeps Qwen's two-stream overlap: the shared branch stays on the primary
+  stream, routed experts stay on `alt_stream`, and the tail wait at the reduce
+  seam joins them immediately before the fused consumer.
+
 ## Required validation before release
 
 Validated code snapshot: `b6995b4d72df142291fe00537055a55ab9f1a3bd`.
