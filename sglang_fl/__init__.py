@@ -805,6 +805,17 @@ def load_plugin():
     # 5. Vendor-specific patches — final overlay on top of all sglang_fl layers
     _apply_vendor_patches()
 
+    # 5b. Vendor-neutral output-completion optimization (opt-in via
+    #     SGLANG_FL_EVENTFD_COMPLETION and the vendor's auto policy)
+    try:
+        from sglang_fl.runtime.stream_completion.patch import (
+            apply_eventfd_completion_patch,
+        )
+
+        apply_eventfd_completion_patch()
+    except Exception as e:
+        logger.warning("eventfd completion registration failed: %s", e)
+
     # 6. Summary banner — confirm plugin is active (rank 0 only)
     if _is_rank0():
         use_fg = _parse_bool(os.environ.get("USE_FLAGGEMS", "1"), default=True)
