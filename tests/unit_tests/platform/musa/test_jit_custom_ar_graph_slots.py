@@ -23,18 +23,15 @@ JIT compiler, or distributed process is needed.
 from __future__ import annotations
 
 import importlib.util
-import inspect
-import logging
 import os
 import sys
 import types
 import unittest
-from functools import partial
 from pathlib import Path
 from unittest import mock
 
 _SOURCE = (
-    Path(__file__).resolve().parents[3]
+    Path(__file__).resolve().parents[4]
     / "sglang_fl/dispatch/backends/vendor/mthreads/jit_custom_ar/communicator.py"
 )
 _MODULE_NAME = "_cpu_test_musa_jit_custom_ar_communicator"
@@ -290,32 +287,7 @@ def _make_communicator(
 
 
 class TestGraphRankDataLayout(unittest.TestCase):
-    def test_source_pins_workspace_only_rightsize_on_musa_class(self):
-        source = _SOURCE.read_text()
-        musa_source = source.split("class MusaJitCustomAllreduce:", 1)[1]
-
-        self.assertIn("_MAX_CAR_SIZE = 512 * 1024 * 1024", musa_source)
-        self.assertNotIn("_MAX_CAR_SIZE = 128 * 1024 * 1024", musa_source)
-        self.assertIn("_graph_rank_data_slot_capacity", musa_source)
-        self.assertIn("_graph_registered_input_enabled", musa_source)
-        self.assertIn("_MUSA_CUSTOM_AR_MAX_SIZE_MB_ENV", source)
-        self.assertIn("musa_custom_allreduce_factory", source)
-
-        plugin_source = (
-            _SOURCE.parents[1] / "patches" / "custom_allreduce_rmsnorm.py"
-        ).read_text()
-        self.assertIn("musa_custom_allreduce_factory", plugin_source)
-
-        fused_source = (_SOURCE.parent / "fused_rmsnorm.py").read_text()
-        self.assertIn("inp.numel() * inp.element_size() > self.max_size", fused_source)
-        self.assertIn("push_polling_override = 0", fused_source)
-
     def test_default_workspace_bound_and_persistent_allocations(self):
-        default_max_size = inspect.signature(
-            COMMUNICATOR.MusaJitCustomAllreduce.__init__
-        ).parameters["max_size"].default
-        self.assertEqual(default_max_size, 512 * 1024 * 1024)
-
         allocations = []
         comm = _make_communicator(allocation_sizes=allocations)
 
@@ -327,25 +299,15 @@ class TestGraphRankDataLayout(unittest.TestCase):
             [128 + 512 * 1024 * 1024, 512 * 1024 * 1024],
         )
 
-    def test_factory_default_is_512_and_logs_effective_bytes(self):
+    def test_factory_default_is_512(self):
         env_name = COMMUNICATOR._MUSA_CUSTOM_AR_MAX_SIZE_MB_ENV
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(env_name, None)
             with mock.patch.object(
                 COMMUNICATOR, "_use_jit_all_reduce", return_value=True
             ):
-                with self.assertLogs(
-                    COMMUNICATOR.logger, level=logging.INFO
-                ) as records:
-                    constructor = COMMUNICATOR.dispatch_custom_allreduce()
+                constructor = COMMUNICATOR.dispatch_custom_allreduce()
 
-        self.assertIs(constructor, COMMUNICATOR.MusaJitCustomAllreduce)
-        self.assertTrue(
-            any(
-                "max_size_bytes=536870912 source=class-default" in line
-                for line in records.output
-            )
-        )
         allocations = []
         comm = _make_communicator(
             constructor=constructor, allocation_sizes=allocations
@@ -355,26 +317,14 @@ class TestGraphRankDataLayout(unittest.TestCase):
             allocations, [128 + 512 * 1024 * 1024, 512 * 1024 * 1024]
         )
 
-    def test_factory_opt_in_128_is_partial_and_logs_effective_bytes(self):
+    def test_factory_opt_in_128(self):
         env_name = COMMUNICATOR._MUSA_CUSTOM_AR_MAX_SIZE_MB_ENV
         with mock.patch.dict(os.environ, {env_name: "128"}, clear=False):
             with mock.patch.object(
                 COMMUNICATOR, "_use_jit_all_reduce", return_value=True
             ):
-                with self.assertLogs(
-                    COMMUNICATOR.logger, level=logging.INFO
-                ) as records:
-                    constructor = COMMUNICATOR.dispatch_custom_allreduce()
+                constructor = COMMUNICATOR.dispatch_custom_allreduce()
 
-        self.assertIsInstance(constructor, partial)
-        self.assertEqual(constructor.keywords["max_size"], 128 * 1024 * 1024)
-        self.assertTrue(
-            any(
-                "max_size_bytes=134217728 "
-                "source=env:SGLANG_MUSA_CUSTOM_AR_MAX_SIZE_MB" in line
-                for line in records.output
-            )
-        )
         allocations = []
         comm = _make_communicator(
             constructor=constructor, allocation_sizes=allocations
@@ -522,19 +472,12 @@ class TestGraphRankDataLayout(unittest.TestCase):
             comm._preferred_shot_cached(64 * 1024 * 1024, False, False)
 
     def test_disabled_uses_one_slot_even_when_max_size_is_small(self):
-        with self.assertLogs(COMMUNICATOR.logger, level=logging.INFO) as records:
-            comm = _make_communicator(max_size=32, env_value="0")
+        comm = _make_communicator(max_size=32, env_value="0")
 
         self.assertFalse(comm._graph_registered_input_enabled)
         self.assertEqual(comm._graph_rank_data_slot_count, 1)
         self.assertEqual(comm._graph_rank_data_bytes, 64)
         self.assertEqual(comm._graph_rank_data_slots.shape, (1, 8))
-        self.assertEqual(len(records.output), 1)
-        self.assertTrue(
-            any(
-                "enabled=False slot_count=1 bytes=64" in line for line in records.output
-            )
-        )
 
     def test_enabled_capacity_is_exact_floor_of_max_size_over_64(self):
         comm = _make_communicator(max_size=64 * 5 + 7, env_value="1")

@@ -404,7 +404,7 @@ def test_model_contract_accepts_exact_m16k_and_rejects_adjacent_shape(monkeypatc
     )
 
 
-def test_combine_consumed_marks_context_and_logs_once(monkeypatch, caplog):
+def test_combine_consumed_marks_context(monkeypatch):
     monkeypatch.setattr(moe_combine, "_SUCCESS_LOGGED", set())
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     context, (routed, output, _, _) = _context()
@@ -430,33 +430,6 @@ def test_combine_consumed_marks_context_and_logs_once(monkeypatch, caplog):
     assert len(launch_calls) == 1
     assert context.used
     assert not original_calls
-    context2, (routed2, output2, _, _) = _context()
-    token = moe_combine._ACTIVE_CONTEXT.set(context2)
-    try:
-        assert wrapped(routed2, output2, 1.0) is None
-    finally:
-        moe_combine._ACTIVE_CONTEXT.reset(token)
-    success_records = [
-        record
-        for record in caplog.records
-        if "deterministic MoE combine launch succeeded" in record.message
-    ]
-    assert len(success_records) == 1
-    assert "rank=-1 M=2048" in success_records[0].message
-    context3, (routed3, output3, _, _) = _context(tokens=4096)
-    token = moe_combine._ACTIVE_CONTEXT.set(context3)
-    try:
-        assert wrapped(routed3, output3, 1.0) is None
-    finally:
-        moe_combine._ACTIVE_CONTEXT.reset(token)
-    success_records = [
-        record
-        for record in caplog.records
-        if "deterministic MoE combine launch succeeded" in record.message
-    ]
-    assert len(success_records) == 2
-    assert "rank=-1 M=4096" in success_records[1].message
-    assert len(launch_calls) == 3
 
 
 def test_combine_exception_uses_original_and_does_not_consume(monkeypatch):

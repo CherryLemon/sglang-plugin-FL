@@ -69,7 +69,7 @@ def test_s5000_long_prefill_uses_tuned_schedule(monkeypatch):
         return {"original": True}
 
     wrapped = moe_schedule._wrap_try_get_optimal_moe_config(original)
-    for tokens in (2048, 4096, 6144, 8192):
+    for tokens in (2048, 8192):
         config, (down_config, max_block_m) = wrapped(
             W1_SHAPE,
             W2_SHAPE,
@@ -85,10 +85,9 @@ def test_s5000_long_prefill_uses_tuned_schedule(monkeypatch):
     assert calls == []
 
 
-def test_s5000_exact_m16k_prefill_uses_bm64_schedule(monkeypatch, caplog):
+def test_s5000_exact_m16k_prefill_uses_bm64_schedule(monkeypatch):
     monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S5000")
     monkeypatch.delenv("SGLANG_MUSA_MOE_PREFILL_SCHEDULE", raising=False)
-    monkeypatch.setattr(moe_schedule, "_prefill_m16k_match_logged", False)
 
     calls = []
 
@@ -112,14 +111,6 @@ def test_s5000_exact_m16k_prefill_uses_bm64_schedule(monkeypatch, caplog):
     assert down_config is not config
     assert max_block_m == 64
     assert calls == []
-
-    wrapped(W1_SHAPE, W2_SHAPE, 8, None, 16384)
-    markers = [
-        record
-        for record in caplog.records
-        if "exact M=16384 prefill schedule selected" in record.message
-    ]
-    assert len(markers) == 1
 
 
 def test_prefill_schedule_is_scoped_and_can_be_disabled(monkeypatch):

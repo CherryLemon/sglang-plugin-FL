@@ -30,11 +30,10 @@ No installed SGLang file is rewritten at startup; no copied `sglang` package
 is put ahead of the original on `PYTHONPATH`. Existing vendor-image core
 changes remain a pinned dependency, not a new plugin-only claim.
 
-`provenance.json` records the campaign source hashes and normalized AST hashes
-for 20 relocated function bodies, including the kernel/launcher. Custom-op
-names are distinct from SGLang's registrations. Scheduling, route alignment
-and reduction are resolved through the original module at call time so the
-existing plugin patches (especially deterministic combine) remain effective.
+Custom-op names are distinct from SGLang's registrations. Scheduling, route
+alignment and reduction are resolved through the original module at call time
+so the existing plugin patches (especially deterministic combine) remain
+effective.
 
 ## Supported candidate contract
 

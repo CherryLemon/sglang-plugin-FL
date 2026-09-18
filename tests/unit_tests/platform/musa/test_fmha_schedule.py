@@ -49,18 +49,27 @@ def test_fmha_schedule_is_narrow_and_respects_explicit_choice(monkeypatch):
     assert wrapped(8192, 8, 256, 256, 2) == CURRENT_CONFIG
 
 
-def test_apply_patches_all_mate_aliases(monkeypatch):
+def test_apply_patches_all_mate_aliases_and_is_idempotent(monkeypatch):
     monkeypatch.setattr(fmha_schedule, "_device_name", lambda: "MTT S5000")
     monkeypatch.delenv("SGLANG_MUSA_FMHA_PREFILL_PACK_GQA", raising=False)
     utils = SimpleNamespace(_get_fwd_kernel_config=_original)
     fwd = SimpleNamespace(_get_fwd_kernel_config=_original)
     metadata = SimpleNamespace(_get_metadata_kernel_config=_original)
-    modules = iter((utils, fwd, metadata))
-    monkeypatch.setattr(
-        fmha_schedule.importlib, "import_module", lambda _name: next(modules)
-    )
+
+    def import_module(name):
+        if name == "mate.jit.attention.fmha.fmha_utils":
+            return utils
+        if name == "mate.jit.attention.fmha.fmha_fwd":
+            return fwd
+        return metadata
+
+    monkeypatch.setattr(fmha_schedule.importlib, "import_module", import_module)
 
     assert fmha_schedule.apply_musa_fmha_schedule_patch()
     assert utils._get_fwd_kernel_config is fwd._get_fwd_kernel_config
     assert utils._get_fwd_kernel_config is metadata._get_metadata_kernel_config
+    assert getattr(utils._get_fwd_kernel_config, fmha_schedule._PATCH_MARKER)
+
+    # Applying again must not re-wrap the already-patched aliases.
+    assert fmha_schedule.apply_musa_fmha_schedule_patch()
     assert getattr(utils._get_fwd_kernel_config, fmha_schedule._PATCH_MARKER)

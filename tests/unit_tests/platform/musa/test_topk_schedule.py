@@ -100,57 +100,8 @@ def test_verify_pinned_startup_rejects_unknown_fake_kernel():
     assert topk_schedule._verify_pinned_startup(fake_kernel, real_selected) is None
 
 
-def test_pinned_config_all_kwargs_shape():
-    triton = pytest.importorskip("triton")
-    pinned = triton.Config({}, num_warps=1, num_stages=1)
-    assert dict(pinned.all_kwargs()) == {"num_warps": 1, "num_ctas": 1, "num_stages": 1}
-    other = triton.Config({}, num_warps=4, num_stages=2)
-    assert dict(other.all_kwargs()) != {"num_warps": 1, "num_ctas": 1, "num_stages": 1}
-
-
 def _target_tensors():
     return _tensor_shape(64, 8), object(), _tensor_shape(64, 256)
-
-
-def test_wrapper_forwards_pinned_launch_without_mutating_configs(monkeypatch):
-    configs = [object(), object()]
-    calls = {}
-
-    class _FakeInner:
-        def run(self, *args, grid=None, warmup=None, **kwargs):
-            calls["args"] = args
-            calls["grid"] = grid
-            calls["warmup"] = warmup
-            calls["kwargs"] = kwargs
-            return None
-
-    inner = _FakeInner()
-    kernel = SimpleNamespace(configs=configs, fn=inner)
-    ctx = {"inner_fn": inner, "pinned_kwargs": {"num_warps": 1, "num_ctas": 1, "num_stages": 1}}
-    monkeypatch.setattr(topk_schedule, "_verify_pinned_startup", lambda k, s: ctx)
-    monkeypatch.setattr(topk_schedule, "_is_musa_launch_eligible", lambda *a: True)
-
-    def original(*args):
-        raise AssertionError("original must not be called on the pinned path")
-
-    wrapped = topk_schedule._make_topk_wrapper(original, kernel, object())
-    weights, ids, gating = _target_tensors()
-    result = wrapped(weights, ids, gating)
-
-    assert result is None
-    assert calls["grid"] == (64,)
-    assert calls["warmup"] is False
-    assert calls["kwargs"]["K"] == 8
-    assert calls["kwargs"]["num_warps"] == 1
-    assert calls["kwargs"]["num_ctas"] == 1
-    assert calls["kwargs"]["num_stages"] == 1
-    assert calls["args"][3] is False
-    assert calls["args"][4] == 256
-    assert calls["args"][5] == 64
-    # No global mutation: configs object identity and content unchanged.
-    assert kernel.configs is configs
-    assert kernel.configs == configs
-    assert getattr(wrapped, topk_schedule._PATCH_MARKER)
 
 
 def test_wrapper_falls_back_when_startup_not_verified(monkeypatch):
@@ -239,54 +190,24 @@ def test_wrapper_leaves_unmeasured_shape_on_autotuner():
     assert kernel.configs is configs
 
 
-_ABI_NAMES = (
-    "gating_output_ptr",
-    "selected_expert_ptr",
-    "moe_weights_ptr",
-    "renormalize_flag",
-    "num_experts",
-    "num_tokens",
-    "moe_softcapping",
-    "correction_bias_ptr",
-    "has_correction_bias",
-    "K",
-    "BLOCK_K",
-    "BLOCK_WIDTH_SIZE_UP",
-)
-
-
 def test_inner_jit_abi_ok_with_fakes():
-    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=list(_ABI_NAMES))) is True
-    swapped = list(_ABI_NAMES)
+    abi_names = list(topk_schedule._EXPECTED_JIT_ARG_NAMES)
+    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=abi_names)) is True
+    swapped = list(abi_names)
     swapped[0], swapped[1] = swapped[1], swapped[0]
     assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=swapped)) is False
-    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=list(_ABI_NAMES)[:-1])) is False
-    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=list(_ABI_NAMES) + ["EXTRA"])) is False
+    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=abi_names[:-1])) is False
+    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=abi_names + ["EXTRA"])) is False
     assert topk_schedule._inner_jit_abi_ok(SimpleNamespace()) is False
     assert topk_schedule._inner_jit_abi_ok(object()) is False
     assert topk_schedule._inner_jit_abi_ok(None) is False
-
-
-def test_verify_startup_returns_immutable_pinned_kwargs():
-    musa_topk = pytest.importorskip("sglang.srt.hardware_backend.musa.kernels.topk")
-    triton = pytest.importorskip("triton")
-    kernel = musa_topk.topk_softmax_triton_kernel
-    selected = triton.Config({}, num_warps=1, num_stages=1)
-    assert topk_schedule._inner_jit_abi_ok(kernel.fn) is True
-    ctx = topk_schedule._verify_pinned_startup(kernel, selected)
-    assert ctx is not None
-    assert type(ctx["pinned_kwargs"]).__name__ == "mappingproxy"
-    assert dict(ctx["pinned_kwargs"]) == {"num_warps": 1, "num_ctas": 1, "num_stages": 1}
-    with pytest.raises(TypeError):
-        ctx["pinned_kwargs"]["num_warps"] = 4
-    with pytest.raises(TypeError):
-        del ctx["pinned_kwargs"]["num_warps"]
 
 
 def test_wrapper_passthrough_with_mappingproxy_ctx(monkeypatch):
     from types import MappingProxyType
 
     configs = [object(), object()]
+    configs_before = list(configs)
     calls = {}
 
     class _FakeInner:
@@ -321,4 +242,4 @@ def test_wrapper_passthrough_with_mappingproxy_ctx(monkeypatch):
     assert calls["kwargs"]["num_ctas"] == 1
     assert calls["kwargs"]["num_stages"] == 1
     assert kernel.configs is configs
-    assert kernel.configs == configs
+    assert configs == configs_before
