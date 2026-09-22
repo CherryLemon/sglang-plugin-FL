@@ -1,0 +1,35 @@
+{
+  "image": "sglang-fl-dsv41:0.5.18",
+  "image_id": "sha256:5dfa10a178cd0d4d1e088d86e94188ee0bdcc611b469953aa32dcd4754acd9ea",
+  "uncompressed_bytes": 32685761080,
+  "base_image_id": "sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb",
+  "validation": {
+    "cpu_tests_passed": 89,
+    "subtests_passed": 63,
+    "skipped": 2,
+    "offline_triton_compile_cases": 10,
+    "offline_compile_arches": [
+      80,
+      90
+    ],
+    "changed_engine_python_ast_and_undefined_name_checks": 181,
+    "gpu_kernel_execution": false,
+    "model_service_started": false,
+    "performance_measured": false,
+    "flag_gems_import_and_plugin_initialization_with_cpu_doubles": true,
+    "skipped_reasons": [
+      "DSpark CUDA graph replay requires GPU",
+      "GPU numerical module is explicitly opt-in"
+    ]
+  },
+  "logs": {
+    "build_log": "build.log",
+    "offline_compile": "offline-compile.json"
+  },
+  "limitations": [
+    "GPU numerical and graph replay validation pending",
+    "Whole-model multi-chip TP/EP and PD not tested",
+    "FlagCX V4.1 DSpark PD remains guarded; sparse/cache/EP vendor chain retained",
+    "BF16 and strict FlagOS are operator profiles, not complete model serving profiles"
+  ]
+}

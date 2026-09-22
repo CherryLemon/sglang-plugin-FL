@@ -1,0 +1,135 @@
+{
+  "triton": "3.7.1",
+  "gpu_executed": false,
+  "cases": [
+    {
+      "kernel": "_quantize",
+      "arch": 90,
+      "constants": {
+        "K": 128,
+        "GROUP": 32,
+        "POW2": true,
+        "EMULATE": false
+      },
+      "ptx_sha256": "8d8317f93def6a4bf112d52ec3ebab935650ed34337b2ecfddd6e43b86732225"
+    },
+    {
+      "kernel": "_quantize",
+      "arch": 80,
+      "constants": {
+        "K": 128,
+        "GROUP": 32,
+        "POW2": true,
+        "EMULATE": true
+      },
+      "ptx_sha256": "873f7b2e7ec7aeb9baacf6aef7dcc8fc71392e17378230321c55393cba43911b"
+    },
+    {
+      "kernel": "_bf16_matmul",
+      "arch": 80,
+      "constants": {
+        "K": 128,
+        "GROUP_N": 32,
+        "GROUP_K": 32,
+        "QUANTIZED": true,
+        "BM": 16,
+        "BN": 32
+      },
+      "ptx_sha256": "ac5f99595451cf3b92b3d849f77b4aecf5c04c43beb5df3ebdbb27b336446e83"
+    },
+    {
+      "kernel": "_bf16_matmul",
+      "arch": 80,
+      "constants": {
+        "K": 128,
+        "GROUP_N": 32,
+        "GROUP_K": 32,
+        "QUANTIZED": false,
+        "BM": 16,
+        "BN": 32
+      },
+      "ptx_sha256": "82675784e9babc78f6dafb361e098f0aede7695344dfd71373bd760aba037c38"
+    },
+    {
+      "kernel": "w8a8_block_fp8_matmul_kernel",
+      "arch": 90,
+      "constants": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 4
+      },
+      "ptx_sha256": "e4fca318767aeb82fdf9f2121dc110659b0a8dde0f23b87ea361e844ebd7b3d2"
+    },
+    {
+      "kernel": "_fp4_index_logits_kernel",
+      "arch": 90,
+      "constants": {
+        "H": 32,
+        "HALF_D": 64,
+        "BLOCK_L": 64,
+        "SKIP_INVALID": true,
+        "RATIO": 2,
+        "USE_REQ_TO_TOKEN": true,
+        "USE_CANDIDATE_BLOCKS": false,
+        "CANDIDATE_BLOCK_SIZE": 8,
+        "WRITE_CANDIDATES": true,
+        "WRITE_LOGITS": true
+      },
+      "ptx_sha256": "4291d4dd117e69663a9d77699cb33e9dd486c6fd962742c52595c301dab24a83"
+    },
+    {
+      "kernel": "_fp4_index_logits_kernel",
+      "arch": 90,
+      "constants": {
+        "H": 32,
+        "HALF_D": 64,
+        "BLOCK_L": 64,
+        "SKIP_INVALID": true,
+        "RATIO": 2,
+        "USE_REQ_TO_TOKEN": false,
+        "USE_CANDIDATE_BLOCKS": true,
+        "CANDIDATE_BLOCK_SIZE": 8,
+        "WRITE_CANDIDATES": false,
+        "WRITE_LOGITS": true
+      },
+      "ptx_sha256": "e2d3c69382034f10684b7f097e6155ce36d837312424bd8f3a3701cd1046b86d"
+    },
+    {
+      "kernel": "_fp4_index_logits_grouped_kernel",
+      "arch": 90,
+      "constants": {
+        "GROUP": 6,
+        "PGROUP": 8,
+        "RATIO": 2,
+        "BL": 64,
+        "CB": 8,
+        "WRITE_LOGITS": false,
+        "WRITE_CANDIDATES": true
+      },
+      "ptx_sha256": "6795ea6dc8b8b1d8ce60de859764380476b75eeed8b9520b105d083336661c1e"
+    },
+    {
+      "kernel": "_hc_mix_stats_partial_kernel",
+      "arch": 90,
+      "constants": {
+        "MIX": 24,
+        "MIX_PAD": 32,
+        "NUM_SLICES": 80,
+        "BLOCK_M": 8,
+        "BLOCK_K": 64,
+        "DOT_PRECISION": "tf32x3"
+      },
+      "ptx_sha256": "1c22d78d44ba20947ad15afb36a4b8fda740d8bdbfc97187c6775d05a4aec00f"
+    },
+    {
+      "kernel": "_hc_combine_kernel",
+      "arch": 90,
+      "constants": {
+        "HC": 4,
+        "BLOCK_H": 1024
+      },
+      "ptx_sha256": "36c1f4823a56765a729fc2b1da1cffe54b8b78050a16e76d56bebac298a3f6af"
+    }
+  ]
+}

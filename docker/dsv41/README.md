@@ -1,0 +1,92 @@
+# DeepSeek V4.1 Flash / SGLang FL 0.5.18
+
+本目录交付代码迁移和 NVIDIA 镜像构建。引擎基于官方 SGLang **v0.5.18**，插件基于 **dev/0.5.18**；具体提交、镜像 digest、模型 revision、补丁及文件 SHA256 见 [manifest.json](manifest.json)。本轮不加载模型、不启动服务、不运行 GPU 数值或性能测试。
+
+镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。它是后续联调的迁移镜像，尚不是多芯片整模验收版本。
+
+## 代码与补丁
+
+| 补丁 | 内容 |
+| --- | --- |
+| `patches/0001-dsv41-functional.patch` | V4.1 配置、权重加载、Engram、压缩/索引、缓存、DSpark 和必要正确性修复 |
+| `patches/0002-v12-serving.patch` | V12 block32 配置、紧凑候选、六 query 解码复用、mHC、缓存游标、图元数据和 PD 拓扑修复 |
+| `patches/0003-0518-compatibility.patch` | 0.5.18 请求字段、配置默认值、TopK 依赖、缓存接口和 CPU 测试适配 |
+| `patches/0004-oot-interface.patch` | `sglang.srt.layers.dsv41_ops` ABI v1，显式分发及必需插件守卫 |
+| `patches/flaggems-dsv41.patch` | FlagGems K tile 缩放边界修复、FP8/BF16 线性计算、packed 索引器及 mHC |
+
+功能回移与 V12 优化分别提交。未引入新版请求对象或整套运行时重构。SGLang 版本保持 `0.5.18`，镜像内 `/opt/sglang-fl/manifest.json` 标明补丁后的源码提交和文件哈希。源分支带入的 `benchmark/deepseek_v41_h100` 报告仅作为历史资料，其吞吐、质量和 GPU 测试结果不代表本镜像的结果。
+
+## 实际算子覆盖
+
+| 路径 | hybrid 后端 | 本轮验证 / 仍需验证 |
+| --- | --- | --- |
+| block32 E4M3 线性层 | FlagGems | 分组、空输入、scale 类型 CPU 契约；SM90 离线编译；GPU 数值待测 |
+| 无原生 FP8 的量化兼容线性层 | FlagGems BF16 tile 解码 | 保留 E4M3 舍入、逐组 scale；SM80 离线编译；GPU 数值待测 |
+| 显式 BF16 线性层 | FlagGems | 独立模式，取消激活量化；权重按 tile 解码；整模 BF16 未打通 |
+| packed FP4 索引器 | FlagGems | E2M1 布局、紧凑候选接口、零长度契约；SM90 离线编译 |
+| 六 query 复用 | FlagGems | 保留逐次 replay 的请求 ID 判断及原形状守卫；GPU 混合请求/图测试待测 |
+| mHC predecessor-pre | FlagGems | FP32 混合权重、前一子层 pre 契约；SM90 离线编译；融合数值误差待测 |
+| 稀疏注意力 / RoPE / 压缩缓存 | vendor | 保留模型语义；其余芯片的完整算子链待补齐 |
+| MoE TP/EP | vendor | 保留原 A2A 策略；未将单 rank 参考 MegaMoE 当成 EP 后端 |
+| 通信 | 插件原有 CommunicatorFL | 本轮未测试 collective、RDMA 或跨节点 |
+| V4.1 DSpark PD | 原 Mooncake 路径 | 布局/拓扑 CPU 契约；未开放 FlagCX 白名单 |
+
+FlagCX 的通用连接器仍保留在插件中。V4.1 专有缓存、C2 stride、完成事件和取消生命周期尚未完成 FlagCX 联调；本次没有删除 Mooncake/static-verify 守卫。流水线并行等原有限制继续生效。不同厂商设备混入同一个 TP/EP 组不在本次范围。
+
+FlagGems 的 block32 修复同时约束默认和调优配置的 K tile，避免一个 tile 跨多个 scale 组；不修改缓存中的配置字典。线性层只接受解码后的浮点 scale，`uint8 UE8M0` 与普通数值 scale 的接口明确区分。
+
+无原生 FP8 的兼容算子用 BF16 表示已经按 E4M3 舍入的激活，并在 tile 内解码权重；显式 `bf16` 模式则改变激活和权重的舍入行为。两种模式不能互称等价。缺少其他算子时，模型准入会直接报错，不会靠 FP32 fallback 启动整模。
+
+## 镜像构建
+
+默认构建产物：`sglang-fl-dsv41:0.5.18`，平台 `linux/amd64`。
+
+保持官方镜像的 Torch `2.13.0+cu130`、Triton `3.7.1`、FlashInfer `0.6.17`、sglang-kernel `0.4.6.post1`、TileLang `0.1.11`、Transformers `5.12.1`。这里不安装通用 CUDA 配方中的 FlagTree。构建依赖安装在临时 venv，不改变最终运行时的 compiler。Rust `_multimodal` 扩展从回移后的源码重编译，确认包含 `dsv41.resize_patchify`；独立 Rust API server/router 二进制不在这个 Python 服务镜像中重建。
+
+准备与 `manifest.json` 匹配的 patched FlagGems checkout，或从上游基点应用补丁：
+
+```bash
+git init FlagGems-dsv41
+git -C FlagGems-dsv41 remote add origin https://github.com/flagos-ai/FlagGems.git
+git -C FlagGems-dsv41 fetch --depth=1 origin 8ea592557659491930ebf24c24392f958b29ac21
+git -C FlagGems-dsv41 checkout --detach FETCH_HEAD
+git -C FlagGems-dsv41 apply /absolute/path/sglang-plugin-FL/docker/dsv41/patches/flaggems-dsv41.patch
+git -C FlagGems-dsv41 add src
+git -C FlagGems-dsv41 commit -m 'Apply DSV4.1 migration patch'
+```
+
+提前准备官方基础镜像和 wheelhouse。wheel 文件名与 SHA256 已锁定；下载使用运行环境的网络设置，凭据不进入构建目录。
+
+```bash
+docker pull --platform=linux/amd64 lmsysorg/sglang@sha256:bde16a8447b19e89056b9eea06c72be6c02801dc89d528c9ea90c53368fd74bf
+docker tag lmsysorg/sglang@sha256:bde16a8447b19e89056b9eea06c72be6c02801dc89d528c9ea90c53368fd74bf lmsysorg/sglang:v0.5.18
+python -m pip download --only-binary=:all: --no-deps --dest wheelhouse \
+  setuptools==76.1.0 setuptools-scm==9.2.2 setuptools-rust==1.12.0 \
+  semantic-version==2.10.0 wheel==0.46.2 SQLAlchemy==2.0.48 greenlet==3.3.2
+python docker/dsv41/build_image.py \
+  --flaggems /absolute/path/FlagGems-dsv41 \
+  --wheelhouse /absolute/path/wheelhouse \
+  --output /absolute/path/new-build-context
+```
+
+构建脚本校验基础镜像 ID、源码和 wheel 哈希，以 `git archive` 打包源码，Docker 构建阶段使用 `--network=none`。输出目录必须是新目录。直接使用 Dockerfile 构建时，默认 `FROM` 也固定为不可变 digest。
+
+## 后端开关与验收
+
+| 环境变量 | 含义 |
+| --- | --- |
+| `SGLANG_FL_DSV41_BACKEND=hybrid` | 默认迁移路径；允许固定的 vendor 路径，已接入算子优先 FlagGems |
+| `...=vendor` | 原始算子对照；配合镜像默认关闭的通用 ATen/fused-op 替换 |
+| `...=flagos` | 单算子严格检查；未覆盖路径直接报错，拒绝整模准入 |
+| `...=reference` | 只允许有界 CPU 线性层 fixture，拒绝整模准入 |
+| `SGLANG_FL_DSV41_QUANTIZATION=quantized` | 默认保留量化语义；兼容计算也显式保留 E4M3 舍入 |
+| `...=bf16` | 单算子 BF16 模式；完整模型链未覆盖，整模准入拒绝 |
+| `SGLANG_FL_DSV41_REQUIRED=1` | 插件初始化失败时禁止静默执行原生路径 |
+
+镜像默认 `USE_FLAGGEMS=0`、`SGLANG_FL_OOT_ENABLED=0`，只启用本次明确接入的 DSV4.1 数值接口，通信插件照常注册。每个接口首次执行输出 `DSV4.1 op=... backend=... quantization=...`；选择完成后不捕获异常来尝试另一后端。`Dsv41Backend.snapshot()` 可读取本进程选择记录。
+
+构建中执行依赖/源码哈希、插件 entry point、ABI、关键模块导入、Rust 符号、CPU 回归和 Triton 离线编译检查。离线编译生成 SM90/SM80 cubin，无 GPU 执行；它不能证明数值或图 replay 正确。
+
+GPU 数值测试入口已提供，默认跳过，需后续明确启用 `RUN_DSV41_GPU_TESTS=1`。正式交付前仍需验证算子数值、changed-input graph replay、整模质量、TP/EP、DSpark、冷/热长上下文及 PD。H100 源分支的性能数字不作为这轮构建验收结果。
+
+本次构建结果见 [build-result.json](build-result.json)：89 项 CPU 测试、63 个子用例通过，2 项跳过；10 个离线编译用例通过。另用明确的 CPU device/driver doubles 检查了 FlagGems 全包导入、插件初始化及 DSV4.1 注册，未执行 GPU 操作。

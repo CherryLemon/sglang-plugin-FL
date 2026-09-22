@@ -1,0 +1,1637 @@
+diff --git a/src/flag_gems/fused/DSA/__init__.py b/src/flag_gems/fused/DSA/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/flag_gems/fused/dsv41/__init__.py b/src/flag_gems/fused/dsv41/__init__.py
+new file mode 100644
+index 0000000..44d2ae2
+--- /dev/null
++++ b/src/flag_gems/fused/dsv41/__init__.py
+@@ -0,0 +1 @@
++"""DeepSeek V4.1 operators with explicit layout contracts."""
+diff --git a/src/flag_gems/fused/dsv41/block_fp8_linear.py b/src/flag_gems/fused/dsv41/block_fp8_linear.py
+new file mode 100644
+index 0000000..356d12e
+--- /dev/null
++++ b/src/flag_gems/fused/dsv41/block_fp8_linear.py
+@@ -0,0 +1,215 @@
++# Copyright 2026 FlagOS Contributors
++# Licensed under the Apache License, Version 2.0.
++"""Block-scaled E4M3 linear: native FP8 or explicit BF16 computation.
++
++Weights remain in E4M3 byte storage in all modes. The emulation kernel decodes
++only a K tile; it never creates a full BF16 weight copy. Numeric FP32 scales are
++required. UE8M0 checkpoint bytes must be decoded by the caller.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _round_e4m3(x):
++    ax = tl.minimum(tl.abs(x), 448.0)
++    exponent = tl.floor(tl.log2(tl.maximum(ax, 0.015625)))
++    step = tl.exp2(exponent - 3.0)
++    units = ax / step
++    low = tl.floor(units)
++    frac = units - low
++    inc = (frac > 0.5) | ((frac == 0.5) & ((low.to(tl.int32) & 1) != 0))
++    value = (low + inc.to(tl.float32)) * step
++    sign = x.to(tl.uint32, bitcast=True) & 0x80000000
++    return (value.to(tl.uint32, bitcast=True) | sign).to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _quantize(
++    X,
++    Q,
++    S,
++    K: tl.constexpr,
++    GROUP: tl.constexpr,
++    POW2: tl.constexpr,
++    EMULATE: tl.constexpr,
++):
++    group = tl.program_id(0)
++    offsets = group * GROUP + tl.arange(0, GROUP)
++    x = tl.load(X + offsets).to(tl.float32)
++    scale = tl.maximum(tl.max(tl.abs(x), 0), 1.0e-10) / 448.0
++    if POW2:
++        scale = tl.exp2(tl.ceil(tl.log2(scale)))
++    q = tl.minimum(tl.maximum(x / scale, -448.0), 448.0)
++    if EMULATE:
++        q = _round_e4m3(q)
++    tl.store(Q + offsets, q)
++    tl.store(S + group, scale)
++
++
++@triton.jit
++def _decode_e4m3(bits):
++    exponent = ((bits >> 3) & 15).to(tl.int32)
++    mantissa = (bits & 7).to(tl.float32)
++    value = tl.where(
++        exponent == 0,
++        mantissa * 0.001953125,
++        (1.0 + mantissa / 8.0) * tl.exp2(exponent - 7.0),
++    )
++    value = tl.where((bits & 127) == 127, float("nan"), value)
++    return tl.where((bits & 128) != 0, -value, value)
++
++
++@triton.jit
++def _bf16_matmul(
++    A,
++    W,
++    AS,
++    WS,
++    O,
++    M,
++    N,
++    K: tl.constexpr,
++    GROUP_N: tl.constexpr,
++    GROUP_K: tl.constexpr,
++    QUANTIZED: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++):
++    rows = tl.program_id(0) * BM + tl.arange(0, BM)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    kk = tl.arange(0, GROUP_K)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for group in range(tl.cdiv(K, GROUP_K)):
++        k = group * GROUP_K + kk
++        a = tl.load(A + rows[:, None] * K + k[None, :], rows[:, None] < M, 0)
++        b = tl.load(W + cols[None, :] * K + k[:, None], cols[None, :] < N, 0)
++        b = _decode_e4m3(b)
++        ws = tl.load(WS + (cols // GROUP_N) * (K // GROUP_K) + group, cols < N, 0)
++        if QUANTIZED:
++            sa = tl.load(AS + rows * (K // GROUP_K) + group, rows < M, 0)
++            dot = tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
++            acc += dot * sa[:, None] * ws[None, :]
++        else:
++            # BF16 mode intentionally changes activation and weight rounding.
++            b = (b * ws[None, :]).to(tl.bfloat16)
++            acc += tl.dot(a.to(tl.bfloat16), b)
++    tl.store(
++        O + rows[:, None] * N + cols[None, :],
++        acc,
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++def block_fp8_linear(
++    input,
++    weight,
++    block_size,
++    weight_scale,
++    input_scale=None,
++    bias=None,
++    act_scale_ue8m0=False,
++    *,
++    mode="quantized",
++    native_fp8=False,
++):
++    if mode not in ("quantized", "bf16"):
++        raise ValueError(f"Unknown DSV4.1 quantization mode: {mode}")
++    if len(block_size) != 2 or min(block_size) < 1:
++        raise ValueError("Expected positive (block_n, block_k)")
++    bn, bk = block_size
++    if bk < 32 or bk & (bk - 1):
++        raise ValueError("block_k must be a power of two >= 32")
++    n, k = weight.shape
++    if input.shape[-1] != k or k == 0 or k % bk:
++        raise ValueError("K must be positive and divisible by block_k")
++    if weight.dtype not in (torch.float8_e4m3fn, torch.uint8):
++        raise TypeError("Weights must contain E4M3FN storage")
++    if not weight_scale.is_floating_point():
++        raise TypeError("Expected numeric scales, not UE8M0 exponent bytes")
++    if tuple(weight_scale.shape) != (triton.cdiv(n, bn), k // bk):
++        raise ValueError("Invalid weight scale layout")
++    rows = input.reshape(-1, k).contiguous()
++    m = rows.shape[0]
++    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
++    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
++        raise TypeError("Unquantized input must use BF16, FP16 or FP32")
++    if input_scale is not None and mode != "quantized":
++        raise ValueError("BF16 mode does not accept pre-quantized activations")
++    out_shape = (*input.shape[:-1], n)
++    if m == 0 or n == 0:
++        return torch.empty(out_shape, dtype=out_dtype, device=input.device)
++    ws = weight_scale.float().contiguous()
++    w = weight.contiguous()
++    if mode == "quantized":
++        if input_scale is None:
++            dtype = torch.float8_e4m3fn if native_fp8 else torch.bfloat16
++            q = torch.empty_like(rows, dtype=dtype)
++            scales = torch.empty((m, k // bk), dtype=torch.float32, device=input.device)
++            _quantize[(m * (k // bk),)](
++                rows, q, scales, k, bk, act_scale_ue8m0, not native_fp8, num_warps=1
++            )
++        else:
++            if (
++                input.dtype != torch.float8_e4m3fn
++                or not input_scale.is_floating_point()
++            ):
++                raise TypeError(
++                    "Pre-quantized input requires E4M3FN and numeric scales"
++                )
++            if tuple(input_scale.shape) != (m, k // bk):
++                raise ValueError("Invalid input scale layout")
++            q = rows if native_fp8 else rows.to(torch.bfloat16)
++            scales = input_scale.float().contiguous()
++        if native_fp8:
++            from flag_gems.ops.w8a8_block_fp8_matmul import w8a8_block_fp8_matmul
++
++            out = w8a8_block_fp8_matmul(
++                q,
++                w.view(torch.float8_e4m3fn),
++                scales,
++                ws,
++                block_size,
++                output_dtype=out_dtype,
++            )
++        else:
++            out = torch.empty((m, n), device=input.device, dtype=out_dtype)
++            _bf16_matmul[(triton.cdiv(m, 16), triton.cdiv(n, 32))](
++                q,
++                w.view(torch.uint8),
++                scales,
++                ws,
++                out,
++                m,
++                n,
++                k,
++                bn,
++                bk,
++                True,
++                16,
++                32,
++                num_warps=4,
++            )
++    else:
++        out = torch.empty((m, n), device=input.device, dtype=out_dtype)
++        _bf16_matmul[(triton.cdiv(m, 16), triton.cdiv(n, 32))](
++            rows,
++            w.view(torch.uint8),
++            ws,
++            ws,
++            out,
++            m,
++            n,
++            k,
++            bn,
++            bk,
++            False,
++            16,
++            32,
++            num_warps=4,
++        )
++    if bias is not None:
++        out += bias
++    return out.reshape(out_shape)
+diff --git a/src/flag_gems/fused/dsv41/fp4_indexer.py b/src/flag_gems/fused/dsv41/fp4_indexer.py
+new file mode 100644
+index 0000000..d74c49b
+--- /dev/null
++++ b/src/flag_gems/fused/dsv41/fp4_indexer.py
+@@ -0,0 +1,949 @@
++# Copyright 2023-2026 SGLang Team
++# Copyright 2026 FlagOS Contributors
++# Licensed under the Apache License, Version 2.0.
++# Adapted from CherryLemon/sglang, runtime 7a882e727d09ed7b896b44227b80b4e0b0b7481d.
++
++"""DeepSeek V4.1 packed-FP4 indexer, ported from the validated V12 source.
++
++DeepGEMM's fp8_fp4 mqa-logits kernels need SM100/SM120. This Triton kernel covers
++the same decode step on SM90: one query token per request, scored against the
++request's visible compressed positions read straight out of the fp4 indexer
++pool (e2m1 payload + e8m0 per-32 block scales, page layout of
++store_fp4_index_k_cache), summed over heads with relu and the per-head weights.
++
++Numerics follow the torch reference path: bf16 dot, bf16 relu/weight product,
++bf16 head reduction, fp32 logits out.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++FP8_E4M3_MAX = 448.0
++INDEX_HEAD_DIM = 128
++PAYLOAD_BYTES = tl.constexpr(64)
++SCALE_BYTES = tl.constexpr(4)
++
++
++@triton.jit
++def _e2m1_decode(code):
++    # E2M1 magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. Their exact FP32
++    # encodings avoid per-element exponentiation and floating-point decoding.
++    u = code.to(tl.uint32)
++    mag = u & 7
++    bits = tl.where(
++        mag == 0, 0, tl.where(mag == 1, 0x3F000000, 0x3F000000 + (mag << 22))
++    )
++    v = (bits | ((u & 8) << 28)).to(tl.float32, bitcast=True)
++    # Legacy decoding canonicalizes FP4 -0 to +0. An explicit exact add keeps
++    # that behavior without an extra predicate/live range in the score kernel.
++    return tl.where(mag == 0, 0.0, v)
++
++
++@triton.jit
++def _fp4_index_logits_kernel(
++    q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
++    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
++    slots_ptr,  # [B, L] pool slots per (request, compressed position)
++    req_to_token_ptr,  # [num_reqs, max_context_len] full-token pool slots
++    req_ptr,  # [B] request-pool row for each query
++    candidate_blocks_ptr,
++    lens_ptr,  # [B] int64 visible compressed positions per request
++    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
++    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
++    candidate_scores_ptr,
++    candidate_lens_ptr,
++    L,
++    page_size,
++    row_stride,
++    stride_qb,
++    stride_qh,
++    stride_wb,
++    stride_req,
++    candidate_block_stride,
++    stride_out,
++    candidate_score_stride,
++    H: tl.constexpr,
++    HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
++    BLOCK_L: tl.constexpr,
++    SKIP_INVALID: tl.constexpr,
++    RATIO: tl.constexpr,
++    USE_REQ_TO_TOKEN: tl.constexpr,
++    USE_CANDIDATE_BLOCKS: tl.constexpr,
++    CANDIDATE_BLOCK_SIZE: tl.constexpr,
++    WRITE_CANDIDATES: tl.constexpr,
++    WRITE_LOGITS: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lb = tl.program_id(1)
++    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
++    offs_h = tl.arange(0, H)
++    offs_i = tl.arange(
++        0, HALF_D
++    )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
++
++    n_vis = tl.load(lens_ptr + b)
++    if SKIP_INVALID:
++        if lb * BLOCK_L >= tl.minimum(n_vis, L):
++            if WRITE_LOGITS:
++                tl.store(out_ptr + b * stride_out + offs_l, -float("inf"), offs_l < L)
++            if WRITE_CANDIDATES:
++                nblocks = (L + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
++                block_ids = lb * (BLOCK_L // CANDIDATE_BLOCK_SIZE) + tl.arange(
++                    0, BLOCK_L // CANDIDATE_BLOCK_SIZE
++                )
++                tl.store(
++                    candidate_scores_ptr + b * candidate_score_stride + block_ids,
++                    -float("inf"),
++                    block_ids < nblocks,
++                )
++                tl.store(candidate_lens_ptr + b, 0, mask=lb == 0)
++            return
++    valid = offs_l < tl.minimum(n_vis, L)
++    if USE_CANDIDATE_BLOCKS:
++        block_col = offs_l // CANDIDATE_BLOCK_SIZE
++        within = offs_l % CANDIDATE_BLOCK_SIZE
++        block = tl.load(
++            candidate_blocks_ptr + b * candidate_block_stride + block_col,
++            mask=valid,
++            other=0,
++        )
++        logical_position = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
++        req = tl.load(req_ptr + b).to(tl.int64)
++        slot = tl.load(
++            req_to_token_ptr + req * stride_req + logical_position * RATIO,
++            mask=valid,
++            other=0,
++        ).to(tl.int64)
++        slot = slot // RATIO
++    elif USE_REQ_TO_TOKEN:
++        req = tl.load(req_ptr + b).to(tl.int64)
++        slot = tl.load(
++            req_to_token_ptr + req * stride_req + offs_l.to(tl.int64) * RATIO,
++            mask=valid,
++            other=0,
++        ).to(tl.int64)
++        slot = slot // RATIO
++    else:
++        slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(
++            tl.int64
++        )
++    page = slot // page_size
++    off = slot % page_size
++    row_base = page * row_stride
++
++    # K payload: [BLOCK_L, HALF_D] uint8
++    pay = tl.load(
++        table_ptr + row_base[:, None] + off[:, None] * PAYLOAD_BYTES + offs_i[None, :],
++        mask=valid[:, None],
++        other=0,
++    )
++    low = _e2m1_decode(pay & 0x0F)
++    high = _e2m1_decode((pay >> 4) & 0x0F)
++    # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
++    sc_idx = offs_i // 16
++    exps = tl.load(
++        table_ptr
++        + row_base[:, None]
++        + page_size * PAYLOAD_BYTES
++        + off[:, None] * SCALE_BYTES
++        + sc_idx[None, :],
++        mask=valid[:, None],
++        other=127,
++    )
++    scale = tl.exp2(exps.to(tl.float32) - 127.0)
++    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
++    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
++
++    # queries: even / odd elements, [H, HALF_D] bf16
++    q_even = tl.load(
++        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
++    )
++    q_odd = tl.load(
++        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
++    )
++
++    acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
++    acc += tl.dot(q_odd, tl.trans(k_high))
++    # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
++    s = acc.to(tl.bfloat16).to(tl.float32)
++    s = tl.maximum(s, 0.0)
++    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++    logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++    logit = tl.where(valid, logit, float("-inf"))
++    if WRITE_LOGITS:
++        tl.store(out_ptr + b * stride_out + offs_l, logit, mask=offs_l < L)
++    if WRITE_CANDIDATES:
++        blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
++        block_scores = tl.reshape(logit, (blocks_per_tile, CANDIDATE_BLOCK_SIZE))
++        block_scores = tl.max(block_scores, axis=1)
++        block_ids = lb * blocks_per_tile + tl.arange(0, blocks_per_tile)
++        last_block = (n_vis - 1) // CANDIDATE_BLOCK_SIZE
++        block_scores = tl.where(
++            (n_vis > 0) & (block_ids == last_block), float("inf"), block_scores
++        )
++        num_blocks = (L + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
++        tl.store(
++            candidate_scores_ptr + b * candidate_score_stride + block_ids,
++            block_scores,
++            mask=block_ids < num_blocks,
++        )
++        tl.store(
++            candidate_lens_ptr + b,
++            (n_vis + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE,
++            mask=lb == 0,
++        )
++
++
++# Each CTA shares a request's decoded K tile across six verify queries. Keep
++# each query's original 32-head MMA and reduction layout: increasing the MMA M
++# dimension can change floating-point reduction order. Request equality is
++# checked on device on every replay; visible lengths and source writes remain
++# per query. Compact candidate lists deliberately use the original kernel.
++@triton.jit
++def _fp4_group_load_keys(
++    RT,
++    TABLE,
++    req,
++    nvis,
++    L,
++    STRIDE_REQ,
++    ROW_STRIDE,
++    PAGE,
++    RATIO: tl.constexpr,
++    BL: tl.constexpr,
++):
++    l = tl.program_id(1) * BL + tl.arange(0, BL)
++    i = tl.arange(0, 64)
++    valid = l < tl.minimum(nvis, L)
++    slot = (
++        tl.load(
++            RT + req.to(tl.int64) * STRIDE_REQ + l.to(tl.int64) * RATIO, valid, other=0
++        ).to(tl.int64)
++        // RATIO
++    )
++    page = slot // PAGE
++    off = slot % PAGE
++    row = page * ROW_STRIDE
++    pay = tl.load(
++        TABLE + row[:, None] + off[:, None] * 64 + i[None, :], valid[:, None], other=0
++    )
++    low = _e2m1_decode(pay & 15)
++    high = _e2m1_decode(pay >> 4 & 15)
++    exps = tl.load(
++        TABLE + row[:, None] + PAGE * 64 + off[:, None] * 4 + (i // 16)[None, :],
++        valid[:, None],
++        other=127,
++    )
++    scale = tl.exp2(exps.to(tl.float32) - 127.0)
++    return ((low * scale).to(tl.bfloat16), (high * scale).to(tl.bfloat16))
++
++
++@triton.jit
++def _fp4_group_invalid(
++    OUT,
++    CS,
++    CL,
++    b,
++    L,
++    SO,
++    SCS,
++    BL: tl.constexpr,
++    CB: tl.constexpr,
++    WRITE_LOGITS: tl.constexpr,
++    WRITE_CANDIDATES: tl.constexpr,
++):
++    lb = tl.program_id(1)
++    l = lb * BL + tl.arange(0, BL)
++    if WRITE_LOGITS:
++        tl.store(OUT + b * SO + l, -float("inf"), l < L)
++    if WRITE_CANDIDATES:
++        ids = lb * (BL // CB) + tl.arange(0, BL // CB)
++        tl.store(CS + b * SCS + ids, -float("inf"), ids < tl.cdiv(L, CB))
++        tl.store(CL + b, 0, lb == 0)
++
++
++@triton.jit
++def _fp4_group_score(
++    Q,
++    W,
++    OUT,
++    CS,
++    CL,
++    KL,
++    KH,
++    b,
++    nvis,
++    L,
++    SQB,
++    SQH,
++    SWB,
++    SO,
++    SCS,
++    BL: tl.constexpr,
++    CB: tl.constexpr,
++    WRITE_LOGITS: tl.constexpr,
++    WRITE_CANDIDATES: tl.constexpr,
++):
++    h = tl.arange(0, 32)
++    i = tl.arange(0, 64)
++    lb = tl.program_id(1)
++    l = lb * BL + tl.arange(0, BL)
++    qe = tl.load(Q + b * SQB + h[:, None] * SQH + 2 * i[None, :])
++    qo = tl.load(Q + b * SQB + h[:, None] * SQH + 2 * i[None, :] + 1)
++    acc = tl.dot(qe, tl.trans(KL))
++    acc += tl.dot(qo, tl.trans(KH))
++    s = tl.maximum(acc.to(tl.bfloat16).to(tl.float32), 0.0)
++    w = tl.load(W + b * SWB + h).to(tl.float32)
++    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++    logit = tl.sum(s, 0).to(tl.bfloat16).to(tl.float32)
++    logit = tl.where(l < tl.minimum(nvis, L), logit, -float("inf"))
++    if WRITE_LOGITS:
++        tl.store(OUT + b * SO + l, logit, l < L)
++    if WRITE_CANDIDATES:
++        scores = tl.max(tl.reshape(logit, (BL // CB, CB)), 1)
++        ids = lb * (BL // CB) + tl.arange(0, BL // CB)
++        scores = tl.where((nvis > 0) & (ids == (nvis - 1) // CB), float("inf"), scores)
++        tl.store(CS + b * SCS + ids, scores, ids < tl.cdiv(L, CB))
++        tl.store(CL + b, tl.cdiv(nvis, CB), lb == 0)
++
++
++@triton.jit
++def _fp4_index_logits_grouped_kernel(
++    Q,
++    W,
++    RT,
++    REQ,
++    LENS,
++    TABLE,
++    OUT,
++    CS,
++    CL,
++    B,
++    L,
++    PAGE,
++    ROW_STRIDE,
++    SQB,
++    SQH,
++    SWB,
++    SR,
++    SO,
++    SCS,
++    GROUP: tl.constexpr,
++    PGROUP: tl.constexpr,
++    RATIO: tl.constexpr,
++    BL: tl.constexpr = 64,
++    CB: tl.constexpr = 8,
++    WRITE_LOGITS: tl.constexpr = True,
++    WRITE_CANDIDATES: tl.constexpr = False,
++):
++    first = tl.program_id(0) * GROUP
++    lb = tl.program_id(1)
++    offset = tl.arange(0, PGROUP)
++    rows = first + offset
++    mask = (offset < GROUP) & (rows < B)
++    lens = tl.load(LENS + rows, mask, other=0)
++    maxlens = tl.max(lens, 0)
++    if lb * BL >= tl.minimum(maxlens, L):
++        for j in tl.range(0, GROUP, loop_unroll_factor=1):
++            b = first + j
++            if b < B:
++                _fp4_group_invalid(
++                    OUT, CS, CL, b, L, SO, SCS, BL, CB, WRITE_LOGITS, WRITE_CANDIDATES
++                )
++        return
++    req0 = tl.load(REQ + first)
++    reqs = tl.load(REQ + rows, mask, other=req0)
++    same = tl.sum((reqs != req0).to(tl.int32), 0) == 0
++    if same:
++        kl, kh = _fp4_group_load_keys(
++            RT, TABLE, req0, maxlens, L, SR, ROW_STRIDE, PAGE, RATIO, BL
++        )
++        for j in tl.range(0, GROUP, loop_unroll_factor=1):
++            b = first + j
++            if b < B:
++                nvis = tl.load(LENS + b)
++                _fp4_group_score(
++                    Q,
++                    W,
++                    OUT,
++                    CS,
++                    CL,
++                    kl,
++                    kh,
++                    b,
++                    nvis,
++                    L,
++                    SQB,
++                    SQH,
++                    SWB,
++                    SO,
++                    SCS,
++                    BL,
++                    CB,
++                    WRITE_LOGITS,
++                    WRITE_CANDIDATES,
++                )
++    else:
++        for j in tl.range(0, GROUP, loop_unroll_factor=1):
++            b = first + j
++            if b < B:
++                nvis = tl.load(LENS + b)
++                if lb * BL < tl.minimum(nvis, L):
++                    req = tl.load(REQ + b)
++                    kl, kh = _fp4_group_load_keys(
++                        RT, TABLE, req, nvis, L, SR, ROW_STRIDE, PAGE, RATIO, BL
++                    )
++                    _fp4_group_score(
++                        Q,
++                        W,
++                        OUT,
++                        CS,
++                        CL,
++                        kl,
++                        kh,
++                        b,
++                        nvis,
++                        L,
++                        SQB,
++                        SQH,
++                        SWB,
++                        SO,
++                        SCS,
++                        BL,
++                        CB,
++                        WRITE_LOGITS,
++                        WRITE_CANDIDATES,
++                    )
++                else:
++                    _fp4_group_invalid(
++                        OUT,
++                        CS,
++                        CL,
++                        b,
++                        L,
++                        SO,
++                        SCS,
++                        BL,
++                        CB,
++                        WRITE_LOGITS,
++                        WRITE_CANDIDATES,
++                    )
++
++
++def fp4_index_logits_decode(
++    q: torch.Tensor,
++    weights: torch.Tensor,
++    slots: torch.Tensor,
++    lens: torch.Tensor,
++    table: torch.Tensor,
++    page_size: int,
++) -> torch.Tensor:
++    """q [B, H, 128] bf16, weights [B, H], slots [B, L], lens [B] int64,
++    table = the layer's fp4 index-K page buffer (uint8, 2D). Returns [B, L] fp32
++    logits with -inf at positions >= lens."""
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
++    B, H, _ = q.shape
++    L = slots.shape[1]
++    assert table.dtype == torch.uint8 and table.dim() == 2
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    slots = slots.contiguous()
++    out_storage = torch.empty(
++        (B, triton.cdiv(L, 4) * 4), dtype=torch.float32, device=q.device
++    )
++    out = out_storage[:, :L]
++    if B == 0 or L == 0:
++        return out
++    BLOCK_L = 64
++    grid = (B, triton.cdiv(L, BLOCK_L))
++    _fp4_index_logits_kernel[grid](
++        q,
++        weights,
++        slots,
++        slots,
++        lens,
++        slots,
++        lens.to(torch.int64).contiguous(),
++        table,
++        out,
++        out,
++        lens,
++        L,
++        page_size,
++        table.stride(0),
++        q.stride(0),
++        q.stride(1),
++        weights.stride(0),
++        slots.stride(0),
++        slots.stride(0),
++        out.stride(0),
++        out.stride(0),
++        H=H,
++        HALF_D=INDEX_HEAD_DIM // 2,
++        BLOCK_L=BLOCK_L,
++        SKIP_INVALID=True,
++        RATIO=1,
++        USE_REQ_TO_TOKEN=False,
++        USE_CANDIDATE_BLOCKS=False,
++        CANDIDATE_BLOCK_SIZE=1,
++        WRITE_CANDIDATES=False,
++        WRITE_LOGITS=True,
++        num_warps=4,
++    )
++    return out
++
++
++def fp4_index_logits_req_to_token(
++    q: torch.Tensor,
++    weights: torch.Tensor,
++    req_to_token: torch.Tensor,
++    req: torch.Tensor,
++    lens: torch.Tensor,
++    table: torch.Tensor,
++    page_size: int,
++    ratio: int,
++    width: int,
++    candidate_block_size: int = 0,
++    write_logits: bool = True,
++    query_group_size: int = 1,
++) -> (
++    torch.Tensor
++    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
++    | tuple[torch.Tensor, torch.Tensor]
++):
++    """Score logical compressed positions without materializing their pool slots."""
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
++    B, H, _ = q.shape
++    assert req.shape == lens.shape == (B,)
++    assert req_to_token.dim() == 2 and req_to_token.stride(1) == 1
++    assert table.dtype == torch.uint8 and table.dim() == 2
++    assert ratio in (1, 2)
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    req = req.to(torch.int64).contiguous()
++    lens = lens.to(torch.int64).contiguous()
++    output_width = triton.cdiv(width, 4) * 4 if write_logits else 4
++    out_storage = torch.empty((B, output_width), dtype=torch.float32, device=q.device)
++    out = out_storage[:, :width]
++    block_l = 64
++    if candidate_block_size:
++        assert block_l % candidate_block_size == 0
++        num_blocks = triton.cdiv(width, candidate_block_size)
++        candidate_storage = torch.empty(
++            (B, triton.cdiv(num_blocks, 4) * 4),
++            dtype=torch.float32,
++            device=q.device,
++        )
++        candidate_scores = candidate_storage[:, :num_blocks]
++        candidate_lens = torch.empty(B, dtype=torch.int32, device=q.device)
++    else:
++        candidate_scores = out
++        candidate_lens = lens
++    if B == 0 or width == 0:
++        if candidate_block_size:
++            candidate_lens.zero_()
++            if not write_logits:
++                return candidate_scores, candidate_lens
++            return out, candidate_scores, candidate_lens
++        return out
++    # The caller supplies a semantic target-verify hint, never a guess from B.
++    # Unsupported heads, block layouts, and partial groups retain the old grid.
++    use_grouped = (
++        query_group_size == 6
++        and q.device.type == "cuda"
++        and torch.version.cuda is not None
++        and torch.cuda.get_device_capability(q.device) == (9, 0)
++        # Validated even request buckets from 20 through 40 share six queries.
++        # Other graph buckets (including partial groups) keep the original grid.
++        and B in (120, 132, 144, 156, 168, 180, 192, 204, 216, 228, 240)
++        and H == 32
++        and candidate_block_size in (0, 8)
++        and True
++    )
++    if use_grouped:
++        _fp4_index_logits_grouped_kernel[(B // 6, triton.cdiv(width, block_l))](
++            q,
++            weights,
++            req_to_token,
++            req,
++            lens,
++            table,
++            out,
++            candidate_scores,
++            candidate_lens,
++            B,
++            width,
++            page_size,
++            table.stride(0),
++            q.stride(0),
++            q.stride(1),
++            weights.stride(0),
++            req_to_token.stride(0),
++            out.stride(0),
++            candidate_scores.stride(0),
++            GROUP=6,
++            PGROUP=8,
++            RATIO=ratio,
++            BL=block_l,
++            CB=candidate_block_size or 1,
++            WRITE_LOGITS=write_logits,
++            WRITE_CANDIDATES=bool(candidate_block_size),
++            num_warps=4,
++        )
++    else:
++        grid = (B, triton.cdiv(width, block_l))
++        _fp4_index_logits_kernel[grid](
++            q,
++            weights,
++            req_to_token,
++            req_to_token,
++            req,
++            req_to_token,
++            lens,
++            table,
++            out,
++            candidate_scores,
++            candidate_lens,
++            width,
++            page_size,
++            table.stride(0),
++            q.stride(0),
++            q.stride(1),
++            weights.stride(0),
++            req_to_token.stride(0),
++            req_to_token.stride(0),
++            out.stride(0),
++            candidate_scores.stride(0),
++            H=H,
++            HALF_D=INDEX_HEAD_DIM // 2,
++            BLOCK_L=block_l,
++            SKIP_INVALID=True,
++            RATIO=ratio,
++            USE_REQ_TO_TOKEN=True,
++            USE_CANDIDATE_BLOCKS=False,
++            CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
++            WRITE_CANDIDATES=bool(candidate_block_size),
++            WRITE_LOGITS=write_logits,
++            num_warps=4,
++        )
++    if not write_logits:
++        assert candidate_block_size
++        return candidate_scores, candidate_lens
++    if candidate_block_size:
++        return out, candidate_scores, candidate_lens
++    return out
++
++
++def fp4_index_logits_candidate_blocks(
++    q: torch.Tensor,
++    weights: torch.Tensor,
++    req_to_token: torch.Tensor,
++    req: torch.Tensor,
++    candidate_blocks: torch.Tensor,
++    candidate_lens: torch.Tensor,
++    table: torch.Tensor,
++    page_size: int,
++    ratio: int,
++    candidate_block_size: int,
++) -> torch.Tensor:
++    """Score compact candidate blocks while resolving physical slots in-kernel."""
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
++    batch, heads, _ = q.shape
++    assert req.shape == candidate_lens.shape == (batch,)
++    assert candidate_blocks.shape[0] == batch
++    assert req_to_token.dim() == 2 and req_to_token.stride(1) == 1
++    assert table.dtype == torch.uint8 and table.dim() == 2
++    assert ratio in (1, 2)
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    req = req.to(torch.int64).contiguous()
++    candidate_lens = candidate_lens.to(torch.int32).contiguous()
++    candidate_blocks = candidate_blocks.to(torch.int32).contiguous()
++    width = candidate_blocks.shape[1] * candidate_block_size
++    out_storage = torch.empty(
++        (batch, triton.cdiv(width, 4) * 4),
++        dtype=torch.float32,
++        device=q.device,
++    )
++    out = out_storage[:, :width]
++    if batch == 0 or width == 0:
++        return out
++    block_l = 64
++    _fp4_index_logits_kernel[(batch, triton.cdiv(width, block_l))](
++        q,
++        weights,
++        candidate_blocks,
++        req_to_token,
++        req,
++        candidate_blocks,
++        candidate_lens,
++        table,
++        out,
++        out,
++        candidate_lens,
++        width,
++        page_size,
++        table.stride(0),
++        q.stride(0),
++        q.stride(1),
++        weights.stride(0),
++        req_to_token.stride(0),
++        candidate_blocks.stride(0),
++        out.stride(0),
++        out.stride(0),
++        H=heads,
++        HALF_D=INDEX_HEAD_DIM // 2,
++        BLOCK_L=block_l,
++        SKIP_INVALID=True,
++        RATIO=ratio,
++        USE_REQ_TO_TOKEN=False,
++        USE_CANDIDATE_BLOCKS=True,
++        CANDIDATE_BLOCK_SIZE=candidate_block_size,
++        WRITE_CANDIDATES=False,
++        WRITE_LOGITS=True,
++        num_warps=4,
++    )
++    return out
++
++
++@triton.jit
++def _unpack_fp4_index_keys_to_fp8_kernel(
++    slots_ptr,
++    table_ptr,
++    out_ptr,
++    page_size,
++    row_stride,
++    HALF_D: tl.constexpr,
++    FP8_MAX: tl.constexpr,
++):
++    """Decode block-scaled E2M1 values directly into E4M3."""
++    row = tl.program_id(0)
++    offs_i = tl.arange(0, HALF_D)
++    slot = tl.load(slots_ptr + row).to(tl.int64)
++    page = slot // page_size
++    off = slot % page_size
++    row_base = page * row_stride
++    pay = tl.load(table_ptr + row_base + off * PAYLOAD_BYTES + offs_i)
++    scale_block = offs_i // 16
++    exps = tl.load(
++        table_ptr
++        + row_base
++        + page_size * PAYLOAD_BYTES
++        + off * SCALE_BYTES
++        + scale_block
++    )
++    scale = tl.exp2(exps.to(tl.float32) - 127.0)
++    low = tl.clamp(_e2m1_decode(pay & 0x0F) * scale, -FP8_MAX, FP8_MAX).to(
++        out_ptr.dtype.element_ty
++    )
++    high = tl.clamp(
++        _e2m1_decode((pay >> 4) & 0x0F) * scale,
++        -FP8_MAX,
++        FP8_MAX,
++    ).to(out_ptr.dtype.element_ty)
++    out = out_ptr + row * (HALF_D * 2)
++    tl.store(out + 2 * offs_i, low)
++    tl.store(out + 2 * offs_i + 1, high)
++
++
++def unpack_fp4_index_keys_to_fp8(
++    slots: torch.Tensor,
++    table: torch.Tensor,
++    page_size: int,
++) -> torch.Tensor:
++    """Gather FP4 index-K rows and decode them directly into E4M3."""
++    assert slots.dim() == 1
++    assert table.dtype == torch.uint8 and table.dim() == 2
++    slots = slots.to(torch.int64).contiguous()
++    values = torch.empty(
++        (slots.shape[0], INDEX_HEAD_DIM),
++        dtype=torch.float8_e4m3fn,
++        device=slots.device,
++    )
++    if slots.numel() > 0:
++        _unpack_fp4_index_keys_to_fp8_kernel[(slots.shape[0],)](
++            slots,
++            table,
++            values,
++            page_size,
++            table.stride(0),
++            HALF_D=INDEX_HEAD_DIM // 2,
++            FP8_MAX=FP8_E4M3_MAX,
++            num_warps=4,
++        )
++    return values
++
++
++@triton.jit
++def _quantize_bf16_index_queries_fp8_kernel(
++    q_ptr,
++    out_ptr,
++    stride_qb,
++    stride_qh,
++    stride_ob,
++    stride_oh,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    FP8_MAX: tl.constexpr,
++):
++    row = tl.program_id(0)
++    offs_h = tl.arange(0, H)
++    offs_d = tl.arange(0, D)
++    q = tl.load(
++        q_ptr + row * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :]
++    ).to(tl.float32)
++    q_fp8 = tl.clamp(q, -FP8_MAX, FP8_MAX).to(out_ptr.dtype.element_ty)
++    tl.store(
++        out_ptr + row * stride_ob + offs_h[:, None] * stride_oh + offs_d[None, :],
++        q_fp8,
++    )
++
++
++def quantize_bf16_index_queries_fp8(
++    q: torch.Tensor,
++) -> torch.Tensor:
++    """Cast each BF16 query head to E4M3 for one K=128 tensor-core dot."""
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
++    q = q.contiguous()
++    rows, heads, _ = q.shape
++    values = torch.empty_like(q, dtype=torch.float8_e4m3fn)
++    if rows > 0:
++        _quantize_bf16_index_queries_fp8_kernel[(rows,)](
++            q,
++            values,
++            q.stride(0),
++            q.stride(1),
++            values.stride(0),
++            values.stride(1),
++            H=heads,
++            D=INDEX_HEAD_DIM,
++            FP8_MAX=FP8_E4M3_MAX,
++            num_warps=8,
++        )
++    return values
++
++
++@triton.jit
++def _fp8_index_logits_prefill_kernel(
++    q_ptr,  # [B, H, D] e4m3
++    w_ptr,  # [B, H] bf16
++    k_ptr,  # [L, D] e4m3
++    lens_ptr,  # [B] int64
++    out_ptr,  # [B, OUT_L] fp32
++    candidate_blocks_ptr,
++    stride_candidates,
++    L,
++    OUT_L,
++    stride_qb,
++    stride_qh,
++    stride_kl,
++    stride_wb,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    BLOCK_L: tl.constexpr,
++    USE_CANDIDATES: tl.constexpr,
++    CANDIDATE_BLOCK_SIZE: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lb = tl.program_id(1)
++    out_cols = lb * BLOCK_L + tl.arange(0, BLOCK_L)
++    if USE_CANDIDATES:
++        blocks = tl.load(
++            candidate_blocks_ptr
++            + b * stride_candidates
++            + out_cols // CANDIDATE_BLOCK_SIZE,
++            mask=out_cols < OUT_L,
++            other=-1,
++        ).to(tl.int64)
++        offs_l = blocks * CANDIDATE_BLOCK_SIZE + out_cols % CANDIDATE_BLOCK_SIZE
++    else:
++        offs_l = out_cols
++    offs_h = tl.arange(0, H)
++    offs_d = tl.arange(0, D)
++    n_vis = tl.load(lens_ptr + b)
++    valid = (offs_l >= 0) & (offs_l < tl.minimum(n_vis, L)) & (out_cols < OUT_L)
++    q = tl.load(q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :])
++    k = tl.load(
++        k_ptr + offs_l[:, None] * stride_kl + offs_d[None, :],
++        mask=valid[:, None],
++        other=0.0,
++    )
++    acc = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
++    # Preserve the reference post-dot rounding and reduction points.
++    s = acc.to(tl.bfloat16).to(tl.float32)
++    s = tl.maximum(s, 0.0)
++    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++    logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++    logit = tl.where(valid, logit, float("-inf"))
++    tl.store(out_ptr + b * OUT_L + out_cols, logit, mask=out_cols < OUT_L)
++
++
++def fp8_index_logits_prefill(
++    q: torch.Tensor,
++    weights: torch.Tensor,
++    keys: torch.Tensor,
++    lens: torch.Tensor,
++    *,
++    candidate_blocks: torch.Tensor | None = None,
++    candidate_block_size: int = 8,
++) -> torch.Tensor:
++    """Score E4M3 queries against E4M3 keys with FP32 accumulation.
++
++    Output rows are padded to four floats for the fused ragged top-k kernel;
++    padding remains unreachable because it is initialized to ``-inf``.
++    """
++    assert q.dtype == torch.float8_e4m3fn and q.shape[-1] == INDEX_HEAD_DIM
++    rows, heads, _ = q.shape
++    width = keys.shape[0]
++    assert keys.dtype == torch.float8_e4m3fn and keys.shape[1:] == (INDEX_HEAD_DIM,)
++    assert weights.shape == (rows, heads)
++    assert lens.shape == (rows,)
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    keys = keys.contiguous()
++    use_candidates = candidate_blocks is not None
++    if use_candidates:
++        assert candidate_blocks.ndim == 2 and candidate_blocks.shape[0] == rows
++        assert candidate_blocks.dtype in (torch.int32, torch.int64)
++        assert candidate_block_size % 4 == 0
++        out_width = candidate_blocks.shape[1] * candidate_block_size
++    else:
++        out_width = ((width + 3) // 4) * 4
++    out = torch.empty((rows, out_width), dtype=torch.float32, device=q.device)
++    if rows == 0 or out_width == 0:
++        return out
++    # On H100, the 32-head source path is limited by repeated cached loads
++    # and small CTAs, rather than HBM traffic. Widen only the key dimension:
++    # grouping query heads would change the tensor-core accumulation path.
++    # Candidate gathers need a smaller tile to retain enough resident warps.
++    block_l = 64
++    if heads == 32 and out_width >= 4096 and rows * out_width >= 262144:
++        block_l = 128 if use_candidates else 256
++    _fp8_index_logits_prefill_kernel[(rows, triton.cdiv(out_width, block_l))](
++        q,
++        weights,
++        keys,
++        lens.to(torch.int64).contiguous(),
++        out,
++        candidate_blocks if use_candidates else lens,
++        candidate_blocks.stride(0) if use_candidates else 0,
++        width,
++        out_width,
++        q.stride(0),
++        q.stride(1),
++        keys.stride(0),
++        weights.stride(0),
++        H=heads,
++        D=INDEX_HEAD_DIM,
++        BLOCK_L=block_l,
++        USE_CANDIDATES=use_candidates,
++        CANDIDATE_BLOCK_SIZE=candidate_block_size,
++        num_warps=4,
++    )
++    return out
++
++
++FP8_E4M3_MAX = 448.0
+diff --git a/src/flag_gems/fused/dsv41/mhc.py b/src/flag_gems/fused/dsv41/mhc.py
+new file mode 100644
+index 0000000..59716cb
+--- /dev/null
++++ b/src/flag_gems/fused/dsv41/mhc.py
+@@ -0,0 +1,378 @@
++# Copyright 2023-2026 SGLang Team
++# Copyright 2026 FlagOS Contributors
++# Licensed under the Apache License, Version 2.0.
++# Adapted from CherryLemon/sglang, Day0 85f8105f5d2e2e0bdea70ff50cb5449bf9567053.
++
++"""V4.1 predecessor-pre mHC; preserve FP32 mixing weights and K reductions."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _hc_combine_kernel(
++    x_ptr,
++    pre_ptr,
++    y_ptr,
++    H,
++    x_stride_m,
++    pre_stride_m,
++    pre_stride_k,
++    y_stride_m,
++    HC: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask = offs_h < H
++    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
++    for k in tl.static_range(HC):
++        pk = tl.load(pre_ptr + pid_m * pre_stride_m + k * pre_stride_k).to(tl.float32)
++        xv = tl.load(
++            x_ptr + pid_m * x_stride_m + k * H + offs_h, mask=mask, other=0.0
++        ).to(tl.float32)
++        acc += pk * xv
++    tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
++
++
++@triton.jit
++def _hc_mix_stats_partial_kernel(
++    x_ptr,
++    w_ptr,
++    part_mix_ptr,
++    part_sq_ptr,
++    M,
++    K,
++    x_stride_m,
++    w_stride_n,
++    MIX: tl.constexpr,
++    MIX_PAD: tl.constexpr,
++    NUM_SLICES: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    DOT_PRECISION: tl.constexpr,
++):
++    """Mixing dot products and row sum of squares over one K slice; the slicing
++    and tiles are compile-time constants, so a row's fp32 operation sequence
++    does not depend on the batch size."""
++    pid_m = tl.program_id(0)
++    pid_s = tl.program_id(1)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = tl.arange(0, MIX_PAD)
++    mask_m = offs_m < M
++    mask_n = offs_n < MIX
++    k_per_slice = K // NUM_SLICES
++    k_start = pid_s * k_per_slice
++    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
++    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
++    for kb in range(0, k_per_slice, BLOCK_K):
++        offs_k = k_start + kb + tl.arange(0, BLOCK_K)
++        mask_k = offs_k < k_start + k_per_slice
++        x_tile = tl.load(
++            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
++            mask=mask_m[:, None] & mask_k[None, :],
++            other=0.0,
++        ).to(tl.float32)
++        w_tile = tl.load(
++            w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
++            mask=mask_n[None, :] & mask_k[:, None],
++            other=0.0,
++        ).to(tl.float32)
++        acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
++        sq += tl.sum(x_tile * x_tile, axis=1)
++    tl.store(
++        part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
++        acc,
++        mask=mask_m[:, None] & mask_n[None, :],
++    )
++    tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
++
++
++@triton.jit
++def _hc_mix_stats_reduce_kernel(
++    part_mix_ptr,
++    part_sq_ptr,
++    mixes_ptr,
++    M,
++    inv_k,
++    eps,
++    MIX: tl.constexpr,
++    MIX_PAD: tl.constexpr,
++    NUM_SLICES: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++):
++    """Sum the NUM_SLICES partials in slice order and apply the rms scaling."""
++    pid_m = tl.program_id(0)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = tl.arange(0, MIX_PAD)
++    mask_m = offs_m < M
++    mask_n = offs_n < MIX
++    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
++    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
++    for s in tl.static_range(NUM_SLICES):
++        acc += tl.load(
++            part_mix_ptr + (s * M + offs_m[:, None]) * MIX + offs_n[None, :],
++            mask=mask_m[:, None] & mask_n[None, :],
++            other=0.0,
++        )
++        sq += tl.load(part_sq_ptr + s * M + offs_m, mask=mask_m, other=0.0)
++    rsqrt = 1.0 / tl.sqrt(sq * inv_k + eps)
++    tl.store(
++        mixes_ptr + offs_m[:, None] * MIX + offs_n[None, :],
++        acc * rsqrt[:, None],
++        mask=mask_m[:, None] & mask_n[None, :],
++    )
++
++
++_HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
++
++_HC_MIX_BLOCK_M = 32
++
++_HC_MIX_BLOCK_K = 64
++
++_HC_MIX_NUM_WARPS = 4
++
++_HC_MIX_DOT_PRECISION = "tf32x3"
++
++_HC_MIX_NUM_STAGES = 2
++
++_HC_MIX_BLOCK_M_SMALL = 8
++
++_HC_MIX_BLOCK_M_MID = 16
++
++_HC_MIX_MID_MAX_M = 2048
++
++
++def _block_m_for(m: int) -> int:
++    """Row-tile choices preserve each row's arithmetic and may depend on M."""
++    if m <= _HC_MIX_BLOCK_M_SMALL:
++        return _HC_MIX_BLOCK_M_SMALL
++    if m <= _HC_MIX_MID_MAX_M:
++        return _HC_MIX_BLOCK_M_MID
++    return _HC_MIX_BLOCK_M
++
++
++def _num_slices_for(k: int) -> int:
++    """Slice count depends only on K, never on batch size M."""
++    blocks = k // _HC_MIX_BLOCK_K
++    assert k % _HC_MIX_BLOCK_K == 0, k
++    for n in _HC_MIX_SLICE_CHOICES:
++        if blocks % n == 0:
++            return n
++    return 1
++
++
++def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
++    """Batch-invariant F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps).
++
++    x_flat is [M, K] in any float dtype; hc_fn is [MIX, K] fp32; returns [M, MIX] fp32.
++    K slicing and reduction order are independent of M, so each row is bitwise
++    identical whether computed alone or in a batch.
++    """
++    assert x_flat.dim() == 2 and hc_fn.dim() == 2
++    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
++    assert hc_fn.dtype == torch.float32
++    m, k = x_flat.shape
++    mix = hc_fn.shape[0]
++    assert hc_fn.shape[1] == k
++    num_slices = _num_slices_for(k)
++    mix_pad = max(16, triton.next_power_of_2(mix))
++    part_mix = torch.empty(
++        (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
++    )
++    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=x_flat.device)
++    mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
++    if m == 0:
++        return mixes
++    block_m = _block_m_for(m)
++    grid_m = triton.cdiv(m, block_m)
++    _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
++        x_flat,
++        hc_fn,
++        part_mix,
++        part_sq,
++        m,
++        k,
++        x_flat.stride(0),
++        hc_fn.stride(0),
++        MIX=mix,
++        MIX_PAD=mix_pad,
++        NUM_SLICES=num_slices,
++        BLOCK_M=block_m,
++        BLOCK_K=_HC_MIX_BLOCK_K,
++        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
++        num_warps=_HC_MIX_NUM_WARPS,
++        num_stages=_HC_MIX_NUM_STAGES,
++    )
++    _hc_mix_stats_reduce_kernel[(grid_m,)](
++        part_mix,
++        part_sq,
++        mixes,
++        m,
++        1.0 / k,
++        eps,
++        MIX=mix,
++        MIX_PAD=mix_pad,
++        NUM_SLICES=num_slices,
++        BLOCK_M=block_m,
++        num_warps=4,
++    )
++    return mixes
++
++
++@triton.jit
++def _hc_mix_reduce_sinkhorn_kernel(
++    part_mix_ptr,
++    part_sq_ptr,
++    scale_ptr,
++    base_ptr,
++    pre_ptr,
++    post_ptr,
++    comb_ptr,
++    m,
++    inv_k,
++    rms_eps,
++    MIX: tl.constexpr,
++    HC: tl.constexpr,
++    NUM_SLICES: tl.constexpr,
++    ITERS: tl.constexpr,
++    EPS: tl.constexpr,
++):
++    """One CTA per row keeps the sinkhorn reductions two-dimensional.
++    Per-row arithmetic follows the slice reduction, then the Triton sinkhorn.
++    """
++    row = tl.program_id(0)
++    if row >= m:
++        return
++    j = tl.arange(0, HC)
++    jj = j[:, None]
++    kk = j[None, :]
++
++    a_pre = tl.zeros([HC], dtype=tl.float32)
++    a_post = tl.zeros([HC], dtype=tl.float32)
++    a_comb = tl.zeros([HC, HC], dtype=tl.float32)
++    sq = tl.zeros([], dtype=tl.float32)
++    for s in tl.static_range(NUM_SLICES):
++        off = (s * m + row) * MIX
++        a_pre += tl.load(part_mix_ptr + off + j)
++        a_post += tl.load(part_mix_ptr + off + HC + j)
++        a_comb += tl.load(part_mix_ptr + off + 2 * HC + jj * HC + kk)
++        sq += tl.load(part_sq_ptr + s * m + row)
++    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
++
++    s0 = tl.load(scale_ptr + 0)
++    s1 = tl.load(scale_ptr + 1)
++    s2 = tl.load(scale_ptr + 2)
++
++    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
++    tl.store(pre_ptr + row * HC + j, pre)
++    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
++    tl.store(post_ptr + row * HC + j, post)
++
++    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
++    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
++    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
++    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
++    for _ in tl.static_range(ITERS - 1):
++        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
++        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
++    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
++
++
++def hc_mix_stats_sinkhorn(
++    x_flat: torch.Tensor,
++    hc_fn: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    hc_mult: int,
++    sinkhorn_iters: int,
++    rms_eps: float,
++    hc_eps: float,
++):
++    """Fuse the reduce and sinkhorn stages of hc_mix_stats followed by hc_split_sinkhorn.
++
++    The split-K kernel fixes the reduction order and preserves batch invariance.
++    Sinkhorn uses the Triton port's transcendental lowering, which differs from TileLang.
++    """
++    assert x_flat.dim() == 2 and hc_fn.dim() == 2
++    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
++    assert hc_fn.dtype == torch.float32
++    m, k = x_flat.shape
++    mix = hc_fn.shape[0]
++    assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
++    dev = x_flat.device
++    pre = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
++    post = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
++    comb = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=dev)
++    if m == 0:
++        return pre, post, comb
++
++    num_slices = _num_slices_for(k)
++    mix_pad = max(16, triton.next_power_of_2(mix))
++    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
++    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
++    block_m = _block_m_for(m)
++    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
++        x_flat,
++        hc_fn,
++        part_mix,
++        part_sq,
++        m,
++        k,
++        x_flat.stride(0),
++        hc_fn.stride(0),
++        MIX=mix,
++        MIX_PAD=mix_pad,
++        NUM_SLICES=num_slices,
++        BLOCK_M=block_m,
++        BLOCK_K=_HC_MIX_BLOCK_K,
++        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
++        num_warps=_HC_MIX_NUM_WARPS,
++        num_stages=_HC_MIX_NUM_STAGES,
++    )
++    _hc_mix_reduce_sinkhorn_kernel[(m,)](
++        part_mix,
++        part_sq,
++        hc_scale.float().contiguous(),
++        hc_base.float().contiguous(),
++        pre,
++        post,
++        comb,
++        m,
++        1.0 / k,
++        rms_eps,
++        MIX=mix,
++        HC=hc_mult,
++        NUM_SLICES=num_slices,
++        ITERS=sinkhorn_iters,
++        EPS=hc_eps,
++        num_warps=1,
++    )
++    return pre, post, comb
++
++
++def hc_combine(
++    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
++) -> torch.Tensor:
++    """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
++    m = x_flat.shape[0]
++    h = x_flat.shape[1] // hc
++    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
++    if m == 0 or h == 0:
++        return y
++    block_h = 1024
++    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
++        x_flat,
++        pre,
++        y,
++        h,
++        x_flat.stride(0),
++        pre.stride(0),
++        pre.stride(1),
++        y.stride(0),
++        HC=hc,
++        BLOCK_H=block_h,
++    )
++    return y
+diff --git a/src/flag_gems/ops/w8a8_block_fp8_matmul.py b/src/flag_gems/ops/w8a8_block_fp8_matmul.py
+index 46c4460..96a08a9 100644
+--- a/src/flag_gems/ops/w8a8_block_fp8_matmul.py
++++ b/src/flag_gems/ops/w8a8_block_fp8_matmul.py
+@@ -14,6 +14,7 @@
+ 
+ import functools
+ import logging
++import math
+ import os
+ from typing import Any, Dict, List, Optional
+ 
+@@ -32,7 +33,7 @@ def _get_default_w8a8_block_fp8_config(block_n: int, block_k: int) -> Dict[str,
+         return {
+             "BLOCK_SIZE_M": 64,
+             "BLOCK_SIZE_N": 64,
+-            "BLOCK_SIZE_K": 128,
++            "BLOCK_SIZE_K": min(128, block_k),
+             "GROUP_SIZE_M": 4,
+             "num_warps": 4,
+             "num_stages": 3,
+@@ -180,11 +181,17 @@ def w8a8_block_fp8_matmul(
+ ) -> torch.Tensor:
+     assert len(block_size) == 2
+     block_n, block_k = block_size[0], block_size[1]
++    if block_k < 32 or block_k & (block_k - 1):
++        raise ValueError("FP8 K groups must be powers of two >= 32")
++    if block_n <= 0:
++        raise ValueError("block_n must be positive")
++    if not As.is_floating_point() or not Bs.is_floating_point():
++        raise TypeError("matmul requires numeric scales; decode UE8M0 bytes first")
+ 
+     assert A.shape[-1] == B.shape[-1]
+     assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+     assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+-    M = A.numel() // A.shape[-1]
++    M = math.prod(A.shape[:-1])
+ 
+     assert B.ndim == 2 and Bs.ndim == 2
+     N, K = B.shape
+@@ -193,6 +200,10 @@ def w8a8_block_fp8_matmul(
+ 
+     C_shape = A.shape[:-1] + (N,)
+     C = A.new_empty(C_shape, dtype=output_dtype)
++    if M == 0 or N == 0:
++        return C
++    if K == 0:
++        return C.zero_()
+ 
+     configs = get_w8a8_block_fp8_configs(N, K, block_n, block_k)
+     if configs:
+@@ -200,6 +211,15 @@ def w8a8_block_fp8_matmul(
+     else:
+         config = _get_default_w8a8_block_fp8_config(block_n, block_k)
+ 
++    # One K tile loads exactly one scale per operand. Tuned configurations,
++    # like defaults, must not cross a quantization-group boundary. Copy the
++    # cached configuration so calls with another group size cannot mutate it.
++    config = dict(config)
++    tile_k = min(config["BLOCK_SIZE_K"], block_k)
++    if tile_k < 32 or block_k % tile_k:
++        raise ValueError("GEMM K tile must divide the quantization group")
++    config["BLOCK_SIZE_K"] = tile_k
++
+     def grid(META):
+         return (
+             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),

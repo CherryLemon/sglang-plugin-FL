@@ -1,0 +1,268 @@
+diff --git a/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py b/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
+index 26cb9112c9..f8983afad8 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
++++ b/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
+@@ -10,6 +10,8 @@ Numerics follow the torch reference path: bf16 dot, bf16 relu/weight product,
+ bf16 head reduction, fp32 logits out.
+ """
+ 
++from sglang.srt.layers.dsv41_ops import dsv41_op
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -428,6 +430,7 @@ def _fp4_index_logits_grouped_kernel(
+                     )
+ 
+ 
++@dsv41_op("indexer.fp4_index_logits_decode")
+ def fp4_index_logits_decode(
+     q: torch.Tensor,
+     weights: torch.Tensor,
+@@ -491,6 +494,7 @@ def fp4_index_logits_decode(
+     return out
+ 
+ 
++@dsv41_op("indexer.fp4_index_logits_req_to_token")
+ def fp4_index_logits_req_to_token(
+     q: torch.Tensor,
+     weights: torch.Tensor,
+@@ -626,6 +630,7 @@ def fp4_index_logits_req_to_token(
+     return out
+ 
+ 
++@dsv41_op("indexer.fp4_index_logits_candidate_blocks")
+ def fp4_index_logits_candidate_blocks(
+     q: torch.Tensor,
+     weights: torch.Tensor,
+@@ -738,6 +743,7 @@ def _unpack_fp4_index_keys_to_fp8_kernel(
+     tl.store(out + 2 * offs_i + 1, high)
+ 
+ 
++@dsv41_op("indexer.unpack_fp4_index_keys_to_fp8")
+ def unpack_fp4_index_keys_to_fp8(
+     slots: torch.Tensor,
+     table: torch.Tensor,
+@@ -791,6 +797,7 @@ def _quantize_bf16_index_queries_fp8_kernel(
+     )
+ 
+ 
++@dsv41_op("indexer.quantize_bf16_index_queries_fp8")
+ def quantize_bf16_index_queries_fp8(
+     q: torch.Tensor,
+ ) -> torch.Tensor:
+@@ -871,6 +878,7 @@ def _fp8_index_logits_prefill_kernel(
+     tl.store(out_ptr + b * OUT_L + out_cols, logit, mask=out_cols < OUT_L)
+ 
+ 
++@dsv41_op("indexer.fp8_index_logits_prefill")
+ def fp8_index_logits_prefill(
+     q: torch.Tensor,
+     weights: torch.Tensor,
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index e0faa24250..26be950a50 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1,3 +1,5 @@
++
++from sglang.srt.layers.dsv41_ops import dsv41_op
+ import functools
+ import importlib
+ import logging
+@@ -1783,6 +1785,7 @@ def _num_slices_for(k: int) -> int:
+     return 1
+ 
+ 
++@dsv41_op("mhc.hc_mix_stats")
+ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
+     """Batch-invariant F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps).
+ 
+@@ -1900,6 +1903,7 @@ def _hc_mix_reduce_sinkhorn_kernel(
+     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
+ 
+ 
++@dsv41_op("mhc.hc_mix_stats_sinkhorn")
+ def hc_mix_stats_sinkhorn(
+     x_flat: torch.Tensor,
+     hc_fn: torch.Tensor,
+@@ -1972,6 +1976,7 @@ def hc_mix_stats_sinkhorn(
+     return pre, post, comb
+ 
+ 
++@dsv41_op("mhc.hc_combine")
+ def hc_combine(
+     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+ ) -> torch.Tensor:
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 058eeeaa94..07c717e59a 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from sglang.srt.layers.dsv41_ops import dsv41_op
++
+ import enum
+ import functools
+ import logging
+@@ -2765,6 +2767,7 @@ class DeepseekV4AttnBackend(
+ 
+     # ---- DeepSeek V4.1 ratio 1/2 compressor and indexer, torch bring-up path ----
+ 
++    @dsv41_op("cache.low_ratio_sources")
+     def forward_low_ratio_sources(
+         self,
+         *,
+@@ -3968,6 +3971,7 @@ class DeepseekV4AttnBackend(
+             cache_k=swa_k,
+         )
+ 
++    @dsv41_op("attention.sparse")
+     def forward(self, q, k, v, layer, forward_batch, *args, **kwargs):
+         result = self._forward_attention(q, k, v, layer, forward_batch, *args, **kwargs)
+         window = self.token_to_kv_pool.request_window
+diff --git a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+index fed37ce227..f52eb57269 100644
+--- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -7,6 +7,8 @@ for subsequent attention layers.
+ 
+ from __future__ import annotations
+ 
++from sglang.srt.layers.dsv41_ops import dsv41_op
++
+ from typing import Optional, Tuple
+ 
+ import torch
+@@ -77,6 +79,7 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
+     )
+ 
+ 
++@dsv41_op("rope.tail")
+ def rope_tail(
+     x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
+ ) -> torch.Tensor:
+diff --git a/python/sglang/srt/layers/dsv41_ops.py b/python/sglang/srt/layers/dsv41_ops.py
+new file mode 100644
+index 0000000000..6fa945f650
+--- /dev/null
++++ b/python/sglang/srt/layers/dsv41_ops.py
+@@ -0,0 +1,52 @@
++"""Versioned, optional OOT interface for DeepSeek V4.1 numerical kernels.
++
++The engine owns model/state semantics; a plugin selects an implementation before
++launch. Exceptions are propagated, never interpreted as a request to retry with
++another backend. Importing this module does not initialize a device.
++"""
++
++from functools import wraps
++import os
++from typing import Callable, Optional
++
++ABI_VERSION = 1
++_dispatch: Optional[Callable] = None
++_validate_model: Optional[Callable] = None
++
++
++def register_backend(dispatch: Callable, *, abi_version: int, validate_model=None):
++    global _dispatch, _validate_model
++    if abi_version != ABI_VERSION:
++        raise RuntimeError(f"DSV4.1 OOT ABI mismatch: {abi_version} != {ABI_VERSION}")
++    if _dispatch is not None and _dispatch is not dispatch:
++        raise RuntimeError("A DSV4.1 OOT backend is already registered")
++    _dispatch, _validate_model = dispatch, validate_model
++
++
++def require_backend():
++    if _dispatch is None and os.environ.get("SGLANG_FL_DSV41_REQUIRED", "0") == "1":
++        raise RuntimeError(
++            "DSV4.1 requires sglang_fl initialization; check plugin startup errors "
++            "and SGLANG_PLUGINS (expected sglang_fl)"
++        )
++
++
++def validate_model(config):
++    require_backend()
++    if _validate_model is not None:
++        _validate_model(config)
++
++
++def dsv41_op(name: str):
++    def decorate(native):
++        @wraps(native)
++        def wrapped(*args, **kwargs):
++            require_backend()
++            if _dispatch is None:
++                return native(*args, **kwargs)
++            return _dispatch(name, native, *args, **kwargs)
++
++        wrapped.__dsv41_op__ = name
++        return wrapped
++
++    return decorate
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index f3ab8b3174..c36df8664e 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from sglang.srt.layers.dsv41_ops import dsv41_op
++
+ import logging
+ from enum import Enum
+ from functools import lru_cache, partial
+@@ -1290,6 +1292,7 @@ def aiter_w8a8_block_fp8_linear(
+     ).view(*output_shape)
+ 
+ 
++@dsv41_op("linear.block_fp8")
+ def triton_w8a8_block_fp8_linear(
+     input: torch.Tensor,
+     weight: torch.Tensor,
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index ae99418883..22b00eed1b 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from sglang.srt.layers.dsv41_ops import dsv41_op
++
+ import concurrent.futures
+ import functools
+ import logging
+@@ -2463,6 +2465,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+             y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
+         return y, post.squeeze(1), comb.squeeze(1), False
+ 
++    @dsv41_op("mhc.post")
+     def hc_post(
+         self,
+         x: torch.Tensor,
+@@ -2730,6 +2733,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
+         return hidden_states, residual, post, comb
+ 
++    @dsv41_op("mhc.mix_and_combine")
+     def _hc_mix_and_combine(
+         self,
+         x: torch.Tensor,
+@@ -2906,6 +2910,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+         return hidden_states, ffn_pre
+ 
++    @dsv41_op("moe.tp_ep")
+     def _run_moe_ffn_dp_sync(
+         self,
+         hidden_states: torch.Tensor,
+@@ -4168,6 +4173,9 @@ class DeepseekV4ForCausalLM(nn.Module):
+         prefix: str = "",
+     ) -> None:
+         super().__init__()
++        from sglang.srt.layers.dsv41_ops import validate_model
++
++        validate_model(config)
+         # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
+         # batched/contiguous-load rope kernels (faster on gfx95; .
+         # Module-level toggles default OFF; flipped True here for DSV4

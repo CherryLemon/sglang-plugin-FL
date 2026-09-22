@@ -1,0 +1,1153 @@
+diff --git a/benchmark/deepseek_v41_h100/tune_block32.py b/benchmark/deepseek_v41_h100/tune_block32.py
+index 0b297f2823..b860f87801 100644
+--- a/benchmark/deepseek_v41_h100/tune_block32.py
++++ b/benchmark/deepseek_v41_h100/tune_block32.py
+@@ -117,7 +117,7 @@ def main():
+             for cfg in configs:
+                 impl.get_w8a8_block_fp8_configs = lambda *args, config=cfg: {m: config}
+ 
+-                def fn(dtype=torch.bfloat16):
++                def fn(dtype=torch.bfloat16, q=q, w=w, qs=qs, ws=ws):
+                     return impl.w8a8_block_fp8_matmul_triton(
+                         q, w, qs, ws, [32, 32], output_dtype=dtype
+                     )
+diff --git a/python/sglang/kernels/jit/csrc/misc/probe.cuh b/python/sglang/kernels/jit/csrc/misc/probe.cuh
+new file mode 100644
+index 0000000000..63019b6a3a
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/misc/probe.cuh
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/utils.cuh>
++
++namespace sglang {
++
++__global__ void dummy_probe_kernel() {}
++
++uint32_t get_max_active_clusters(uint32_t cluster_size, uint32_t num_waves) {
++#if !SGL_ARCH_HOPPER_OR_GREATER
++  host::Panic("cluster is not supported on arch before CUDA sm90");
++#else
++  int device;
++  int max_threads_per_sm;
++  int smem_per_sm;
++  int smem_per_block;
++  int num_clusters;
++  CHECK_CUDA(cudaGetDevice(&device));
++  CHECK_CUDA(cudaDeviceGetAttribute(&max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
++  CHECK_CUDA(cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
++  CHECK_CUDA(cudaDeviceGetAttribute(&smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
++
++  // Threads alone cannot pin the probe to `num_waves` blocks per SM: a block
++  // caps at 1024, so num_waves == 1 still leaves room for a second block. Spend
++  // the shared budget instead -- what one block gets at this occupancy, less the
++  // per-block driver reserve, floored to the 1 KiB allocation granularity so the
++  // driver cannot round it back up and squeeze out a block.
++  const auto reserved = static_cast<uint32_t>(smem_per_sm - smem_per_block);
++  const auto budget = static_cast<uint32_t>(smem_per_sm) / num_waves;
++  const auto smem = (std::min(budget - std::min(budget, reserved), static_cast<uint32_t>(smem_per_block))) & ~1023u;
++  const auto num_warps = std::max(1u, std::min(1024u, static_cast<uint32_t>(max_threads_per_sm) / num_waves) / 32);
++
++  // Widths above 8 are non-portable and the query rejects them without this.
++  CHECK_CUDA(cudaFuncSetAttribute(
++      reinterpret_cast<const void*>(dummy_probe_kernel), cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
++  CHECK_CUDA(cudaFuncSetAttribute(
++      reinterpret_cast<const void*>(dummy_probe_kernel),
++      cudaFuncAttributeMaxDynamicSharedMemorySize,
++      static_cast<int>(smem)));
++
++  cudaLaunchConfig_t config = {};  // stream/dynamicSmemBytes must not be garbage
++  config.gridDim = dim3{cluster_size, 1024u};
++  config.blockDim = dim3{32, num_warps};
++  config.dynamicSmemBytes = smem;
++  config.numAttrs = 1;
++  cudaLaunchAttribute attr = {};
++  attr.id = cudaLaunchAttributeClusterDimension;
++  attr.val.clusterDim = {cluster_size, 1, 1};
++  config.attrs = &attr;
++  CHECK_CUDA(cudaOccupancyMaxActiveClusters(&num_clusters, dummy_probe_kernel, &config));
++  return num_clusters;
++#endif
++}
++
++}  // namespace sglang
+diff --git a/python/sglang/kernels/ops/attention/dsv4/topk.py b/python/sglang/kernels/ops/attention/dsv4/topk.py
+index 48c0a51d0d..610c483138 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/topk.py
++++ b/python/sglang/kernels/ops/attention/dsv4/topk.py
+@@ -44,8 +44,10 @@ def _jit_topk_v2_module():
+         except Exception:
+             pass
+         extra_cuda_cflags = [
+-            f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}",
+-            f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}",
++            f"-D{name}={value}"
++            for name, value in (("SGL_TOPK_V2_MAX_C8_OCC2", occ_8_2),
++                                ("SGL_TOPK_V2_MAX_C16_OCC1", occ_16_1))
++            if value > 0
+         ]
+     kernel = f"TopKKernel<{args}>"
+     return load_jit(
+diff --git a/python/sglang/kernels/ops/misc.py b/python/sglang/kernels/ops/misc.py
+new file mode 100644
+index 0000000000..4e056f1078
+--- /dev/null
++++ b/python/sglang/kernels/ops/misc.py
+@@ -0,0 +1,61 @@
++"""Device probes that a launch configuration depends on.
++
++Not an operator group -- these answer "what will the hardware actually schedule",
++which a host-side dispatch needs before it can size a grid. Kept out of
++``ops/__init__``'s eager group import for that reason; import it directly.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++from sglang.kernels.jit.utils import cache_once, load_jit
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++__all__ = ["get_max_active_clusters"]
++
++
++@cache_once
++def _jit_probe_module() -> Module:
++    return load_jit(
++        "misc_probe",
++        cuda_files=["misc/probe.cuh"],
++        cuda_wrappers=[("get_max_active_clusters", "get_max_active_clusters")],
++    )
++
++
++@cache_once
++def _get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
++    return int(_jit_probe_module().get_max_active_clusters(cluster_size, occupancy))
++
++
++def get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
++    """Clusters of ``cluster_size`` blocks that can be resident at once.
++
++    Asks the driver (``cudaOccupancyMaxActiveClusters``) rather than dividing SM
++    count by cluster size: a cluster's blocks must be co-scheduled within one
++    GPC, so the answer falls short of ``num_sms * occupancy / cluster_size`` once
++    the cluster stops dividing a GPC evenly. On B200 (148 SMs) at occupancy 2 the
++    driver reports 33 clusters of 8 where the division says 37, and 14 of 16
++    where it says 18.
++
++    Probed with an empty kernel pinned to ``occupancy`` blocks per SM, so the
++    answer is the *scheduling* limit at that occupancy and nothing else. Pass the
++    occupancy the real kernel reaches (the second ``__launch_bounds__``
++    argument), not the one it asks for.
++
++    :param cluster_size: Blocks per cluster.
++    :param occupancy: Blocks per SM (``num_waves`` in ``csrc/misc/probe.cuh``).
++    :raises RuntimeError: On pre-sm90 devices, which have no clusters.
++    :raises ValueError: If nothing is schedulable, which a real device should
++                        never report for a cluster width it supports.
++    """
++    result = _get_max_active_clusters(cluster_size, occupancy)
++    if result == 0:
++        raise ValueError(
++            f"no cluster of {cluster_size} fits at occupancy {occupancy}; "
++            "the cluster width is likely beyond what this device supports"
++        )
++    return result
+diff --git a/python/sglang/srt/configs/deepseek_v4.py b/python/sglang/srt/configs/deepseek_v4.py
+index 087e7971ae..af8650f39c 100644
+--- a/python/sglang/srt/configs/deepseek_v4.py
++++ b/python/sglang/srt/configs/deepseek_v4.py
+@@ -103,14 +103,14 @@ class DeepSeekV4Config(PretrainedConfig):
+ 
+     compress_rope_theta: int = 40000
+     compress_ratios: List[int] = field(default_factory=list)
+-    kv_source_layer_ids: List[int] = field(default_factory=list)
+-    index_source_layer_ids: List[int] = field(default_factory=list)
++    kv_source_layer_ids: List[int] | tuple[int, ...] = ()
++    index_source_layer_ids: List[int] | tuple[int, ...] = ()
+     candidate_source_layer_id: int = -1
+     candidate_topk_blocks: int = 0
+     candidate_block_size: int = 0
+ 
+-    engram_layer_ids: List[int] = field(default_factory=list)
+-    engram_num_embeddings: List[int] = field(default_factory=list)
++    engram_layer_ids: List[int] | tuple[int, ...] = ()
++    engram_num_embeddings: List[int] | tuple[int, ...] = ()
+     engram_max_ngram_size: int = 1
+     engram_vocab_size: int = 0
+     engram_n_heads: int = 0
+diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
+index a4e7a992ae..ec58a95ba9 100644
+--- a/python/sglang/srt/layers/attention/dsv4/indexer.py
++++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
+@@ -19,14 +19,8 @@ import torch.nn.functional as F
+ from sglang.kernels.ops.attention.dsv4 import (
+     fused_q_indexer_rope_hadamard_fp4_quant,
+     fused_q_indexer_rope_hadamard_quant,
+-    plan_topk_v2,
+-    topk_transform_paged,
+-    topk_transform_paged_v2,
+-)
+-from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+-    aiter_fp4_paged_mqa_logits,
+-    aiter_q_indexer_fp4,
+-    logits_rows_per_chunk,
++    topk_transform_512,
++    topk_transform_512_v2,
+ )
+ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+@@ -35,7 +29,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+ from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+ from sglang.srt.layers.attention.dsv4.compressor import Compressor
+ from sglang.srt.layers.attention.dsv4.metadata import (
+-    _SM120_INDEXER_M_CHUNK,
+     NonPagedIndexerPlan,
+     PagedIndexerMetadata,
+ )
+@@ -47,13 +40,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
+ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+     is_in_tc_piecewise_cuda_graph,
+ )
+-from sglang.srt.runtime_context import (
+-    get_exec,
+-    get_parallel,
+-    get_platform,
+-)
++from sglang.srt.runtime_context import get_exec, get_parallel
+ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+ from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
++from sglang.srt.utils.common import is_sm120_supported
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+@@ -216,9 +206,9 @@ def fp8_paged_mqa_logits_torch_sm120(
+         )
+ 
+     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
+-    assert block_size == 64, (
+-        "Vectorized torch impl hardcodes block_size=64 cache layout"
+-    )
++    assert (
++        block_size == 64
++    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
+     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+     assert weight.shape == (batch_size, num_heads)
+@@ -267,7 +257,7 @@ def fp8_paged_mqa_logits_torch_sm120(
+     return logits
+ 
+ 
+-def _topk_transform_vectorized(
++def _topk_transform_512_vectorized(
+     scores: torch.Tensor,
+     seq_lens: torch.Tensor,
+     page_tables: torch.Tensor,
+@@ -355,7 +345,7 @@ def _topk_transform_vectorized(
+         out_raw_indices.copy_(raw_indices)
+ 
+ 
+-def topk_transform_pytorch_vectorized(
++def topk_transform_512_pytorch_vectorized(
+     scores: torch.Tensor,
+     seq_lens: torch.Tensor,
+     page_tables: torch.Tensor,
+@@ -363,11 +353,11 @@ def topk_transform_pytorch_vectorized(
+     page_size: int,
+     out_raw_indices: Optional[torch.Tensor] = None,
+ ) -> None:
+-    """Vectorized PyTorch fallback for topk_transform_paged.
++    """Vectorized PyTorch fallback for topk_transform_512.
+     All helper tensors (arange, zeros) are cached to avoid device-tensor
+     creation during HIP/CUDA graph capture."""
+ 
+-    _topk_transform_vectorized(
++    _topk_transform_512_vectorized(
+         scores,
+         seq_lens,
+         page_tables,
+@@ -379,7 +369,7 @@ def topk_transform_pytorch_vectorized(
+     )
+ 
+ 
+-def topk_transform_flashinfer_unfused(
++def topk_transform_512_flashinfer_unfused(
+     scores: torch.Tensor,
+     seq_lens: torch.Tensor,
+     page_tables: torch.Tensor,
+@@ -393,7 +383,7 @@ def topk_transform_flashinfer_unfused(
+         _flashinfer_tie_break_value,
+     )
+ 
+-    _topk_transform_vectorized(
++    _topk_transform_512_vectorized(
+         scores,
+         seq_lens,
+         page_tables,
+@@ -411,44 +401,11 @@ def topk_transform_flashinfer_unfused(
+     )
+ 
+ 
+-def topk_transform_flashinfer_fused(
+-    scores: torch.Tensor,
+-    seq_lens: torch.Tensor,
+-    page_tables: torch.Tensor,
+-    out_page_indices: torch.Tensor,
+-    page_size: int,
+-    out_raw_indices: Optional[torch.Tensor] = None,
+-) -> None:
+-    import flashinfer
+-
+-    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+-        _flashinfer_tie_break_value,
+-    )
+-
+-    flashinfer.top_k_page_table_transform(
+-        scores,
+-        page_tables.contiguous(),
+-        seq_lens.contiguous(),
+-        out_page_indices.shape[1],
+-        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+-        tie_break=_flashinfer_tie_break_value(),
+-        dsa_graph_safe=True,
+-        page_size=page_size,
+-        out=out_page_indices,
+-        out_raw_indices=out_raw_indices,
+-    )
+-
+-
+ class C4IndexerBackendMixin:
+     def __init__(self):
+         super().__init__()
+         self.debug_use_external_c4_sparse_indices: bool = False
+         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+-        self.flashinfer_topk_transform: Callable[..., None] = (
+-            topk_transform_flashinfer_fused
+-            if envs.SGLANG_DSA_FUSE_TOPK.get()
+-            else topk_transform_flashinfer_unfused
+-        )
+ 
+     def _forward_prepare_multi_stream(
+         self,
+@@ -701,13 +658,8 @@ class C4IndexerBackendMixin:
+         core_metadata = metadata.core_metadata
+ 
+         assert isinstance(indexer_metadata, PagedIndexerMetadata)
+-        use_aiter_fp4 = c4_indexer.use_fp4_indexer and is_hip()
+ 
+         positions = core_metadata.positions
+-        if use_aiter_fp4:
+-            widened = getattr(metadata, "fp4_q_positions", None)
+-            if widened is not None and widened.shape == positions.shape:
+-                positions = widened
+         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+         if x.shape[0] != num_queries:
+             x = x[:num_queries]
+@@ -739,9 +691,7 @@ class C4IndexerBackendMixin:
+ 
+         use_fp4_indexer = c4_indexer.use_fp4_indexer
+ 
+-        if use_aiter_fp4:
+-            q = q_indexer
+-        elif use_fp4_indexer:
++        if use_fp4_indexer:
+             q_fp4, q_sf = q_indexer
+             assert len(q_fp4.shape) == 3
+             assert len(q_sf.shape) == 2
+@@ -750,18 +700,13 @@ class C4IndexerBackendMixin:
+             assert len(q_indexer.shape) == 3
+             q = q_indexer.unsqueeze(1)
+ 
+-        if use_aiter_fp4:
+-            weights = weights.contiguous()
+-        else:
+-            assert len(weights.shape) == 3
+-            weights = weights.squeeze(2)
+-        if use_fp4_indexer and not use_aiter_fp4:
++        assert len(weights.shape) == 3
++        weights = weights.squeeze(2)
++        if use_fp4_indexer:
+             weights = weights.float()
+             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
+             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+-        elif use_aiter_fp4:
+-            fn = None
+         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                 tilelang_fp8_paged_mqa_logits as fn,
+@@ -769,7 +714,7 @@ class C4IndexerBackendMixin:
+         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+             fn = _aiter_fp8_paged_mqa_logits
+         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+-            if get_platform().is_sm120:
++            if is_sm120_supported():
+                 fn = fp8_paged_mqa_logits_torch_sm120
+             else:
+                 fn = fp8_paged_mqa_logits_torch
+@@ -792,9 +737,7 @@ class C4IndexerBackendMixin:
+             pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
+             return F.pad(tensor, pad, value=value)
+ 
+-        c4_seq_lens = match_num_queries(
+-            indexer_metadata.c4_seq_lens, value=0 if use_aiter_fp4 else 1
+-        )
++        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+         _c4sl = c4_seq_lens
+         page_table = match_num_queries(indexer_metadata.page_table, value=0)
+         c4_sparse_page_indices = match_num_queries(
+@@ -804,27 +747,46 @@ class C4IndexerBackendMixin:
+             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
+         )
+         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+-        _use_torch_fn = (
+-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
+-        )
+-        if (
+-            _c4sl.dim() == 1
+-            and not _use_tilelang
+-            and not _use_aiter
+-            and not _use_torch_fn
+-            and not use_aiter_fp4
+-        ):
++        if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
+             _c4sl = _c4sl.unsqueeze(-1)
+-        nonpaged_plan = None
+-        if not use_aiter_fp4:
+-            nonpaged_plan = self._get_nonpaged_indexer_plan(
++        nonpaged_plan = self._get_nonpaged_indexer_plan(
++            c4_indexer=c4_indexer,
++            forward_batch=forward_batch,
++            indexer_metadata=indexer_metadata,
++            page_table=page_table,
++            c4_seq_lens=c4_seq_lens,
++            query_rows=query_rows,
++        )
++        if nonpaged_plan is not None:
++            assert isinstance(q_indexer, torch.Tensor)
++            logits = self._forward_nonpaged_indexer(
++                q_indexer=q_indexer,
++                weights=weights,
+                 c4_indexer=c4_indexer,
+-                forward_batch=forward_batch,
+-                indexer_metadata=indexer_metadata,
+-                page_table=page_table,
+-                c4_seq_lens=c4_seq_lens,
+-                query_rows=query_rows,
++                token_to_kv_pool=token_to_kv_pool,
++                plan=nonpaged_plan,
+             )
++        else:
++            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
++                layer_id=c4_indexer.layer_id,
++            )
++            assert c4_indexer_kv_cache.dim() == 2
++            head_dim_with_sf = 68 if use_fp4_indexer else 132
++            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
++                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
++            )
++            logits = fn(
++                q,
++                c4_indexer_kv_cache,
++                weights,
++                _c4sl,
++                page_table,
++                indexer_metadata.deep_gemm_metadata,
++                indexer_metadata.max_c4_seq_len,
++                False,
++            )
++
++        assert indexer_metadata.page_table is core_metadata.page_table
+         if self.debug_use_external_c4_sparse_indices:
+             return
+ 
+@@ -846,143 +808,43 @@ class C4IndexerBackendMixin:
+                 : c4_sparse_page_indices.size(0)
+             ]
+ 
+-        all_rows = slice(0, _c4sl.shape[0])
+-
+-        def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
+-            row_raw_indices = raw_indices[rows] if raw_indices is not None else None
+-            if self.dsa_topk_backend.is_torch():
+-                topk_transform_pytorch_vectorized(
+-                    logits,
+-                    c4_seq_lens[rows],
+-                    page_table[rows],
+-                    c4_sparse_page_indices[rows],
+-                    indexer_metadata.c4_page_size,
+-                    row_raw_indices,
+-                )
+-            elif self.dsa_topk_backend.is_flashinfer():
+-                self.flashinfer_topk_transform(
+-                    logits,
+-                    c4_seq_lens[rows],
+-                    page_table[rows],
+-                    c4_sparse_page_indices[rows],
+-                    indexer_metadata.c4_page_size,
+-                    row_raw_indices,
+-                )
+-            elif self.dsa_topk_backend.should_use_topk_v2():
+-                topk_transform_paged_v2(
+-                    logits,
+-                    c4_seq_lens[rows],
+-                    page_table[rows],
+-                    c4_sparse_page_indices[rows],
+-                    indexer_metadata.c4_page_size,
+-                    # The cached plan routes rows by their index in the full
+-                    # range, so a chunk needs one built over its own rows.
+-                    (
+-                        indexer_metadata.topk_metadata
+-                        if rows == all_rows or not is_hip()
+-                        else plan_topk_v2(c4_seq_lens[rows])
+-                    ),
+-                    row_raw_indices,
+-                )
+-            else:
+-                topk_transform_paged(
+-                    logits,
+-                    c4_seq_lens[rows],
+-                    page_table[rows],
+-                    c4_sparse_page_indices[rows],
+-                    indexer_metadata.c4_page_size,
+-                    row_raw_indices,
+-                )
+-
+-        if nonpaged_plan is not None:
+-            assert isinstance(q_indexer, torch.Tensor)
+-            logits = self._forward_nonpaged_indexer(
+-                q_indexer=q_indexer,
+-                weights=weights,
+-                c4_indexer=c4_indexer,
+-                token_to_kv_pool=token_to_kv_pool,
+-                plan=nonpaged_plan,
++        if self.dsa_topk_backend.is_torch():
++            topk_transform_512_pytorch_vectorized(
++                logits,
++                c4_seq_lens,
++                page_table,
++                c4_sparse_page_indices,
++                indexer_metadata.c4_page_size,
++                raw_indices,
+             )
+-            run_topk_transform(all_rows, logits)
+-        elif use_aiter_fp4:
+-            q_fp4, q_scale = q
+-            is_decode = forward_batch.forward_mode.is_decode()
+-            # Hoisted: these await this layer's KV transfer, which every chunk
+-            # would otherwise re-await.
+-            k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
+-                c4_indexer.layer_id
++        elif self.dsa_topk_backend.is_flashinfer():
++            topk_transform_512_flashinfer_unfused(
++                logits,
++                c4_seq_lens,
++                page_table,
++                c4_sparse_page_indices,
++                indexer_metadata.c4_page_size,
++                raw_indices,
+             )
+-            k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
+-
+-            def run_fp4_indexer(rows: slice) -> None:
+-                logits = aiter_fp4_paged_mqa_logits(
+-                    q_fp4=q_fp4[rows],
+-                    q_scale=q_scale[rows],
+-                    k_payload=k_payload,
+-                    k_scale=k_scale,
+-                    weights=weights[rows],
+-                    page_table=page_table[rows],
+-                    c4_seq_lens=c4_seq_lens[rows],
+-                    weight_scale=c4_indexer.weight_scale,
+-                    is_decode=is_decode,
+-                    decode_workspace=metadata.fp4_decode_workspace,
+-                    prefill_workspace=metadata.fp4_prefill_workspace,
+-                )
+-                run_topk_transform(rows, logits)
+-
+-            # The scores are the layer's largest transient and their width tracks
+-            # context length, so prefill splits the rows into whatever fits the
+-            # pooled logits block and reduces each chunk before the next one
+-            # reuses it. Rows are scored and reduced independently, so this
+-            # matches a single pass. Decode's rectangle is bounded by its capture
+-            # shapes, so it always stays whole.
+-            rows_per_chunk = (
+-                query_rows if is_decode else logits_rows_per_chunk(page_table)
++        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
++            topk_transform_512_v2(
++                logits,
++                c4_seq_lens,
++                page_table,
++                c4_sparse_page_indices,
++                indexer_metadata.c4_page_size,
++                indexer_metadata.topk_metadata,
++                raw_indices,
+             )
+-            if rows_per_chunk >= query_rows:
+-                run_fp4_indexer(all_rows)
+-            else:
+-                for start in range(0, query_rows, max(1, rows_per_chunk)):
+-                    run_fp4_indexer(
+-                        slice(start, min(start + rows_per_chunk, query_rows))
+-                    )
+         else:
+-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+-                layer_id=c4_indexer.layer_id,
+-            )
+-            assert c4_indexer_kv_cache.dim() == 2
+-            head_dim_with_sf = 68 if use_fp4_indexer else 132
+-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
++            topk_transform_512(
++                logits,
++                c4_seq_lens,
++                page_table,
++                c4_sparse_page_indices,
++                indexer_metadata.c4_page_size,
++                raw_indices,
+             )
+-
+-            def run_paged_indexer(rows: slice, metadata: torch.Tensor) -> None:
+-                row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
+-                logits = fn(
+-                    row_q,
+-                    c4_indexer_kv_cache,
+-                    weights[rows],
+-                    _c4sl[rows],
+-                    page_table[rows],
+-                    metadata,
+-                    indexer_metadata.max_c4_seq_len,
+-                    False,
+-                )
+-                run_topk_transform(rows, logits)
+-
+-            deep_gemm_metadata = indexer_metadata.deep_gemm_metadata
+-            if isinstance(deep_gemm_metadata, list):
+-                # SM120 only: DeepGEMM's metadata kernel caps the row count, so
+-                # PagedIndexerMetadata split it; run indexer + topk per chunk.
+-                num_rows = _c4sl.shape[0]
+-                for chunk_idx, start in enumerate(
+-                    range(0, num_rows, _SM120_INDEXER_M_CHUNK)
+-                ):
+-                    rows = slice(start, min(start + _SM120_INDEXER_M_CHUNK, num_rows))
+-                    run_paged_indexer(rows, deep_gemm_metadata[chunk_idx])
+-            else:
+-                run_paged_indexer(all_rows, deep_gemm_metadata)
+-
+         if hisparse_coordinator is not None:
+             if hisparse_decode:
+                 compress_layer_id = token_to_kv_pool.layer_mapping[
+@@ -1021,8 +883,6 @@ class C4Indexer(nn.Module):
+         prefix: str = "",
+         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+         rotary_emb=None,
+-        fp4_cos: Optional[torch.Tensor] = None,
+-        fp4_sin: Optional[torch.Tensor] = None,
+     ):
+         super().__init__()
+         self.layer_id = layer_id
+@@ -1034,7 +894,6 @@ class C4Indexer(nn.Module):
+         self.q_lora_rank = config.q_lora_rank
+         self.softmax_scale = self.head_dim**-0.5
+         self.n_local_heads = self.n_heads
+-        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+         self.wq_b = ReplicatedLinear(
+             self.q_lora_rank,
+             self.n_heads * self.head_dim,
+@@ -1043,16 +902,11 @@ class C4Indexer(nn.Module):
+             params_dtype=torch.bfloat16,
+             prefix=add_prefix("wq_b", prefix),
+         )
+-        expert_pack_quant_config = (
+-            quant_config
+-            if quant_config is not None and quant_config.get_name() == "expert_pack"
+-            else None
+-        )
+         self.weights_proj = ReplicatedLinear(
+             self.dim,
+             self.n_heads,
+             bias=False,
+-            quant_config=expert_pack_quant_config,
++            quant_config=None,
+             params_dtype=torch.bfloat16,
+             prefix=add_prefix("weights_proj", prefix),
+         )
+@@ -1065,16 +919,13 @@ class C4Indexer(nn.Module):
+             head_dim=self.head_dim,
+             rotate=True,
+             prefix=add_prefix("compressor", prefix),
+-            quant_config=expert_pack_quant_config,
+             rotary_emb=rotary_emb,
+         )
+-        if self.use_fp4_indexer and is_hip():
+-            self.compressor.fp4_cos = fp4_cos
+-            self.compressor.fp4_sin = fp4_sin
+         self.rotary_emb = rotary_emb
+         self.freqs_cis = freqs_cis
+         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
+ 
++        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+         self.alt_streams = alt_streams
+ 
+     def compute_q(
+@@ -1085,14 +936,6 @@ class C4Indexer(nn.Module):
+     ) -> Tuple[IndexerQuery, torch.Tensor]:
+         q, _ = self.wq_b(q_lora)
+         q = q.view(-1, self.n_local_heads, self.head_dim)
+-        if self.use_fp4_indexer and is_hip():
+-            q_fp4, q_scale = aiter_q_indexer_fp4(
+-                q.contiguous(),
+-                self.compressor.fp4_cos,
+-                self.compressor.fp4_sin,
+-                positions,
+-            )
+-            return (q_fp4, q_scale), weight
+         if self.use_fp4_indexer:
+             return fused_q_indexer_rope_hadamard_fp4_quant(
+                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+diff --git a/python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py b/python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py
+index d49088d79f..2b31ac0740 100644
+--- a/python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py
++++ b/python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py
+@@ -70,13 +70,16 @@ class SparsePrefillWorkspace:
+         self.device = device
+         self._buffer: Optional[torch.Tensor] = None
+ 
+-    def get(self, num_tokens: int) -> torch.Tensor:
++    def get(
++        self, num_tokens: int, dtype: torch.dtype = torch.bfloat16
++    ) -> torch.Tensor:
+         assert num_tokens > 0
+         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
+-        if num_tokens > current_capacity:
++        current_dtype = self._buffer.dtype if self._buffer is not None else None
++        if num_tokens > current_capacity or dtype != current_dtype:
+             self._buffer = torch.empty(
+                 (num_tokens, 1, WORKSPACE_DIM),
+-                dtype=torch.bfloat16,
++                dtype=dtype,
+                 device=self.device,
+             )
+         return self._buffer[:num_tokens]
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 5db66de4a0..47d66e271a 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -1802,9 +1802,9 @@ def biased_grouped_topk_gpu(
+             and experts_per_group <= 32
+             and is_power_of_two(num_experts)
+         ):
+-            from sgl_kernel import moe_fused_gate
++            from sgl_kernel import moe_fused_gate as cuda_moe_fused_gate
+ 
+-            return moe_fused_gate(
++            return cuda_moe_fused_gate(
+                 gating_output.to(torch.float32),
+                 correction_bias.to(torch.float32),
+                 num_expert_group,
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 8d5cf994fb..0757752fcf 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2433,7 +2433,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+                         "encoder SWA replay cannot return cached prompt logprobs"
+                     )
+             self.encoder_swa_reset = [
+-                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
++                r.req_pool_idx is None or r.is_retracted for r in reqs
+             ]
+         # Allocate memory
+         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+@@ -2825,8 +2825,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         reserve = get_alloc_reserve_per_decode()
+         total = 0
+         for r in requests:
+-            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
+-            cur = r.kv.kv_allocated_len
++            x = max(0, r.kv_committed_len + reserve - r.kv_allocated_len)
++            cur = r.kv_allocated_len
+             nxt = cur + x
+             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+         return total
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index 5fdf21a439..d283ebdedc 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -70,7 +70,7 @@ def free_swa_out_of_window_slots(
+     evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
+     if page_size > 1 and evict_floor > req.cache_protected_len:
+         evict_floor = -(-evict_floor // page_size) * page_size
+-    req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
++    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
+ 
+     if is_chunk_cache:
+         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+@@ -89,19 +89,19 @@ def free_swa_out_of_window_slots(
+         evict_threshold = min(evict_threshold, retain_floor)
+ 
+     new_swa_evicted_seqlen = max(
+-        req.kv.swa_evicted_seqlen,
++        req.swa_evicted_seqlen,
+         evict_threshold,
+     )
+ 
+     if page_size > 1:
+         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
+ 
+-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
++    if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+         free_slots = req_to_token_pool.req_to_token[
+-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
++            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+         ]
+         token_to_kv_pool_allocator.free_swa(free_slots)
+-        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
++        req.swa_evicted_seqlen = new_swa_evicted_seqlen
+ 
+ 
+ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+@@ -239,7 +239,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
+     if req.req_pool_idx is None and req.kv is None:
+         return
+ 
+-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
++    start_p, end_p = effective_kv_committed_len, req.kv_allocated_len
+     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+ 
+     # If the prefix cache doesn't manage mamba states, we must free them here.
+@@ -268,7 +268,7 @@ def _release_overallocated_kv_indices(
+     if spec_algo is None and not get_serving().strip_thinking_cache:
+         assert (
+             start_p == end_p
+-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
++        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+ 
+     if page_size > 1:
+         start_p = ceil_align(start_p, page_size)
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+index 457e26ad45..9f72b13761 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import logging
+ from dataclasses import dataclass, field
+-from typing import TYPE_CHECKING, Any, Callable, Optional
++from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
+ 
+ from sglang.srt.mem_cache.hicache_storage import (
+     PoolHitPolicy,
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index f7eebd75f6..9923d8b3d4 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -180,10 +180,18 @@ class RadixKey:
+ 
+     def match(self, other: RadixKey, page_size: int = 1) -> int:
+         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
++        return self.match_at(other, offset=0, page_size=page_size)
++
++    def match_at(self, other: RadixKey, offset: int, page_size: int = 1) -> int:
++        """Match without slicing while preserving bigram boundaries and limit semantics."""
+         self._check_compatible(other)
++        if self.is_bigram != other.is_bigram:
++            raise ValueError("RadixKey operations require matching bigram modes")
++        if offset < 0 or offset > len(other):
++            raise IndexError(f"RadixKey offset out of range: {offset}")
+         t0, t1 = self.token_ids, other.token_ids
+         assert type(t0) is type(t1), (type(t0), type(t1))
+-        n = min(len(t0), len(t1))
++        n = min(self._raw_len(), other._raw_len() - offset)
+ 
+         # Exponential search for the first diverging token: gallop in doubling
+         # windows (one C-level slice compare each), then binary-search the window
+@@ -193,10 +201,10 @@ class RadixKey:
+         step = 1
+         while lo < n:
+             hi = lo + step if lo + step < n else n
+-            if t0[lo:hi] != t1[lo:hi]:
++            if t0[lo:hi] != t1[offset + lo : offset + hi]:
+                 while hi - lo > 1:
+                     mid = (lo + hi) // 2
+-                    if t0[lo:mid] == t1[lo:mid]:
++                    if t0[lo:mid] == t1[offset + lo : offset + mid]:
+                         lo = mid
+                     else:
+                         hi = mid
+@@ -206,24 +214,37 @@ class RadixKey:
+             step *= 2
+ 
+         if self.is_bigram:
+-            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
++            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
+             return (matched // page_size) * page_size if page_size > 1 else matched
+ 
+-        matched_tokens = min(matched_tokens, len(self), len(other))
++        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
+         if page_size == 1:
+             return matched_tokens
+         return (matched_tokens // page_size) * page_size
+ 
+     def child_key(self, page_size: int = 1):
+         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
++        return self.child_key_at(offset=0, page_size=page_size)
++
++    def child_key_at(self, offset: int, page_size: int = 1):
++        """Hashable child key at ``offset`` without slicing token storage."""
++        if offset < 0 or offset + page_size > len(self):
++            raise IndexError(
++                f"RadixKey child range out of bounds: offset={offset}, "
++                f"page_size={page_size}, len={len(self)}"
++            )
+         t = self.token_ids
+         if self.is_bigram:
+             if page_size == 1:
+-                plain = (t[0], t[1])
++                plain = (t[offset], t[offset + 1])
+             else:
+-                plain = tuple((t[j], t[j + 1]) for j in range(page_size))
++                plain = tuple(
++                    (t[j], t[j + 1]) for j in range(offset, offset + page_size)
++                )
+         else:
+-            plain = t[0] if page_size == 1 else tuple(t[:page_size])
++            plain = (
++                t[offset] if page_size == 1 else tuple(t[offset : offset + page_size])
++            )
+         if self.cache_salt is not None:
+             return ((self.extra_key, self.cache_salt), plain)
+         return plain if self.extra_key is None else (self.extra_key, plain)
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index bcfaa6c6b4..04ca61e6c4 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -201,6 +201,7 @@ from sglang.srt.models.deepseek_common.utils import (
+ )
+ from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+ from sglang.srt.runtime_context import (
++    get_platform,
+     attention_backends,
+     get_device,
+     get_exec,
+diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
+index 9390761051..e164c27d0c 100644
+--- a/python/sglang/srt/models/deepseek_v4_dspark.py
++++ b/python/sglang/srt/models/deepseek_v4_dspark.py
+@@ -52,7 +52,7 @@ from sglang.srt.models.dspark import (
+     gather_and_crop_vocab,
+     run_markov_block,
+ )
+-from sglang.srt.runtime_context import get_parallel
++from sglang.srt.runtime_context import get_parallel, get_platform
+ from sglang.srt.speculative.dspark_components.dspark_config import (
+     parse_dspark_draft_config,
+ )
+diff --git a/test/manual/dsv41_h100/check_block32_configs.py b/test/manual/dsv41_h100/check_block32_configs.py
+index 810dedb219..68d1c292e7 100644
+--- a/test/manual/dsv41_h100/check_block32_configs.py
++++ b/test/manual/dsv41_h100/check_block32_configs.py
+@@ -60,7 +60,7 @@ def main():
+             qs = torch.exp2(torch.randint(-4, 4, (m, k // 32), device="cuda").float())
+             chosen = cfg[min(cfg, key=lambda b: abs(m - b))]
+ 
+-            def call(config, dtype=torch.bfloat16):
++            def call(config, dtype=torch.bfloat16, q=q, w=w, qs=qs, ws=ws):
+                 impl.get_w8a8_block_fp8_configs = lambda *args: {m: config}
+                 return impl.w8a8_block_fp8_matmul_triton(
+                     q, w, qs, ws, [32, 32], output_dtype=dtype
+diff --git a/test/registered/kernels/ops/attention/test_topk_v2.py b/test/registered/kernels/ops/attention/test_topk_v2.py
+index d6e5d3ea2c..2192a77712 100644
+--- a/test/registered/kernels/ops/attention/test_topk_v2.py
++++ b/test/registered/kernels/ops/attention/test_topk_v2.py
+@@ -168,10 +168,10 @@ def _run_raw(scores, seq_lens, page_table, k):
+ 
+ def _run_dual(scores, seq_lens, page_table, inv_cpu, k):
+     batch = scores.shape[0]
+-    metadata = _plan(seq_lens)
++    metadata = plan_topk_v2(seq_lens)
+     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+     raw = torch.full_like(out, -1)
+-    topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
++    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+     torch.cuda.synchronize()
+     out_cpu = out.cpu().tolist()
+     raw_cpu = raw.cpu().tolist()
+diff --git a/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py b/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
+index 0f34fe3803..54d7007cec 100644
+--- a/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
++++ b/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
+@@ -14,7 +14,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
+ from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
+ from sglang.srt.mem_cache.common import retraction_backup
+ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+-from sglang.srt.runtime_context import get_context
++from sglang.srt.runtime_context import get_context, get_parallel
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+ 
+@@ -55,13 +55,15 @@ class TestDSV41DSparkPD(CustomTestCase):
+             ("tp_mismatch", layout, layout, 2, False),
+         ]
+         for name, local, peer, tp_size, supported in cases:
+-            with self.subTest(name=name):
++            with self.subTest(name=name), get_parallel().override(tp_size=4), get_context().override_server_args(ep_size=4):
+                 manager = object.__new__(CommonKVManager)
+                 manager.prefill_info_table = {}
+                 manager.kv_args = SimpleNamespace(page_size=256)
+                 manager.kv_cache_dtype_str = "fp8_e4m3"
+                 manager.dsv41_spec_layout = local
+                 manager.attn_tp_size = 4
++                manager.attn_dp_size = 1
++                manager.is_mla_backend = True
+                 manager.dcp_size = 1
+                 manager._resolve_rank_mapping = Mock()
+                 response = Mock(status_code=200)
+@@ -154,7 +156,7 @@ class TestDSV41DSparkPD(CustomTestCase):
+                     offload_kv_cache=Mock(),
+                 )
+                 request_pool = Mock()
+-                self.assertTrue(
++                self.assertIsNone(
+                     retraction_backup(
+                         req, Mock(), request_pool, allocator, "cpu_tensor"
+                     )
+@@ -166,6 +168,7 @@ class TestDSV41DSparkPD(CustomTestCase):
+                     _resolve_prefill_dp_rank=Mock(return_value=0),
+                     retracted_queue=[],
+                     pending_reqs=[],
++                    scheduler=SimpleNamespace(server_args=SimpleNamespace(disaggregation_transfer_backend="mooncake")),
+                 )
+                 DecodePreallocQueue.add(queue, req, is_retracted=True)
+                 if algorithm == "DSPARK":
+diff --git a/test/registered/unit/layers/test_dsv4_nonpaged_indexer.py b/test/registered/unit/layers/test_dsv4_nonpaged_indexer.py
+index 4f71fb2641..e25863d364 100644
+--- a/test/registered/unit/layers/test_dsv4_nonpaged_indexer.py
++++ b/test/registered/unit/layers/test_dsv4_nonpaged_indexer.py
+@@ -122,8 +122,8 @@ class TestDSV4TopKDispatch(CustomTestCase):
+                 f"{_INDEXER}.get_global_indexer_capturer",
+                 return_value=indexer_capturer,
+             ),
+-            patch(f"{_INDEXER}.topk_transform_paged") as topk_v1,
+-            patch(f"{_INDEXER}.topk_transform_paged_v2") as topk_v2,
++            patch(f"{_INDEXER}.topk_transform_512") as topk_v1,
++            patch(f"{_INDEXER}.topk_transform_512_v2") as topk_v2,
+         ):
+             backend.forward_c4_indexer(
+                 x=torch.empty((1, 1)),
+diff --git a/test/registered/unit/mem_cache/test_unified_tree_insert_cursor.py b/test/registered/unit/mem_cache/test_unified_tree_insert_cursor.py
+index 2a71adfb8c..4b7bcc8ef8 100644
+--- a/test/registered/unit/mem_cache/test_unified_tree_insert_cursor.py
++++ b/test/registered/unit/mem_cache/test_unified_tree_insert_cursor.py
+@@ -12,7 +12,6 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
+ from sglang.srt.mem_cache.unified_cache.cache_action import (
+     BackupKV,
+     FreeDeviceKV,
+-    FreeDeviceKVFullOnly,
+ )
+ from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
+ from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+@@ -84,14 +83,11 @@ class TestUnifiedTreeInsertCursor(unittest.TestCase):
+                         branch,
+                         new_values,
+                         prev_prefix_len=8,
+-                        track_adopted_ranges=True,
++                        
+                     )
+                     prefix = (21 - is_bigram) // page_size * page_size
+                     length = 35 // page_size * page_size
+                     self.assertEqual(result.prefix_len, prefix)
+-                    self.assertEqual(
+-                        result.adopted_ranges, {ComponentType.FULL: [(prefix, length)]}
+-                    )
+                     torch.testing.assert_close(
+                         released(actions, FreeDeviceKV), new_values[8:prefix]
+                     )
+@@ -133,11 +129,10 @@ class TestUnifiedTreeInsertCursor(unittest.TestCase):
+                             key=make_key(raw, limit=16 + is_bigram),
+                             value=torch.arange(100, 132),
+                             prev_prefix_len=16,
+-                            track_adopted_ranges=True,
++                            
+                         )
+                     )
+                     self.assertEqual(step.result.prefix_len, 16)
+-                    self.assertEqual(step.result.adopted_ranges, {})
+                     self.assertEqual(step.actions, [])
+                     empty, actions = insert(core, [], torch.empty(0, dtype=torch.int64))
+                     self.assertEqual(empty.prefix_len, 0)
+@@ -165,12 +160,10 @@ class TestUnifiedTreeInsertCursor(unittest.TestCase):
+             fresh,
+             prev_prefix_len=6,
+             swa_evicted_seqlen=18,
+-            track_adopted_ranges=True,
++            
+         )
+         self.assertEqual(result.prefix_len, 24)
+-        self.assertEqual(result.adopted_ranges, {ComponentType.FULL: [(24, 28)]})
+-        torch.testing.assert_close(released(actions, FreeDeviceKVFullOnly), fresh[6:18])
+-        torch.testing.assert_close(released(actions, FreeDeviceKV), fresh[18:24])
++        torch.testing.assert_close(released(actions, FreeDeviceKV), fresh[6:24])
+         torch.testing.assert_close(
+             match(core, raw), torch.cat((torch.arange(24), fresh[24:]))
+         )
+@@ -198,7 +191,7 @@ class TestUnifiedTreeInsertCursor(unittest.TestCase):
+                         make_key(raw[: 32 + is_bigram]),
+                         fresh,
+                         prev_prefix_len=24,
+-                        track_adopted_ranges=True,
++                        
+                     )
+                 )
+                 backed_up = []
+@@ -223,9 +216,6 @@ class TestUnifiedTreeInsertCursor(unittest.TestCase):
+                 self.assertFalse(core.has_ongoing_insert())
+                 self.assertEqual(backed_up, nodes + [step.result.last_device_node])
+                 self.assertEqual(step.result.prefix_len, 24)
+-                self.assertEqual(
+-                    step.result.adopted_ranges, {ComponentType.FULL: [(24, 32)]}
+-                )
+                 torch.testing.assert_close(
+                     match(core, raw[: 32 + is_bigram]),
+                     torch.cat((torch.arange(24), fresh[24:])),
+@@ -250,11 +240,8 @@ class TestUnifiedTreeInsertCursor(unittest.TestCase):
+         middle.value = None
+         core.component_evictable_size_[ComponentType.FULL] -= 8
+         fresh = torch.arange(100, 128)
+-        result, actions = insert(core, raw, fresh, track_adopted_ranges=True)
++        result, actions = insert(core, raw, fresh)
+         self.assertEqual(result.prefix_len, 24)
+-        self.assertEqual(
+-            result.adopted_ranges, {ComponentType.FULL: [(8, 16), (24, 28)]}
+-        )
+         torch.testing.assert_close(
+             released(actions, FreeDeviceKV), torch.cat((fresh[:8], fresh[16:24]))
+         )
+diff --git a/test/registered/unit/models/test_deepseek_v4_shared_expert_fusion.py b/test/registered/unit/models/test_deepseek_v4_shared_expert_fusion.py
+index 792691052c..97d44f9d62 100644
+--- a/test/registered/unit/models/test_deepseek_v4_shared_expert_fusion.py
++++ b/test/registered/unit/models/test_deepseek_v4_shared_expert_fusion.py
+@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.utils import (
+ )
+ from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+ from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+-from sglang.srt.runtime_context import get_context, get_exec, get_flags
++from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+ 
+@@ -27,6 +27,10 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
+     on the ACTIVE moe flag, and the config bag keeps the user's intent.
+     """
+ 
++    def setUp(self):
++        super().setUp()
++        self.enterContext(get_parallel().override(moe_ep_size=1))
++
+     def _publish(self, enforce):
+         override = get_context().override_server_args(
+             enforce_shared_experts_fusion=enforce
