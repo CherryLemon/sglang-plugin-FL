@@ -49,6 +49,7 @@
       "flag_gems/fused/dsv41/mhc.py": "bae3097ba138a3e05e6f47f8a564793faad3529945259025d9efc1fb40393160",
       "flag_gems/ops/w8a8_block_fp8_matmul.py": "3d3f6e595061559201458b9b6cfcf1214e8a5af44414d60b736e023a5a6b9426"
     },
+    "package_tree": "1fe4714a882328b0a9d4dffae7b6c0fe87f7e59b",
     "patch": "patches/flaggems-dsv41.patch",
     "patch_sha256": "5d875b56fb9a2d994a93fbcc92f7590aae55993c00690290829fd1c312962455",
     "repository": "https://github.com/flagos-ai/FlagGems",
@@ -81,6 +82,7 @@
       "sglang_fl/dsv41/backend.py": "8b33aea80c4ed949107c3d91cdaac51880f107d534fbf17a9187ac0f0f2fa0be",
       "sglang_fl/dsv41/quantization.py": "3a22dbcdc8649146256a5fdf1401d22907c6e45f1e7c467eedbf3360456f540c"
     },
+    "package_tree": "fe57786ab2e11a012cee7363329251da817293e2",
     "repository": "https://github.com/flagos-ai/sglang-plugin-FL",
     "upstream_branch": "dev/0.5.18"
   },

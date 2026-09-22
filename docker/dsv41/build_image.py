@@ -50,6 +50,10 @@ def main():
     if image_id != lock["base_image"]["image_id"]:
         raise SystemExit("Local base tag does not match the locked official image ID")
     for repo, component in [(args.flaggems, "flaggems"), (plugin, "plugin")]:
+        package_path = "src/flag_gems" if component == "flaggems" else "sglang_fl"
+        tree = git(repo, "rev-parse", f"HEAD:{package_path}").decode().strip()
+        if tree != lock[component]["package_tree"]:
+            raise SystemExit(f"Package tree drift: {component}")
         for name, expected in lock[component]["package_files"].items():
             path = repo / ("src" if component == "flaggems" else "") / name
             if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
