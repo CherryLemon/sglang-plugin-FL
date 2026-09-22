@@ -1031,4 +1031,10 @@ def load_plugin():
         )
         logger.info(banner)
 
+    # Install only after the generic plugin initialized successfully. The engine
+    # can require this registration, so an earlier plugin failure cannot silently
+    # leave DSV4.1 running with native numerical kernels.
+    from sglang_fl.dsv41 import install as install_dsv41
+
+    install_dsv41()
     _plugin_active = True
