@@ -69,7 +69,7 @@ python docker/dsv41/build_image.py \
   --output /absolute/path/new-build-context
 ```
 
-构建脚本校验基础镜像 ID、源码和 wheel 哈希，以 `git archive` 打包源码，Docker 构建阶段使用 `--network=none`。输出目录必须是新目录。直接使用 Dockerfile 构建时，默认 `FROM` 也固定为不可变 digest。
+构建脚本校验基础镜像 ID、源码和 wheel 哈希，以 `git archive` 打包源码，Docker 构建阶段使用 `--network=none`。输出目录必须是新目录。直接使用 Dockerfile 构建时，默认 `FROM` 也固定为不可变 digest。构建结果记录保存在镜像外，镜像内的离线编译记录由该次构建生成。
 
 ## 后端开关与验收
 

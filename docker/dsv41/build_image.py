@@ -74,8 +74,14 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     snapshot(args.flaggems, args.output / "gems")
     snapshot(plugin, args.output / "plugin")
+    # Build receipts describe the resulting image and stay outside it. The
+    # compiler report is regenerated in the builder stage for this source tree.
     shutil.copytree(
-        delivery, args.output / "delivery", ignore=shutil.ignore_patterns("__pycache__")
+        delivery,
+        args.output / "delivery",
+        ignore=shutil.ignore_patterns(
+            "__pycache__", "build-result.json", "offline-compile.json"
+        ),
     )
     wheels = args.output / "wheelhouse"
     wheels.mkdir()
