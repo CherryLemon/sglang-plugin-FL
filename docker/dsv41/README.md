@@ -90,3 +90,22 @@ python docker/dsv41/build_image.py \
 GPU 数值测试入口已提供，默认跳过，需后续明确启用 `RUN_DSV41_GPU_TESTS=1`。正式交付前仍需验证算子数值、changed-input graph replay、整模质量、TP/EP、DSpark、冷/热长上下文及 PD。H100 源分支的性能数字不作为这轮构建验收结果。
 
 本次构建结果见 [build-result.json](build-result.json)：89 项 CPU 测试、63 个子用例通过，2 项跳过；10 个离线编译用例通过。另用明确的 CPU device/driver doubles 检查了 FlagGems 全包导入、插件初始化及 DSV4.1 注册，未执行 GPU 操作。
+
+## 单节点 Graph / MTP 联调入口
+
+[serve_single_node.sh](serve_single_node.sh) 使用 TP8/EP8、DSpark block5、static verify 和 decode CUDA Graph，默认上下文 65536、最多 16 个并发请求，不启用 PD。`MODEL_PATH` 必须指向固定 revision 的完整 checkpoint；`SERVE_PORT` 默认 31818。该脚本是联调入口，服务验证结果单独记录，不改变前面的镜像构建验收范围。
+
+先检查容器内 8 张 GPU 均可由 PyTorch 访问，并执行 `RUN_DSV41_GPU_TESTS=1 pytest -q /opt/sglang-fl/tests/dsv41/test_gpu_ops.py`。将本目录只读挂载为 `/work/scripts` 后，可在容器内运行：
+
+```bash
+MODEL_PATH=/models/DeepSeek-V4.1-Flash bash /work/scripts/serve_single_node.sh
+```
+
+[smoke_service.py](smoke_service.py) 验证已启动服务的非 PD / DSPARK / Graph 配置、单请求及 4/8 并发的已知答案、连续生成和 draft token 接受情况：
+
+```bash
+python /work/scripts/smoke_service.py \
+  --url http://127.0.0.1:31818 --output /work/results/service-smoke.json
+```
+
+还需从同一次请求的 scheduler 日志确认 `CUDA graph: True`，并核对 target 和 draft 图捕获成功；只看到配置开关或 HTTP 200 不构成 Graph/MTP 通过。
