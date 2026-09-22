@@ -1,7 +1,7 @@
 {
   "image": "sglang-fl-dsv41:0.5.18",
-  "image_id": "sha256:5dfa10a178cd0d4d1e088d86e94188ee0bdcc611b469953aa32dcd4754acd9ea",
-  "uncompressed_bytes": 32685761080,
+  "image_id": "sha256:d38d6c39198dba8c52c36aea7d0497edb37f7610e31078a0cd000bae20ddbc74",
+  "uncompressed_bytes": 32685773742,
   "base_image_id": "sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb",
   "validation": {
     "cpu_tests_passed": 89,
@@ -23,13 +23,17 @@
     ]
   },
   "logs": {
-    "build_log": "build.log",
-    "offline_compile": "offline-compile.json"
+    "build_log": "build-release.log",
+    "offline_compile": "offline-compile.json",
+    "plugin_import": "plugin-import-release.log",
+    "artifact_directory": "/public-nvme/yjwu/sglang-fl-0518-build"
   },
   "limitations": [
     "GPU numerical and graph replay validation pending",
     "Whole-model multi-chip TP/EP and PD not tested",
     "FlagCX V4.1 DSpark PD remains guarded; sparse/cache/EP vendor chain retained",
     "BF16 and strict FlagOS are operator profiles, not complete model serving profiles"
-  ]
+  ],
+  "build_source_revision": "3f8ef3d718b111f53fe229f86e556681497e865a",
+  "manifest_sha256": "68640402d4c8dc1ba560fb7a5195c52fe0c18fae7ca9ecab6793965f5c01890a"
 }
