@@ -45,15 +45,15 @@
       "flag_gems/fused/DSA/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "flag_gems/fused/dsv41/__init__.py": "275d6cf2854e01e2edc4582a47d268d523fde520864a5d20d23842e4dc50b068",
       "flag_gems/fused/dsv41/block_fp8_linear.py": "5e8e859aebf35705099be87449915759ac7ee6ff7350bae7bc7bd03442efc747",
-      "flag_gems/fused/dsv41/fp4_indexer.py": "8b5e2ded9a24ef2e54d557d3a6195e772b296fe217cf26182471758d3d80f497",
+      "flag_gems/fused/dsv41/fp4_indexer.py": "afa434d355da836ba9f09544732d9629e5418b13abad3d600f5701172dd116f6",
       "flag_gems/fused/dsv41/mhc.py": "bae3097ba138a3e05e6f47f8a564793faad3529945259025d9efc1fb40393160",
       "flag_gems/ops/w8a8_block_fp8_matmul.py": "3d3f6e595061559201458b9b6cfcf1214e8a5af44414d60b736e023a5a6b9426"
     },
-    "package_tree": "1fe4714a882328b0a9d4dffae7b6c0fe87f7e59b",
+    "package_tree": "7a5388063c4c3da3e5c9df6a05b1f9f88d6439c9",
     "patch": "patches/flaggems-dsv41.patch",
-    "patch_sha256": "5d875b56fb9a2d994a93fbcc92f7590aae55993c00690290829fd1c312962455",
+    "patch_sha256": "f1052454832d1545adacb10584befa8db3b570cf038e8083f42bdee154311ead",
     "repository": "https://github.com/flagos-ai/FlagGems",
-    "revision": "bce7e0843f2490bc1c6af6f315a4e55054660ca0"
+    "revision": "63bf36d6eb2edaed0877d52c88a2041a4a2b8f00"
   },
   "model": {
     "config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",

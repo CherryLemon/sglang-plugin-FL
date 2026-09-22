@@ -17,7 +17,7 @@ from flag_gems.fused.dsv41.block_fp8_linear import block_fp8_linear
 from flag_gems.fused.dsv41.fp4_indexer import fp4_index_logits_decode
 from flag_gems.fused.dsv41.mhc import hc_combine, hc_mix_stats
 from sglang_fl.dsv41.quantization import block_fp8_linear as linear_reference
-from sglang_fl.dsv41.quantization import decode_e2m1
+from sglang_fl.dsv41.quantization import decode_e2m1, decode_scale
 
 
 @pytest.mark.parametrize("m,n", [(0, 35), (1, 32), (17, 35), (65, 64)])
@@ -51,9 +51,10 @@ def test_fp4_packed_pages_visibility_and_mixed_requests():
     b, h, length, page = 3, 32, 65, 64
     payload = torch.randint(0, 256, (128, 64), dtype=torch.uint8)
     scale = torch.randint(125, 129, (128, 4), dtype=torch.uint8)
+    scale[37, 2] = 255  # Reserved UE8M0 NaN must propagate.
     table = torch.cat([payload.reshape(2, page * 64), scale.reshape(2, page * 4)], 1)
     keys = (
-        decode_e2m1(payload) * torch.exp2(scale.float() - 127).repeat_interleave(32, 1)
+        decode_e2m1(payload) * decode_scale(scale, "ue8m0").repeat_interleave(32, 1)
     ).bfloat16()
     q = torch.randn(b, h, 128).bfloat16()
     weights = torch.randn(b, h).bfloat16()
@@ -78,7 +79,7 @@ def test_fp4_packed_pages_visibility_and_mixed_requests():
         q.cuda(), weights.cuda(), slots.cuda(), lens.cuda(), table.cuda(), page
     )
     torch.testing.assert_close(
-        result.cpu(), torch.stack(reference), rtol=0.008, atol=0.25
+        result.cpu(), torch.stack(reference), rtol=0.008, atol=0.25, equal_nan=True
     )
 
 
