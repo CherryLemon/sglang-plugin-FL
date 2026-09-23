@@ -1,0 +1,70 @@
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+index 6ab7bb239c..05ca83df03 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -348,6 +348,13 @@ class DeepSeekV4IndexerPool(KVCache):
+     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+         return self.index_k_with_scale_buffer[layer_id]
+ 
++    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
++        """Return indexer pages in the layout used by PD page transfers."""
++        for buf in self.index_k_with_scale_buffer:
++            if buf.ndim != 2 or not buf.is_contiguous():
++                raise ValueError("DeepSeek-V4 indexer PD pages must be contiguous 2D buffers")
++        return self.index_k_with_scale_buffer
++
+     def get_index_k_scale_buffer(
+         self,
+         layer_id: int,
+diff --git a/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py b/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
+index 1b2cb6f5fd..cfa40bb71d 100644
+--- a/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
++++ b/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
+@@ -5,6 +5,8 @@ import unittest
+ from types import SimpleNamespace
+ from unittest.mock import AsyncMock, Mock, patch
+ 
++import torch
++
+ from sglang.srt.disaggregation.base.conn import StateType
+ from sglang.srt.disaggregation.common.conn import (
+     CommonKVBootstrapServer,
+@@ -13,7 +15,10 @@ from sglang.srt.disaggregation.common.conn import (
+ from sglang.srt.disaggregation.decode import DecodePreallocQueue
+ from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
+ from sglang.srt.mem_cache.common import retraction_backup
+-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
++from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
++    DeepSeekV4IndexerPool,
++    DeepSeekV4TokenToKVPool,
++)
+ from sglang.srt.runtime_context import get_context, get_parallel
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -36,6 +41,26 @@ def make_layout():
+ 
+ 
+ class TestDSV41DSparkPD(CustomTestCase):
++    def test_indexer_pages_register_with_full_page_stride(self):
++        index_pages = torch.empty((5, 32 * 68), dtype=torch.uint8)
++        index_pool = object.__new__(DeepSeekV4IndexerPool)
++        index_pool.page_size = 32
++        index_pool.index_k_with_scale_buffer = [index_pages]
++        pool = object.__new__(DeepSeekV4TokenToKVPool)
++        pool._unified_kv = False
++        pool.page_size = 256
++        pool.kv_pools = {4: SimpleNamespace(kv_buffer=[])}
++        pool.index_pools = {4: index_pool}
++
++        ptrs, lens, strides = pool.get_contiguous_buf_infos()
++        self.assertEqual(ptrs, [index_pages.data_ptr()])
++        self.assertEqual(lens, [index_pages.nbytes])
++        self.assertEqual(strides, [index_pages[0].nbytes * 2])
++
++        index_pool.index_k_with_scale_buffer = [index_pages.t()]
++        with self.assertRaisesRegex(ValueError, "contiguous 2D"):
++            index_pool.contiguous_page_row_buffers()
++
+     def test_flagcx_dspark_pd_accepts_only_equal_tp_dp1(self):
+         from sglang.srt.arg_groups.deepseek_v4_hook import (
+             validate_deepseek_v41_features,

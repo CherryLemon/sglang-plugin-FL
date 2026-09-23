@@ -1,8 +1,8 @@
 # DeepSeek V4.1 Flash / SGLang FL 0.5.18
 
-本目录交付代码迁移、NVIDIA 镜像和单机整模联调。引擎基于官方 SGLang **v0.5.18**，插件基于 **dev/0.5.18**；具体提交、镜像 digest、模型 revision、补丁及文件 SHA256 见 [manifest.json](manifest.json)。DeepSeek V4.1 Flash 已在 `aiops-10-8-2-1` 的 8 张 H100 上以 TP8/EP8 启动；验证了非 PD 服务、DSpark/MTP 和 decode CUDA Graph。
+本目录交付代码迁移、NVIDIA 镜像和 H100 整模联调。引擎基于官方 SGLang **v0.5.18**，插件基于 **dev/0.5.18**；具体提交、镜像 digest、模型 revision、补丁及文件 SHA256 见 [manifest.json](manifest.json)。DeepSeek V4.1 Flash 已在 `aiops-10-8-2-1` 的 8 张 H100 上以 TP8/EP8 启动；验证了非 PD 服务、DSpark/MTP 和 decode CUDA Graph。FlagCX 两机 PD 配置与验收见 [FLAGCX_PD.md](FLAGCX_PD.md)。
 
-镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。本次是单节点功能联调，未做质量、吞吐和 PD 验收。
+镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。单节点已测稳态 decode TPS；两机 PD 使用 FlagCX RoCE 状态传输和 decode Graph，D attention TP2×DP4 配置已通过 80 路同时运行的 128K 输入验收。当前 hybrid 模式的每路 decode TPS 仍低于 V12 历史结果，`vendor` 对照也未达到其每路最低 100 TPS 门槛；详见 [PD 实验报告](FLAGCX_PD.md)。整模质量及更长时间稳定性仍需单独验收。
 
 ## 代码与补丁
 
@@ -13,6 +13,7 @@
 | `patches/0003-0518-compatibility.patch` | 0.5.18 请求字段、配置默认值、TopK 依赖、缓存接口和 CPU 测试适配 |
 | `patches/0004-oot-interface.patch` | `sglang.srt.layers.dsv41_ops` ABI v1，显式分发及必需插件守卫 |
 | `patches/0005`–`0011` | 修复 0.5.18 的压缩状态、SWA 分配、图元数据、V4.1 processor，以及请求 KV/SWA 字段迁移 |
+| `patches/0012`–`0014` | FlagCX PD 的 DSpark 与 D attention TP2×DP4 准入、连续索引器页，以及按请求窗口分配 D 的 SWA 缓存 |
 | `patches/flaggems-dsv41.patch` | FlagGems K tile 缩放边界修复、FP8/BF16 线性计算、packed 索引器及 mHC |
 
 功能回移与 V12 优化分别提交。未引入新版请求对象或整套运行时重构。SGLang 版本保持 `0.5.18`，镜像内 `/opt/sglang-fl/manifest.json` 标明补丁后的源码提交和文件哈希。源分支带入的 `benchmark/deepseek_v41_h100` 报告仅作为历史资料，其吞吐、质量和 GPU 测试结果不代表本镜像的结果。
@@ -29,10 +30,10 @@
 | mHC predecessor-pre | FlagGems | FP32 混合权重、前一子层 pre 契约；SM90 离线编译；融合数值误差待测 |
 | 稀疏注意力 / RoPE / 压缩缓存 | vendor | 保留模型语义；其余芯片的完整算子链待补齐 |
 | MoE TP/EP | FlashInfer MXFP4 | 8 卡 TP8/EP8 整模请求通过；未将单 rank 参考 MegaMoE 当成 EP 后端 |
-| 通信 | 插件原有 CommunicatorFL | 单节点 TP8/EP8 已跑通；RDMA 和跨节点未测 |
-| V4.1 DSpark PD | 原 Mooncake 路径 | 布局/拓扑 CPU 契约；未开放 FlagCX 白名单 |
+| 通信 | 单节点 TP/EP 使用 NCCL；PD 状态使用 FlagCX | `.1`/`.3` 的 `mlx5_bond_0` RoCE 设备均 ACTIVE；跨机请求通过 |
+| V4.1 DSpark PD | FlagCX，P TP8、D 可选 attention TP2×DP4 | C128/SWA-ring 状态与索引器页迁移；跨拓扑单请求、3 路并发及 128K 输入通过；80 路容量见 PD 报告 |
 
-FlagCX 的通用连接器仍保留在插件中。V4.1 专有缓存、C2 stride、完成事件和取消生命周期尚未完成 FlagCX 联调；本次没有删除 Mooncake/static-verify 守卫。流水线并行等原有限制继续生效。不同厂商设备混入同一个 TP/EP 组不在本次范围。
+V4.1 的 C128/SWA-ring 状态、C2 stride 和完成状态已接入 FlagCX；D 的 attention TP2×DP4 仅在 `PD_DECODE_DPA=1` 时开放，P 保持 TP8/DP1，static-verify 与缓存布局校验仍生效。取消请求、retraction 和长时间压力仍需验证。不同厂商设备混入同一个 TP/EP 组不在本次范围。
 
 FlagGems 的 block32 修复同时约束默认和调优配置的 K tile，避免一个 tile 跨多个 scale 组；不修改缓存中的配置字典。线性层只接受解码后的浮点 scale，`uint8 UE8M0` 与普通数值 scale 的接口明确区分。
 
@@ -88,9 +89,9 @@ python docker/dsv41/build_image.py \
 
 构建中执行依赖/源码哈希、插件 entry point、ABI、关键模块导入、Rust 符号、CPU 回归和 Triton 离线编译检查。离线编译生成 SM90/SM80 cubin；GPU 数值和整模 graph replay 另在目标机器验证。
 
-GPU 数值测试入口默认跳过。在 `.1` 机器上显式运行 `RUN_DSV41_GPU_TESTS=1`，14 项通过；随后 TP8/EP8、DSpark 与 decode graph 整模服务通过 14 个已知答案及并发请求。整模质量、长上下文、吞吐和 PD 尚未验收。H100 源分支的性能数字不作为本次验收结果。
+GPU 数值测试入口默认跳过。在 `.1` 机器上显式运行 `RUN_DSV41_GPU_TESTS=1`，14 项通过；随后 TP8/EP8、DSpark 与 decode graph 整模服务通过 14 个已知答案及并发请求。非 PD 的 32K 稳态 decode TPS 已测；FlagCX PD 的首次两机请求与 3 路并发通过，详细结果见 [FLAGCX_PD.md](FLAGCX_PD.md)。H100 源分支的性能数字不作为本次验收结果。
 
-本次构建结果见 [build-result.json](build-result.json)：89 项 CPU 测试、63 个子用例通过，2 项跳过；10 个离线编译用例通过。另用明确的 CPU device/driver doubles 检查了 FlagGems 全包导入、插件初始化及 DSV4.1 注册，未执行 GPU 操作。
+初始非 PD 镜像构建结果见 [build-result.json](build-result.json)：89 项 CPU 测试、63 个子用例通过，2 项跳过；10 个离线编译用例通过。另用明确的 CPU device/driver doubles 检查了 FlagGems 全包导入、插件初始化及 DSV4.1 注册，未执行 GPU 操作。包含 FlagCX PD 的后续镜像构建记录见 [FLAGCX_PD.md](FLAGCX_PD.md)。
 
 ## 单节点 Graph / MTP 联调入口
 

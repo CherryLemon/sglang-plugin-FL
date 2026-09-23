@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the V11 32K shared-prefix burst shape and measure decode TPS.
+"""Measure steady decode TPS for a calibrated shared-prefix coding workload.
 
 The generated coding reference is deterministic, but is not the private V11
 prompt. Record both per-request streamed-content generation rates and pooled
@@ -24,7 +24,7 @@ def post(opener, url, body, timeout):
     return opener.open(request, timeout=timeout)
 
 
-def make_prompt(repetitions):
+def make_prompt(repetitions, padding=0):
     reference = (
         "# Reference: weighted interval scheduling\n"
         "# Jobs have start, end, and value fields. Sort by end. For each job i, "
@@ -43,9 +43,14 @@ def make_prompt(repetitions):
     return (
         "Use this reference material when answering the final coding task.\n"
         + reference * repetitions
+        + " note" * padding
         + "\nWrite a Python 3 implementation of weighted interval scheduling. "
         "Include the function, type hints, and a brief example.\n"
     )
+
+
+def request_prompt(prefix, index):
+    return prefix + f"\nRequest variant {index}: return the implementation now."
 
 
 def tokenize_count(opener, base_url, prompt):
@@ -58,13 +63,13 @@ def tokenize_count(opener, base_url, prompt):
         return json.load(response)["count"]
 
 
-def run_one(opener, url, prefix, index, barrier, timeout):
-    prompt = prefix + f"\nRequest variant {index}: return the implementation now."
+def run_one(opener, url, prefix, index, barrier, timeout, output_tokens):
+    prompt = request_prompt(prefix, index)
     body = {
         "model": "deepseek-v4.1-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "max_tokens": 512,
+        "max_tokens": output_tokens,
         "ignore_eos": True,
         "chat_template_kwargs": {"thinking": False},
         "stream": True,
@@ -103,7 +108,7 @@ def run_one(opener, url, prefix, index, barrier, timeout):
     if not done or not usage or not content or finish_reason != "length":
         raise RuntimeError(f"Incomplete request {index}: {done=} {usage=} {finish_reason=}")
     tokens = usage["completion_tokens"]
-    if tokens != 512 or last <= first:
+    if tokens != output_tokens or last <= first:
         raise RuntimeError(f"Unexpected output {index}: {tokens=}, {first=}, {last=}")
     return {
         "index": index,
@@ -121,11 +126,11 @@ def run_one(opener, url, prefix, index, barrier, timeout):
     }
 
 
-def run_burst(opener, url, prefix, concurrency, timeout):
+def run_burst(opener, url, prefix, concurrency, timeout, output_tokens):
     barrier = threading.Barrier(concurrency + 1)
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [
-            pool.submit(run_one, opener, url, prefix, i, barrier, timeout)
+            pool.submit(run_one, opener, url, prefix, i, barrier, timeout, output_tokens)
             for i in range(concurrency)
         ]
         barrier.wait(timeout=60)
@@ -154,32 +159,60 @@ def run_burst(opener, url, prefix, concurrency, timeout):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://10.8.2.1:31818")
+    parser.add_argument("--tokenize-url", help="Tokenizer endpoint if the PD router does not expose /tokenize")
+    parser.add_argument(
+        "--deployment", choices=("single_node", "flagcx_pd"), default="single_node"
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 16])
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--prompt-tokens", type=int, default=32768)
+    parser.add_argument("--output-tokens", type=int, default=512)
     args = parser.parse_args()
     url = args.url.rstrip("/")
+    tokenize_url = (args.tokenize_url or url).rstrip("/")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    # Calibrate using the running model tokenizer, keeping the 32K shared-prefix
-    # shape of the mainline V11 experiment without depending on a private prompt.
-    lo, hi = 1, 256
+    # Calibrate against the model tokenizer without depending on the private
+    # mainline prompt. The request variant adds a small per-request suffix.
+    lo, hi = 1, 1
+    while tokenize_count(opener, tokenize_url, make_prompt(hi)) <= args.prompt_tokens:
+        lo, hi = hi, hi * 2
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if tokenize_count(opener, url, make_prompt(mid)) <= 32768:
+        if tokenize_count(opener, tokenize_url, make_prompt(mid)) <= args.prompt_tokens:
             lo = mid
         else:
             hi = mid - 1
-    prefix = make_prompt(lo)
-    prefix_tokens = tokenize_count(opener, url, prefix)
+    # Fill the last partial reference block with short tokens. Calibrate the
+    # first complete request, since the variant suffix counts toward input.
+    padding_lo, padding_hi = 0, args.prompt_tokens
+    while padding_lo < padding_hi:
+        mid = (padding_lo + padding_hi + 1) // 2
+        prompt = request_prompt(make_prompt(lo, mid), 0)
+        if tokenize_count(opener, tokenize_url, prompt) <= args.prompt_tokens:
+            padding_lo = mid
+        else:
+            padding_hi = mid - 1
+    prefix = make_prompt(lo, padding_lo)
+    prefix_tokens = tokenize_count(opener, tokenize_url, prefix)
+    calibration_request_tokens = tokenize_count(
+        opener, tokenize_url, request_prompt(prefix, 0)
+    )
     metadata = {
-        "workload": "V11-shape 32K shared-prefix weighted-interval coding, fixed 512 output",
+        "workload": "shared-prefix weighted-interval coding, fixed output length",
         "mainline_prompt_identical": False,
-        "single_node_no_pd": True,
+        "deployment": args.deployment,
+        "tokenize_url": tokenize_url,
+        "single_node_no_pd": args.deployment == "single_node",
         "prompt_sha256": hashlib.sha256(prefix.encode()).hexdigest(),
         "reference_repetitions": lo,
+        "padding_repetitions": padding_lo,
         "prefix_token_count": prefix_tokens,
+        "calibration_request_tokens": calibration_request_tokens,
+        "target_prefix_tokens": args.prompt_tokens,
+        "output_tokens": args.output_tokens,
         "warmups_per_concurrency": args.warmups,
         "measured_rounds_per_concurrency": args.rounds,
         "concurrency": args.concurrency,
@@ -191,7 +224,9 @@ def main():
     for concurrency in args.concurrency:
         measured = []
         for round_index in range(-args.warmups, args.rounds):
-            result = run_burst(opener, url, prefix, concurrency, args.timeout)
+            result = run_burst(
+                opener, url, prefix, concurrency, args.timeout, args.output_tokens
+            )
             result["round"] = round_index
             result["warmup"] = round_index < 0
             report["rounds"].append(result)

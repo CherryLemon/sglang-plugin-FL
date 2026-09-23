@@ -28,6 +28,7 @@ def snapshot(repo, target):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--flaggems", type=Path, required=True)
+    parser.add_argument("--flagcx", type=Path)
     parser.add_argument("--wheelhouse", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tag", default="sglang-fl-dsv41:0.5.18")
@@ -70,10 +71,27 @@ def main():
             raise SystemExit(
                 f"Commit {component} implementation changes before building"
             )
+    if args.flagcx is not None:
+        flagcx_lock = lock["flagcx"]
+        revision = git(args.flagcx, "rev-parse", "HEAD").decode().strip()
+        if revision != flagcx_lock["revision"]:
+            raise SystemExit(f"FlagCX source revision drift: {revision}")
+        for name, expected in flagcx_lock["files"].items():
+            actual = hashlib.sha256((args.flagcx / name).read_bytes()).hexdigest()
+            if actual != expected:
+                raise SystemExit(f"FlagCX source or binary drift: {name}")
     # Refuse to overwrite another build's artifacts.
     args.output.mkdir(parents=True, exist_ok=False)
     snapshot(args.flaggems, args.output / "gems")
     snapshot(plugin, args.output / "plugin")
+    flagcx = args.output / "flagcx"
+    (flagcx / "build" / "lib").mkdir(parents=True)
+    (flagcx / "plugin" / "interservice").mkdir(parents=True)
+    if args.flagcx is not None:
+        for name in lock["flagcx"]["files"]:
+            target = flagcx / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(args.flagcx / name, target)
     # Build receipts describe the resulting image and stay outside it. The
     # compiler report is regenerated in the builder stage for this source tree.
     shutil.copytree(

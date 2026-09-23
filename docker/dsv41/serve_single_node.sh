@@ -20,6 +20,8 @@ export SGLANG_OPT_USE_TOPK_V2=0
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
+read -r -a cuda_graph_bs_decode <<< "${CUDA_GRAPH_BS_DECODE:-1 2 3 4 6 8 12 16}"
+
 exec python -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --served-model-name deepseek-v4.1-flash \
@@ -30,12 +32,12 @@ exec python -m sglang.launch_server \
     --context-length "${CONTEXT_LENGTH:-65536}" \
     --chunked-prefill-size 4096 \
     --max-total-tokens "${MAX_TOTAL_TOKENS:-131072}" \
-    --max-running-requests 16 \
+    --max-running-requests "${MAX_RUNNING_REQUESTS:-16}" \
     --mem-fraction-static "${MEM_FRACTION_STATIC:-0.92}" \
     --speculative-algorithm DSPARK \
     --speculative-dspark-block-size 5 \
-    --cuda-graph-max-bs-decode 16 \
-    --cuda-graph-bs-decode 1 2 3 4 6 8 12 16 \
+    --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE:-16}" \
+    --cuda-graph-bs-decode "${cuda_graph_bs_decode[@]}" \
     --reasoning-parser auto --tool-call-parser auto \
     --enable-metrics --decode-log-interval 10 \
     --host "${SERVE_HOST:-0.0.0.0}" --port "${SERVE_PORT:-31818}" \

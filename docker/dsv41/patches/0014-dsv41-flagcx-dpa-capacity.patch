@@ -1,0 +1,241 @@
+diff --git a/python/sglang/srt/arg_groups/deepseek_v4_hook.py b/python/sglang/srt/arg_groups/deepseek_v4_hook.py
+index d4898da122..50ef6a2b4b 100644
+--- a/python/sglang/srt/arg_groups/deepseek_v4_hook.py
++++ b/python/sglang/srt/arg_groups/deepseek_v4_hook.py
+@@ -275,12 +275,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
+         )
+ 
+         flagcx_pd = cfg.disaggregation_transfer_backend == "flagcx"
++        flagcx_dpa_decode = (
++            flagcx_pd
++            and cfg.disaggregation_mode == "decode"
++            and cfg.tp_size == cfg.ep_size == 8
++            and cfg.dp_size == 4
++            and allow_decode_config(cfg)
++        )
+         if (
+             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+             or cfg.disaggregation_transfer_backend not in ("mooncake", "flagcx")
+             or (
+                 (cfg.dp_size != 1 or cfg.enable_dp_attention)
+-                and (flagcx_pd or not allow_decode_config(cfg))
++                and not (flagcx_dpa_decode if flagcx_pd else allow_decode_config(cfg))
+             )
+             or cfg.attn_cp_size != 1
+             or cfg.dcp_size != 1
+@@ -288,9 +295,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
+         ):
+             raise ValueError(
+                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or "
+-                "FlagCX, and CP=1. FlagCX currently requires DP=1 and equal "
+-                "attention TP on both servers. Both servers must enable DSpark "
+-                "with the same block size and TP size."
++                "FlagCX, and CP=1. FlagCX admits equal attention TP/DP1 or "
++                "the opt-in decode attention TP2 x DP4 topology. Both servers "
++                "must enable DSpark with the same block size."
+             )
+ 
+     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
+index 90c2cb7117..570e2b0918 100644
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -1160,7 +1160,17 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
+         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
+     )
+ 
+-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
++    # Decode attention DP4 needs a request-bounded SWA pool so the full KV
++    # pool can hold 20 independent 128K contexts per DP worker. Leaving the
++    # CLI default intact lets DSV4PoolConfigurator select cap mode; preserve
++    # an operator-supplied ratio and the usual model default everywhere else.
++    from sglang.srt.disaggregation.dsv41_dpa_experiment import allow_decode_config
++
++    use_decode_swa_cap = allow_decode_config(server_args)
++    if (
++        server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio
++        and not use_decode_swa_cap
++    ):
+         overrides["swa_full_tokens_ratio"] = 0.1
+         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
+ 
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index 3f4bba7381..8f40d9ab7a 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -778,6 +778,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+             else DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO
+         )
+         self.sliding_window_size = kvc.sliding_window_size
++        if (
++            self.sliding_window_size is None
++            and kvc.server_args.disaggregation_mode == "decode"
++        ):
++            # V4.1 exposes its actual SWA window through the compressed pool
++            # config, not ModelRunner's generic sliding-window detector. Use it
++            # to size decode's request-scoped ring instead of a fraction of the
++            # full 128K-token KV capacity.
++            self.sliding_window_size = cfg.window_size
+         self.page_size = kvc.page_size
+         self.is_speculative = get_spec().speculative_algorithm is not None
+         self.online_c128_mtp_max_draft_tokens = kvc.server_args.max_speculative_num_draft_tokens or 0
+@@ -788,6 +797,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+             else None
+         )
+         self.disaggregation_mode = kvc.server_args.disaggregation_mode
++        self.decode_radix_cache_enabled = (
++            kvc.server_args.disaggregation_decode_enable_radix_cache
++        )
+         self.disaggregation_decode_extra_slots = (
+             kvc.server_args.disaggregation_decode_extra_slots or 0
+         )
+@@ -931,7 +943,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+         prefix_tails = get_schedule().swa_prefix_tails
+         if prefix_tails is not None:
+             return prefix_tails
+-        if get_memory().disable_radix_cache:
++        if get_memory().disable_radix_cache or (
++            self.disaggregation_mode == "decode"
++            and not self.decode_radix_cache_enabled
++        ):
+             # Nothing is kept for reuse, so the request cap alone bounds the pool.
+             return 0
+         max_running_requests = self.requested_max_running_requests_per_worker
+diff --git a/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py b/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
+index cfa40bb71d..56dc4b0677 100644
+--- a/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
++++ b/test/registered/unit/disaggregation/test_dsv41_dspark_pd.py
+@@ -61,7 +61,7 @@ class TestDSV41DSparkPD(CustomTestCase):
+         with self.assertRaisesRegex(ValueError, "contiguous 2D"):
+             index_pool.contiguous_page_row_buffers()
+ 
+-    def test_flagcx_dspark_pd_accepts_only_equal_tp_dp1(self):
++    def test_flagcx_dspark_pd_accepts_only_equal_tp_or_opt_in_decode_dp4(self):
+         from sglang.srt.arg_groups.deepseek_v4_hook import (
+             validate_deepseek_v41_features,
+         )
+@@ -77,8 +77,12 @@ class TestDSV41DSparkPD(CustomTestCase):
+             pp_size=1,
+             disaggregation_mode="decode",
+             disaggregation_transfer_backend="flagcx",
++            tp_size=8,
++            ep_size=8,
+             dp_size=1,
+             enable_dp_attention=False,
++            enable_dp_lm_head=False,
++            moe_a2a_backend="none",
+             attn_cp_size=1,
+             dcp_size=1,
+             enable_prefill_context_parallel=False,
+@@ -107,8 +111,14 @@ class TestDSV41DSparkPD(CustomTestCase):
+             validate_deepseek_v41_features(server_args)
+             cfg.dp_size = 4
+             cfg.enable_dp_attention = True
+-            with self.assertRaisesRegex(ValueError, "FlagCX currently requires DP=1"):
++            cfg.enable_dp_lm_head = True
++            with self.assertRaisesRegex(ValueError, "opt-in decode attention TP2"):
+                 validate_deepseek_v41_features(server_args)
++            with patch.dict("os.environ", {"SGLANG_DSV41_EXPERIMENTAL_DPA_PD": "1"}):
++                validate_deepseek_v41_features(server_args)
++                cfg.dp_size = 8
++                with self.assertRaisesRegex(ValueError, "opt-in decode attention TP2"):
++                    validate_deepseek_v41_features(server_args)
+ 
+     def test_bootstrap_validates_before_caching(self):
+         layout = make_layout()
+diff --git a/test/registered/unit/model_executor/test_pool_configurator.py b/test/registered/unit/model_executor/test_pool_configurator.py
+index 7757da848b..1a9848f83f 100644
+--- a/test/registered/unit/model_executor/test_pool_configurator.py
++++ b/test/registered/unit/model_executor/test_pool_configurator.py
+@@ -717,6 +717,40 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
+ 
+ 
+ class TestFactory(CustomTestCase):
++    def test_dsv41_pd_decode_caps_swa_by_live_requests(self):
++        from sglang.srt.model_executor.pool_configurator import (
++            DSV4PoolConfigurator,
++        )
++        from sglang.srt.server_args import ServerArgs
++
++        runner = _make_model_runner(
++            self,
++            num_layers=4,
++            page_size=256,
++            sliding_window_size=None,
++            disaggregation_mode="decode",
++            max_running_requests=80,
++            swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
++        )
++        model = runner.model_config
++        model.qk_nope_head_dim = 128
++        model.index_head_dim = 64
++        model.window_size = 128
++        model.compress_ratios = [4, 128, 2, 1]
++        model.hf_config.kv_source_layer_ids = [2, 3]
++        runner.kv_cache_dtype_str = "fp8_e4m3"
++        runner.ps = SimpleNamespace(pp_size=1, attn_dp_size=4)
++
++        with mock_cpu_env():
++            configurator = DSV4PoolConfigurator(runner)
++            sizes = configurator._compute_dsv4_sizes(2_621_440, 256)
++
++        self.assertEqual(configurator.sliding_window_size, 128)
++        self.assertEqual(configurator.swa_prefix_tails, 0)
++        self.assertIsNotNone(configurator.swa_cap_tokens)
++        self.assertEqual(sizes.swa_max_total_num_tokens, configurator.swa_cap_tokens)
++        self.assertLess(sizes.swa_max_total_num_tokens, 2_621_440 // 10)
++
+     def test_default_for_non_swa(self):
+         mr = _make_model_runner(self, is_hybrid_swa=False)
+         with mock_cpu_env():
+diff --git a/test/registered/unit/test_model_overrides.py b/test/registered/unit/test_model_overrides.py
+index 34ef3c0c88..78c0636d8d 100644
+--- a/test/registered/unit/test_model_overrides.py
++++ b/test/registered/unit/test_model_overrides.py
+@@ -971,6 +971,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
+             defaults = dict(
+                 device="cuda",
+                 swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
++                disaggregation_mode="null",
++                enable_dp_attention=False,
++                enable_dp_lm_head=False,
++                tp_size=8,
++                ep_size=8,
++                dp_size=1,
++                moe_a2a_backend="none",
+                 moe_runner_backend="auto",
+                 get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+             )
+@@ -994,6 +1001,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
+             "swa_full_tokens_ratio",
+             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
+         )
++        with patch.dict("os.environ", {"SGLANG_DSV41_EXPERIMENTAL_DPA_PD": "1"}):
++            decode = _args(
++                disaggregation_mode="decode",
++                enable_dp_attention=True,
++                enable_dp_lm_head=True,
++                dp_size=4,
++            )
++            self.assertNotIn(
++                "swa_full_tokens_ratio", _deepseek_v4_overrides(decode, hf)
++            )
++            self.assertNotIn(
++                "swa_full_tokens_ratio",
++                _deepseek_v4_overrides(
++                    _args(
++                        disaggregation_mode="decode",
++                        enable_dp_attention=True,
++                        enable_dp_lm_head=True,
++                        dp_size=4,
++                        swa_full_tokens_ratio=0.5,
++                    ),
++                    hf,
++                ),
++            )
++        self.assertEqual(
++            _deepseek_v4_overrides(decode, hf)["swa_full_tokens_ratio"], 0.1
++        )
+         # nvfp4 hybrid checkpoint routes the MoE runner
+         self.assertEqual(
+             _deepseek_v4_overrides(

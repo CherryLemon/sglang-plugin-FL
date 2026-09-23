@@ -65,8 +65,31 @@
     {
       "path": "patches/0011-req-swa-state-0518.patch",
       "sha256": "2854bd5f24e695dafec0b10b711604d48d1af1f96a25b3f066c7ceafd40d5e54"
+    },
+    {
+      "path": "patches/0012-dsv41-flagcx-pd.patch",
+      "sha256": "5ad8bcbec806220e39412d1932faa9c7492138ba8f638ebc7da00faf801e6417"
+    },
+    {
+      "path": "patches/0013-dsv41-indexer-pd-pages.patch",
+      "sha256": "19a001db25775c473f2f3ed279a092769cd60ef472b5e94542934e9347ef9740"
+    },
+    {
+      "path": "patches/0014-dsv41-flagcx-dpa-capacity.patch",
+      "sha256": "122eb3a6f22434fa4cdecafeec97284517eac7b246c5e03fb64fc25dd36d374f"
     }
   ],
+  "flagcx": {
+    "build": "make USE_NVIDIA=1 CCL_HOME=/usr/local/lib/python3.12/dist-packages/nvidia/nccl DEVICE_HOME=/usr/local/cuda -j16",
+    "files": {
+      "build/lib/libflagcx.so": "3bc2c0be3053e9b3413d352b884b749876f064d590c1505c57ee986e4e23e1de",
+      "plugin/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "plugin/interservice/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "plugin/interservice/flagcx_wrapper.py": "e6e4bdb2c0d0034100d861e132d5092a381cdab5764db7b2a3775b56efc1ff27"
+    },
+    "repository": "https://github.com/flagos-ai/FlagCX",
+    "revision": "648a6c489d2d54870d173926eda2d0ea0771b39d"
+  },
   "flaggems": {
     "base": "8ea592557659491930ebf24c24392f958b29ac21",
     "package_files": {
@@ -103,19 +126,21 @@
   },
   "plugin": {
     "base": "244fda597bd7128482490c75895f7699330f39e6",
-    "implementation_revision": "f5b45b4a9a1ada5b0dfe3ae133c943d483ade80d",
+    "implementation_revision": "0f75b384b9dba8b5c83ce159e475d051ab073dfc",
     "package_files": {
       "sglang_fl/__init__.py": "91f7943285d38e307b6bce46dcd712ecd97f9886f273390d582a6a06f7284ff5",
+      "sglang_fl/disaggregation/conn.py": "c6d3248ae2b31f9f05db4ea229f0c1d9210084866320777366e71cbd3adb6000",
+      "sglang_fl/disaggregation/transfer_engine.py": "93b945df1c5bc2858accad466d620e86cb153dfab2567385707ab2381343a71e",
       "sglang_fl/dsv41/__init__.py": "995fb7ce7558145be880797af83d7429a71d4ab77c4314d169f850b1bbce7300",
       "sglang_fl/dsv41/backend.py": "8b33aea80c4ed949107c3d91cdaac51880f107d534fbf17a9187ac0f0f2fa0be",
       "sglang_fl/dsv41/quantization.py": "3a22dbcdc8649146256a5fdf1401d22907c6e45f1e7c467eedbf3360456f540c"
     },
-    "package_tree": "fe57786ab2e11a012cee7363329251da817293e2",
+    "package_tree": "2e86dae53ecc556ceff6c853a69018bf9e11dd53",
     "repository": "https://github.com/flagos-ai/sglang-plugin-FL",
     "upstream_branch": "dev/0.5.18"
   },
   "schema": 1,
-  "scope": "code, official-base image build, single-node TP8/EP8 GPU validation, DSPARK and decode CUDA Graph; PD excluded",
+  "scope": "code, official-base image build, single-node TP8/EP8 GPU validation, DSPARK and decode CUDA Graph, two-node FlagCX PD validation",
   "sglang": {
     "base": "71de97b264b04dcd514cf904003028aefe9775c8",
     "branch": "dsv41-fl-0.5.18",
@@ -207,8 +232,8 @@
       "python/sglang/kernels/ops/quantization/fp8_hopper_static.py": "eecf3e7a6244a2cdcf1f6662a81ddd8c193e4d7479d3c0120a0b403e40625dc6",
       "python/sglang/kernels/ops/quantization/fp8_kernel.py": "06aa1e9cd8a398d3959c189584dafbe2b7a532c7f1034c7effb28a8592ad0c36",
       "python/sglang/kernels/ops/speculative/dspark/dspark_draft_model.py": "c0bddaf51bd780382f8f9147a53564a9adee9fbcc084dabbdacaf06d4d1d8576",
-      "python/sglang/srt/arg_groups/deepseek_v4_hook.py": "e1b126381a3f011dcf6c30271310418acf04e3a547382096a7b2744ebb519814",
-      "python/sglang/srt/arg_groups/overrides.py": "ae6caa1c82c1d79e6a18efb040f818113ebd6d218861f30f75d9ecd0ad638f4b",
+      "python/sglang/srt/arg_groups/deepseek_v4_hook.py": "c91c3b24224bdce61fff95662071281f6e224db1b124bbef2b3dbdc96dacbbce",
+      "python/sglang/srt/arg_groups/overrides.py": "9c46cc773c31e963b1a3358632a171e70f7a386db06d42cee5c11680440bf951",
       "python/sglang/srt/configs/deepseek_v4.py": "1d08f541df6dd39bf3eb57ecf60659526d434bb5596fe7148016381121c6632e",
       "python/sglang/srt/configs/deepseek_v41.py": "23ffdb2c0201b449963f83dca9b9783decceb57f5a1ab5bf49bbae77faddf63e",
       "python/sglang/srt/configs/model_config.py": "0d10926401f948480ac578fc67b0c4878a62e9d490122ff63a6a18b25087c7e5",
@@ -257,7 +282,7 @@
       "python/sglang/srt/managers/tp_worker.py": "6316c87cbef7b54905038658ec215056d683e620ace1b2cf5220f824da080308",
       "python/sglang/srt/mem_cache/common.py": "2f0d93c7c2e91df2e67d340fdc3054e3b4fa960d2c2024ff6c156a14d45a0a74",
       "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py": "dd3a69d0ac048d696e49600eeac3a96d1e4d939b6e509c3de0bbe14e14498fed",
-      "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "49ab1af882c76d36f226714d12afba4e42071ebba0e18765e699cebdbaccb170",
+      "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "b6e07365d858a2914277f489f49aae70d495dfb4fba2b060cb0475757ed62ac2",
       "python/sglang/srt/mem_cache/dsv41_request_window.py": "732df8991fb780bc2ad3d813c318ef8a21078c8c5ac25d6ea023878471c53520",
       "python/sglang/srt/mem_cache/hicache_storage.py": "87e8f0f7d1617797b67a73caba2d613cbf6801e4c2eb4c6d6e23eb95ea7cff39",
       "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py": "f23b1dd08ce90c4c625410c5470fbdcb1d0d2d45711008481e9bf69a70bf8562",
@@ -271,7 +296,7 @@
       "python/sglang/srt/model_executor/encoder_swa_replay.py": "b7a7c9793ddbfda7f2c48d76a36a6b0ba3093303d5a1419cd313710f1505b4dd",
       "python/sglang/srt/model_executor/forward_batch_info.py": "76a5a53543d10cea3a7481327451b4b8953c9032d5857d17138ab593c4fe3c1b",
       "python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py": "a26d21f1a6d58de4aacf329c4b3a236dc5e4df40ffc113c217df21a41527f13d",
-      "python/sglang/srt/model_executor/pool_configurator.py": "7ef85193a3fb1ea3f21dd46d0a2a0a163469926ea496bf2bb0224759f23114dc",
+      "python/sglang/srt/model_executor/pool_configurator.py": "0fd748fe4c4a5795e654d403a06f751ff52dd048a9c1cb5d6c2fe74c764ff037",
       "python/sglang/srt/model_executor/runner/base_runner.py": "34f2ddfdb1a2c852325cfa87d270d8a7a67729a7b08982a27fde3b7abfa1154a",
       "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "7e9638af76b9598a15a9e3f77364329fb25da2c1811046c308534efbea0f6795",
       "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "16e16b3e0b286d2de60279bfc5525025a649a75261885bd013fa11d9df3323fd",
@@ -331,7 +356,7 @@
       "test/registered/quant/test_fp8_hopper_swapab.py": "81db346f9c3bf4ab348f01bdb31dba4394ace7c43c2489889b39511015206d2b",
       "test/registered/spec/dspark/test_dspark_dp_tier.py": "621030a085f4f73ed3c66f21a332adeed0429b6cc0989f756f122817b136b21f",
       "test/registered/unit/disaggregation/test_disaggregation_wire.py": "57e9a8f2cc4dee78d48a27fb4636508dc3f3be5e3222beac91f01b231121d468",
-      "test/registered/unit/disaggregation/test_dsv41_dspark_pd.py": "b388c967b2ae50e18e50cea6295c856d57df8492a03f5a1fcdc0aeb83159f424",
+      "test/registered/unit/disaggregation/test_dsv41_dspark_pd.py": "d5bfb2c35e42656ebfd60276fc2be7cd9dc87f317404387eb9424864aa9be4c6",
       "test/registered/unit/entrypoints/openai/test_encoding_dsv41.py": "1ed2b8e7956d68aa1c834864973c5248a3e7c10d07f08968b42f66a1f78fe126",
       "test/registered/unit/entrypoints/openai/test_serving_chat.py": "474e7fc0a89badff71729e1c280d6db3d112d734e16cc0ddc76757692fb7d6a9",
       "test/registered/unit/entrypoints/openai/test_serving_responses.py": "045bd92fc9875e9da60ddfc8684d5b22085e9e86f68efb59d3ee3eca4a9db39f",
@@ -345,12 +370,14 @@
       "test/registered/unit/mem_cache/test_unified_tree_insert_cursor.py": "83e7153912ae54a88cbf0cc2df55d5c4526825f5dda8d529b59ef67e7b0e15b2",
       "test/registered/unit/model_executor/model_runner_components/test_ngram_embedding_manager.py": "bc520387fb33cacf6f445cd468b1084a50427a63eb453f0f6e8802dcab074138",
       "test/registered/unit/model_executor/runner/test_prefill_cuda_graph_padding.py": "33125eaa7161c61be91c28aa3fbb8ce7bb3b65ee1d297c2c9ace4eb4d4cfc3a8",
+      "test/registered/unit/model_executor/test_pool_configurator.py": "32032a7007e0efd4eed885f52cfaed5f3ce5f592136bf742bc8fea46a1fcdd88",
       "test/registered/unit/model_executor/test_prefill_cuda_graph_runner.py": "3c57cf91fb97dabca8fd93a9ab0c38511fe433218a439d8f277773b74e3c0b13",
       "test/registered/unit/models/test_deepseek_v4_shared_expert_fusion.py": "467e9b1bfda8cf6be269f147d187d4b40aa6da8fad385403ed27240cec9d510b",
       "test/registered/unit/multimodal/test_dsv41_vl_routing.py": "4f50a7cf4f9a0a291bd010c9fd46e3baa2bc504af5bcce3d9d1ed6ce80a4898e",
-      "test/registered/unit/spec/test_dspark_draft_metadata.py": "351181ede4161b687a83a5e1bbe9154030d386fc90eb400ca81028ecae03e965"
+      "test/registered/unit/spec/test_dspark_draft_metadata.py": "351181ede4161b687a83a5e1bbe9154030d386fc90eb400ca81028ecae03e965",
+      "test/registered/unit/test_model_overrides.py": "1f3347dfd21a3ee11b2c90e689d8d0a8cf9cdebadb524dcc225b0d7b0bec6316"
     },
     "repository": "https://github.com/sgl-project/sglang",
-    "revision": "e1dc3808466baccdb7e21639ce944552cad6bd2a"
+    "revision": "4cf6966fef013bccd7bbe4274df5132d7877b103"
   }
 }

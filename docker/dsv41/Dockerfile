@@ -28,6 +28,7 @@ COPY --from=builder /build/wheels /opt/sglang-fl/wheels
 COPY wheelhouse/sqlalchemy-*.whl wheelhouse/greenlet-*.whl /opt/sglang-fl/wheels/
 RUN pip install --no-index --no-deps /opt/sglang-fl/wheels/*.whl
 COPY delivery /opt/sglang-fl
+COPY flagcx /opt/FlagCX
 RUN python /opt/sglang-fl/apply_patches.py /sgl-workspace/sglang
 COPY --from=builder /sgl-workspace/sglang/python/sglang/srt/rust_extensions/_multimodal*.so /sgl-workspace/sglang/python/sglang/srt/rust_extensions/
 COPY --from=builder /build/offline-compile.json /opt/sglang-fl/offline-compile.json
