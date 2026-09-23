@@ -140,6 +140,14 @@ class PlatformFL(SRTPlatform):
     def is_out_of_tree(self) -> bool:
         return True
 
+    def get_torch_profiler_activity_str(self) -> str:
+        """Return the activity exposed by this device's PyTorch profiler."""
+        return self._device_type.upper()
+
+    def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
+        activity = self.get_torch_profiler_activity_str()
+        return getattr(torch.profiler.ProfilerActivity, activity)
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend for this platform.
 
