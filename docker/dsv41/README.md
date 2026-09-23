@@ -1,8 +1,8 @@
 # DeepSeek V4.1 Flash / SGLang FL 0.5.18
 
-本目录交付代码迁移和 NVIDIA 镜像构建。引擎基于官方 SGLang **v0.5.18**，插件基于 **dev/0.5.18**；具体提交、镜像 digest、模型 revision、补丁及文件 SHA256 见 [manifest.json](manifest.json)。本轮不加载模型、不启动服务、不运行 GPU 数值或性能测试。
+本目录交付代码迁移、NVIDIA 镜像和单机整模联调。引擎基于官方 SGLang **v0.5.18**，插件基于 **dev/0.5.18**；具体提交、镜像 digest、模型 revision、补丁及文件 SHA256 见 [manifest.json](manifest.json)。DeepSeek V4.1 Flash 已在 `aiops-10-8-2-1` 的 8 张 H100 上以 TP8/EP8 启动；验证了非 PD 服务、DSpark/MTP 和 decode CUDA Graph。
 
-镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。它是后续联调的迁移镜像，尚不是多芯片整模验收版本。
+镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。本次是单节点功能联调，未做质量、吞吐和 PD 验收。
 
 ## 代码与补丁
 
@@ -12,6 +12,7 @@
 | `patches/0002-v12-serving.patch` | V12 block32 配置、紧凑候选、六 query 解码复用、mHC、缓存游标、图元数据和 PD 拓扑修复 |
 | `patches/0003-0518-compatibility.patch` | 0.5.18 请求字段、配置默认值、TopK 依赖、缓存接口和 CPU 测试适配 |
 | `patches/0004-oot-interface.patch` | `sglang.srt.layers.dsv41_ops` ABI v1，显式分发及必需插件守卫 |
+| `patches/0005`–`0011` | 修复 0.5.18 的压缩状态、SWA 分配、图元数据、V4.1 processor，以及请求 KV/SWA 字段迁移 |
 | `patches/flaggems-dsv41.patch` | FlagGems K tile 缩放边界修复、FP8/BF16 线性计算、packed 索引器及 mHC |
 
 功能回移与 V12 优化分别提交。未引入新版请求对象或整套运行时重构。SGLang 版本保持 `0.5.18`，镜像内 `/opt/sglang-fl/manifest.json` 标明补丁后的源码提交和文件哈希。源分支带入的 `benchmark/deepseek_v41_h100` 报告仅作为历史资料，其吞吐、质量和 GPU 测试结果不代表本镜像的结果。
@@ -20,15 +21,15 @@
 
 | 路径 | hybrid 后端 | 本轮验证 / 仍需验证 |
 | --- | --- | --- |
-| block32 E4M3 线性层 | FlagGems | 分组、空输入、scale 类型 CPU 契约；SM90 离线编译；GPU 数值待测 |
+| block32 E4M3 线性层 | FlagGems | 分组、空输入、scale 类型 CPU 契约；SM90 离线编译；GPU 数值通过 |
 | 无原生 FP8 的量化兼容线性层 | FlagGems BF16 tile 解码 | 保留 E4M3 舍入、逐组 scale；SM80 离线编译；GPU 数值待测 |
 | 显式 BF16 线性层 | FlagGems | 独立模式，取消激活量化；权重按 tile 解码；整模 BF16 未打通 |
-| packed FP4 索引器 | FlagGems | E2M1 布局、紧凑候选接口、零长度契约；SM90 离线编译 |
-| 六 query 复用 | FlagGems | 保留逐次 replay 的请求 ID 判断及原形状守卫；GPU 混合请求/图测试待测 |
+| packed FP4 索引器 | FlagGems | E2M1 布局、紧凑候选接口、零长度契约；SM90 GPU 数值通过，修复零乘 NaN |
+| 六 query 复用 | FlagGems | 保留逐次 replay 的请求 ID 判断及原形状守卫；整模 decode graph 与 1/4/8 并发通过 |
 | mHC predecessor-pre | FlagGems | FP32 混合权重、前一子层 pre 契约；SM90 离线编译；融合数值误差待测 |
 | 稀疏注意力 / RoPE / 压缩缓存 | vendor | 保留模型语义；其余芯片的完整算子链待补齐 |
-| MoE TP/EP | vendor | 保留原 A2A 策略；未将单 rank 参考 MegaMoE 当成 EP 后端 |
-| 通信 | 插件原有 CommunicatorFL | 本轮未测试 collective、RDMA 或跨节点 |
+| MoE TP/EP | FlashInfer MXFP4 | 8 卡 TP8/EP8 整模请求通过；未将单 rank 参考 MegaMoE 当成 EP 后端 |
+| 通信 | 插件原有 CommunicatorFL | 单节点 TP8/EP8 已跑通；RDMA 和跨节点未测 |
 | V4.1 DSpark PD | 原 Mooncake 路径 | 布局/拓扑 CPU 契约；未开放 FlagCX 白名单 |
 
 FlagCX 的通用连接器仍保留在插件中。V4.1 专有缓存、C2 stride、完成事件和取消生命周期尚未完成 FlagCX 联调；本次没有删除 Mooncake/static-verify 守卫。流水线并行等原有限制继续生效。不同厂商设备混入同一个 TP/EP 组不在本次范围。
@@ -85,15 +86,15 @@ python docker/dsv41/build_image.py \
 
 镜像默认 `USE_FLAGGEMS=0`、`SGLANG_FL_OOT_ENABLED=0`，只启用本次明确接入的 DSV4.1 数值接口，通信插件照常注册。每个接口首次执行输出 `DSV4.1 op=... backend=... quantization=...`；选择完成后不捕获异常来尝试另一后端。`Dsv41Backend.snapshot()` 可读取本进程选择记录。
 
-构建中执行依赖/源码哈希、插件 entry point、ABI、关键模块导入、Rust 符号、CPU 回归和 Triton 离线编译检查。离线编译生成 SM90/SM80 cubin，无 GPU 执行；它不能证明数值或图 replay 正确。
+构建中执行依赖/源码哈希、插件 entry point、ABI、关键模块导入、Rust 符号、CPU 回归和 Triton 离线编译检查。离线编译生成 SM90/SM80 cubin；GPU 数值和整模 graph replay 另在目标机器验证。
 
-GPU 数值测试入口已提供，默认跳过，需后续明确启用 `RUN_DSV41_GPU_TESTS=1`。正式交付前仍需验证算子数值、changed-input graph replay、整模质量、TP/EP、DSpark、冷/热长上下文及 PD。H100 源分支的性能数字不作为这轮构建验收结果。
+GPU 数值测试入口默认跳过。在 `.1` 机器上显式运行 `RUN_DSV41_GPU_TESTS=1`，14 项通过；随后 TP8/EP8、DSpark 与 decode graph 整模服务通过 14 个已知答案及并发请求。整模质量、长上下文、吞吐和 PD 尚未验收。H100 源分支的性能数字不作为本次验收结果。
 
 本次构建结果见 [build-result.json](build-result.json)：89 项 CPU 测试、63 个子用例通过，2 项跳过；10 个离线编译用例通过。另用明确的 CPU device/driver doubles 检查了 FlagGems 全包导入、插件初始化及 DSV4.1 注册，未执行 GPU 操作。
 
 ## 单节点 Graph / MTP 联调入口
 
-[serve_single_node.sh](serve_single_node.sh) 使用 TP8/EP8、DSpark block5、static verify 和 decode CUDA Graph，默认上下文 65536、最多 16 个并发请求，不启用 PD。`MODEL_PATH` 必须指向固定 revision 的完整 checkpoint；`SERVE_PORT` 默认 31818。该脚本是联调入口，服务验证结果单独记录，不改变前面的镜像构建验收范围。
+[serve_single_node.sh](serve_single_node.sh) 使用 TP8/EP8、FlashInfer MXFP4 MoE、DSpark block5、static verify 和 decode CUDA Graph；默认上下文 65536、最多 16 个并发请求、静态内存比例 0.92，不启用 PD。SM90 上关闭不兼容该索引分数 stride 的 TopK v2。`MODEL_PATH` 必须指向固定 revision 的完整 checkpoint；`SERVE_PORT` 默认 31818。
 
 先检查容器内 8 张 GPU 均可由 PyTorch 访问，并执行 `RUN_DSV41_GPU_TESTS=1 pytest -q /opt/sglang-fl/tests/dsv41/test_gpu_ops.py`。将本目录只读挂载为 `/work/scripts` 后，可在容器内运行：
 
@@ -108,4 +109,4 @@ python /work/scripts/smoke_service.py \
   --url http://127.0.0.1:31818 --output /work/results/service-smoke.json
 ```
 
-还需从同一次请求的 scheduler 日志确认 `CUDA graph: True`，并核对 target 和 draft 图捕获成功；只看到配置开关或 HTTP 200 不构成 Graph/MTP 通过。
+本次 [服务结果](/public-nvme/yjwu/sglang-fl-0518-node1/smoke-service.json) 为 14/14 请求通过，`avg_spec_accept_length=4.13`。同一轮 [服务日志](/public-nvme/yjwu/sglang-fl-0518-node1/server.log) 显示 target/draft 图捕获完成，且实际解码 batch 1/8 的 `cuda graph: True`。prefill 图按该模型的 SGLang 配置关闭；这里的 Graph 验收指 decode replay。

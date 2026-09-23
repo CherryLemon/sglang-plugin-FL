@@ -1,0 +1,20 @@
+diff --git a/python/sglang/srt/layers/attention/dsv4/metadata.py b/python/sglang/srt/layers/attention/dsv4/metadata.py
+index 8a9c47c3f3..45b6b8da93 100644
+--- a/python/sglang/srt/layers/attention/dsv4/metadata.py
++++ b/python/sglang/srt/layers/attention/dsv4/metadata.py
+@@ -112,6 +112,7 @@ class PagedIndexerMetadata:
+     page_size: int
+     page_table: torch.Tensor
+     c4_seq_lens: torch.Tensor
++    use_topk_v2: bool = False
+     force_deep_gemm_metadata: bool = False
+     use_prefill_cuda_graph: bool = False
+     # Compression ratio of the indexer source: 4 for c4, 1/2 for the dsv41
+@@ -225,6 +226,7 @@ class PagedIndexerMetadata:
+                 "compress_ratio",
+                 "index_page_size",
+                 "row_chunk",
++                "use_topk_v2",
+                 "force_deep_gemm_metadata",
+                 "use_prefill_cuda_graph",
+             ],

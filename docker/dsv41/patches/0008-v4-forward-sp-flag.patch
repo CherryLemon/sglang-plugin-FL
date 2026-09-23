@@ -1,0 +1,21 @@
+diff --git a/python/sglang/srt/runtime_context.py b/python/sglang/srt/runtime_context.py
+index 047ea44915..df6ef62942 100644
+--- a/python/sglang/srt/runtime_context.py
++++ b/python/sglang/srt/runtime_context.py
+@@ -498,6 +498,8 @@ class ForwardFlags:
+         "fuse_mlp_allreduce": False,
+         "mlp_reduce_scatter": False,
+         "flashinfer_trtllm_bypass": False,
++        # DeepSeek V4's fused wo_a path reads this during graph capture.
++        "sp_active": False,
+     }
+ 
+     # Read/written inside compiled graphs (vocab embedding, communicator,
+@@ -512,6 +514,7 @@ class ForwardFlags:
+             "fuse_mlp_allreduce",
+             "mlp_reduce_scatter",
+             "flashinfer_trtllm_bypass",
++            "sp_active",
+         }
+     )
+ 

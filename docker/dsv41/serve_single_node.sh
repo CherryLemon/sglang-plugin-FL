@@ -16,6 +16,7 @@ export SGLANG_RAGGED_VERIFY_MODE=static
 export SGLANG_DSPARK_ATTN_TP_REDUCE=1
 export SGLANG_OPT_DSV41_INDEXER_SKIP_INVALID_TILES=1
 export SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK=0
+export SGLANG_OPT_USE_TOPK_V2=0
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
@@ -24,11 +25,13 @@ exec python -m sglang.launch_server \
     --served-model-name deepseek-v4.1-flash \
     --trust-remote-code \
     --tp 8 --ep-size 8 --moe-a2a-backend none \
+    --moe-runner-backend flashinfer_mxfp4 \
+    --speculative-moe-runner-backend flashinfer_mxfp4 \
     --context-length "${CONTEXT_LENGTH:-65536}" \
     --chunked-prefill-size 4096 \
     --max-total-tokens "${MAX_TOTAL_TOKENS:-131072}" \
     --max-running-requests 16 \
-    --mem-fraction-static "${MEM_FRACTION_STATIC:-0.80}" \
+    --mem-fraction-static "${MEM_FRACTION_STATIC:-0.92}" \
     --speculative-algorithm DSPARK \
     --speculative-dspark-block-size 5 \
     --cuda-graph-max-bs-decode 16 \

@@ -1,0 +1,12 @@
+diff --git a/python/sglang/srt/multimodal/processors/deepseek_v41.py b/python/sglang/srt/multimodal/processors/deepseek_v41.py
+index b4d93aabf4..498f67ff26 100644
+--- a/python/sglang/srt/multimodal/processors/deepseek_v41.py
++++ b/python/sglang/srt/multimodal/processors/deepseek_v41.py
+@@ -122,6 +122,6 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
+             )
+         return MultimodalProcessorOutput(
+             input_ids=tokens,
+-            mm_items=self._prepare_mm_items_for_transport(items),
++            mm_items=items,
+             im_token_id=self.image_token_id,
+         )

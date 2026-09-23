@@ -1,0 +1,37 @@
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 0757752fcf..2b2018ab5f 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2825,8 +2825,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         reserve = get_alloc_reserve_per_decode()
+         total = 0
+         for r in requests:
+-            x = max(0, r.kv_committed_len + reserve - r.kv_allocated_len)
+-            cur = r.kv_allocated_len
++            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
++            cur = r.kv.kv_allocated_len
+             nxt = cur + x
+             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+         return total
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index d283ebdedc..7846f50824 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -239,7 +239,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
+     if req.req_pool_idx is None and req.kv is None:
+         return
+ 
+-    start_p, end_p = effective_kv_committed_len, req.kv_allocated_len
++    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+ 
+     # If the prefix cache doesn't manage mamba states, we must free them here.
+@@ -268,7 +268,7 @@ def _release_overallocated_kv_indices(
+     if spec_algo is None and not get_serving().strip_thinking_cache:
+         assert (
+             start_p == end_p
+-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
++        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+ 
+     if page_size > 1:
+         start_p = ceil_align(start_p, page_size)

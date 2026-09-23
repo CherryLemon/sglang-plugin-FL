@@ -1,0 +1,13 @@
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_compress_state.py b/python/sglang/srt/mem_cache/deepseek_v4_compress_state.py
+index 2cc70ad59d..a45238f1cd 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_compress_state.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_compress_state.py
+@@ -55,7 +55,7 @@ class KVAndScore:
+         self.kv_score[index] = value.kv_score
+ 
+     def clear(self):
+-        self.zero_()
++        self.kv_score.zero_()
+         self.score.fill_(float("-inf"))
+ 
+     def view(self, *args):

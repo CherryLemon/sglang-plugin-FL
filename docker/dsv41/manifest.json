@@ -37,6 +37,34 @@
     {
       "path": "patches/0004-oot-interface.patch",
       "sha256": "0634f2da500663029a278bb01ae3adcbab6eab4ce510e864a133275ad234c8f8"
+    },
+    {
+      "path": "patches/0005-fix-compress-state-clear.patch",
+      "sha256": "14c9b9fa552b3a35058b66f866adf8374e284dcce5c9c7889538c2c7ddb70b5e"
+    },
+    {
+      "path": "patches/0006-oot-hybrid-swa-allocator.patch",
+      "sha256": "d4343264d4779db534799e10e2a72a6d614030d626b22a37c1babafb88ff3761"
+    },
+    {
+      "path": "patches/0007-v4-topk-graph-metadata.patch",
+      "sha256": "4c54c2159d6b92b9762c4a2333325ed97fb819b101bcd159bfd8f1d2dbc4c271"
+    },
+    {
+      "path": "patches/0008-v4-forward-sp-flag.patch",
+      "sha256": "a6d9d8e35e3f845d17fd83a7938c594fe4d6e8ded4d06233f121b8adc2806429"
+    },
+    {
+      "path": "patches/0009-v41-processor-0518-output.patch",
+      "sha256": "9bdf74d4e97752b7166e4dd23610deaf51c2a8ee9d851b1287d3eef0cc27e191"
+    },
+    {
+      "path": "patches/0010-req-kv-state-0518.patch",
+      "sha256": "37cdb633a7163be3b407641d706f7543a88796d470a2fcad59bc09ecc0156c10"
+    },
+    {
+      "path": "patches/0011-req-swa-state-0518.patch",
+      "sha256": "2854bd5f24e695dafec0b10b711604d48d1af1f96a25b3f066c7ceafd40d5e54"
     }
   ],
   "flaggems": {
@@ -45,15 +73,15 @@
       "flag_gems/fused/DSA/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "flag_gems/fused/dsv41/__init__.py": "275d6cf2854e01e2edc4582a47d268d523fde520864a5d20d23842e4dc50b068",
       "flag_gems/fused/dsv41/block_fp8_linear.py": "5e8e859aebf35705099be87449915759ac7ee6ff7350bae7bc7bd03442efc747",
-      "flag_gems/fused/dsv41/fp4_indexer.py": "afa434d355da836ba9f09544732d9629e5418b13abad3d600f5701172dd116f6",
+      "flag_gems/fused/dsv41/fp4_indexer.py": "8fa80b668a6047641b4c0c6e2f9588b48708c2fae5940ce2a4366e56b6ecb764",
       "flag_gems/fused/dsv41/mhc.py": "bae3097ba138a3e05e6f47f8a564793faad3529945259025d9efc1fb40393160",
       "flag_gems/ops/w8a8_block_fp8_matmul.py": "3d3f6e595061559201458b9b6cfcf1214e8a5af44414d60b736e023a5a6b9426"
     },
-    "package_tree": "7a5388063c4c3da3e5c9df6a05b1f9f88d6439c9",
+    "package_tree": "6343915012287d84d423fed6f94f34fdbf15c7aa",
     "patch": "patches/flaggems-dsv41.patch",
-    "patch_sha256": "f1052454832d1545adacb10584befa8db3b570cf038e8083f42bdee154311ead",
+    "patch_sha256": "474765c552ccbef614019171c8cb14bc3df4e4b17c55107b9e27b1022bd8665e",
     "repository": "https://github.com/flagos-ai/FlagGems",
-    "revision": "63bf36d6eb2edaed0877d52c88a2041a4a2b8f00"
+    "revision": "bcc159d7968c20c739dd59596585c92ae1563b04"
   },
   "model": {
     "config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
@@ -87,7 +115,7 @@
     "upstream_branch": "dev/0.5.18"
   },
   "schema": 1,
-  "scope": "code, offline CPU validation and image build; no model or GPU execution",
+  "scope": "code, official-base image build, single-node TP8/EP8 GPU validation, DSPARK and decode CUDA Graph; PD excluded",
   "sglang": {
     "base": "71de97b264b04dcd514cf904003028aefe9775c8",
     "branch": "dsv41-fl-0.5.18",
@@ -205,7 +233,7 @@
       "python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py": "b92e5a55ffca78b904852c232e469e467780041f32ba561e5931bdd17f2b43fe",
       "python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py": "7232b7a53f97f0e346d180da92849fcd34d25866aaf8130373ba689584541730",
       "python/sglang/srt/layers/attention/dsv4/indexer.py": "2bdbba0c7cd5e8faaaa129f4e26a0543abb3cf71fc600420f534f267fc6fa4b8",
-      "python/sglang/srt/layers/attention/dsv4/metadata.py": "e5707165d4b6dc481d43e88481b895c2df92de1f0028860b2c4eb25f15fd68c5",
+      "python/sglang/srt/layers/attention/dsv4/metadata.py": "1af7ac9f247c51cb58cc0b76d22176cb8137117476fb8c8de549de7bdbf6e1e2",
       "python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py": "7bda5eac628edc7befd910d9020dc94fa58860751a302a771f1eb291df05c8f8",
       "python/sglang/srt/layers/attention/dsv4/torch_quant.py": "72770fc6635768f49d8c7dc53a053829a6a5e5acead41e555d22cbd385a4cdef",
       "python/sglang/srt/layers/cp/interleave.py": "c49c15ad76660b5ac79538c62782a9f242aaf50fbad179132830c73cb8e6c774",
@@ -221,20 +249,20 @@
       "python/sglang/srt/layers/quantization/fp8_utils.py": "129c3b05d18101b30cce17a5467c3bf7e1640573a429a32f175cc2215b41eac3",
       "python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py": "867e588bbf368b73650a1d3580b5fe63bebd8c1420a92d888ed59ec87fdba038",
       "python/sglang/srt/layers/quantization/mxfp8_input.py": "02033012ebbcbb4b6140092ccadf8ce3dbb1105e81fb1e2bbe2b9afa3af6171a",
-      "python/sglang/srt/managers/schedule_batch.py": "3e1f9a021c84daa93f9807bd5cd29fd1a8a8bd278b299378e77dcc6f61c05179",
+      "python/sglang/srt/managers/schedule_batch.py": "7256014360d06e3c809bfe944f2ab065af58649ea807809770900d981766cf67",
       "python/sglang/srt/managers/schedule_policy.py": "96e7e5e5a4070a9a0f63219b35af9ea51eaa74835989332f5bd762caa7b0f7d8",
       "python/sglang/srt/managers/scheduler.py": "3f53494c7f8e1bf8b59684fa732e943842164c0ed76dfb07e58bc22d0d57bb59",
       "python/sglang/srt/managers/scheduler_components/metrics_reporter.py": "74ea6bf668e24c527b4f9a00fd3c09e6357d8d9d8f83b83eedf7447922aa241f",
       "python/sglang/srt/managers/tokenizer_manager.py": "98134379bd92d408c1ed264d659c1d4ec609d9d1ef3b66e1d234fb177253ce7a",
       "python/sglang/srt/managers/tp_worker.py": "6316c87cbef7b54905038658ec215056d683e620ace1b2cf5220f824da080308",
-      "python/sglang/srt/mem_cache/common.py": "452d29b2a2058bd9dd2b6e27c5607a3c9c6d7a4d644088c628678ad1b7b6297a",
-      "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py": "b92350b16d4a36b9c1a426f850661c864d8c670b2535bd1b790e7f6781e87999",
+      "python/sglang/srt/mem_cache/common.py": "2f0d93c7c2e91df2e67d340fdc3054e3b4fa960d2c2024ff6c156a14d45a0a74",
+      "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py": "dd3a69d0ac048d696e49600eeac3a96d1e4d939b6e509c3de0bbe14e14498fed",
       "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "49ab1af882c76d36f226714d12afba4e42071ebba0e18765e699cebdbaccb170",
       "python/sglang/srt/mem_cache/dsv41_request_window.py": "732df8991fb780bc2ad3d813c318ef8a21078c8c5ac25d6ea023878471c53520",
       "python/sglang/srt/mem_cache/hicache_storage.py": "87e8f0f7d1617797b67a73caba2d613cbf6801e4c2eb4c6d6e23eb95ea7cff39",
       "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py": "f23b1dd08ce90c4c625410c5470fbdcb1d0d2d45711008481e9bf69a70bf8562",
       "python/sglang/srt/mem_cache/kv_cache_builder.py": "a0d485f9bc2e2fdda8d948d912f92ae98de5be1e07d732fa37add9b1e00a4324",
-      "python/sglang/srt/mem_cache/kv_cache_configurator.py": "aa511d6e1ca5ffd705e10b91fa1ed7f75bf19acde77181e7d45fbf862b9ccdc4",
+      "python/sglang/srt/mem_cache/kv_cache_configurator.py": "f3c692a50635ffdad4bd0075f2ac92cd01af541eec79a7b265af564e08eed9cf",
       "python/sglang/srt/mem_cache/radix_cache.py": "7765469dd429d51891753730ac3fdc875921b44151c970d5d0aa76db19ee1eb7",
       "python/sglang/srt/mem_cache/registry.py": "07a3b2da58c65d2b002f04c869ab005f5cf8fd263c02bae20514475acaf73dab",
       "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py": "1f2927ccdb5d9a647be40b15c1aa0a873aa906bf78448ee626bd3c04921ed4c3",
@@ -259,10 +287,10 @@
       "python/sglang/srt/multimodal/deepseek_v41_image_processing.py": "dcd06c489aa12fecf7a99925d010bb9929b408f834d7e277051bfc3dd41db0ba",
       "python/sglang/srt/multimodal/dsv41/__init__.py": "6a103cc3d0e4d126c21a6378fe67b6e60d23d992251c87eac210c67e8af763d5",
       "python/sglang/srt/multimodal/dsv41/vl_routing.py": "261ad984a174329140e6fe87d80da462f036ea25680059447a451784701cb81f",
-      "python/sglang/srt/multimodal/processors/deepseek_v41.py": "467044021fbbfffcfb7c303408786fba3231dc5b4c6c1f927f6c0eb672840dd4",
+      "python/sglang/srt/multimodal/processors/deepseek_v41.py": "5008e46ff5c40d31716378fe8f2a8198fc09256c1746d9382d29bc82bae2ae1a",
       "python/sglang/srt/parser/reasoning_parser.py": "9a46bae75ca9ab9c8f0737541a3bb18e681ed25819f0a4458b4ae45dccdf8b91",
       "python/sglang/srt/parser/template_detection.py": "71ccb1105cbde0a5ef9f37b3af8183b0c9eff8ffef143cde2bb4ce9baa6b6098",
-      "python/sglang/srt/runtime_context.py": "a3f539aaed4ed2a07a5beaba43933bef7e0156888753ac2e364d28fc77c556a8",
+      "python/sglang/srt/runtime_context.py": "d6550a1935eda591e0b74fdbdf877a8e6bbd7f1921cc4724f1e5ad54d5cc954d",
       "python/sglang/srt/server_args.py": "65ff7366c8016eafe0cd344fdf3dcd3a95a92a5e523748d156fbed5d85fa4bc0",
       "python/sglang/srt/speculative/dspark_components/dspark_draft.py": "1bdc19fc5101308e07aead7d58c85b8ff4e86eaffe696d082435cd502dca875a",
       "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "3f6a7d07790c08047af3ac5ed07d679993a46e046c0f1421a36f0760b71efe53",
@@ -323,6 +351,6 @@
       "test/registered/unit/spec/test_dspark_draft_metadata.py": "351181ede4161b687a83a5e1bbe9154030d386fc90eb400ca81028ecae03e965"
     },
     "repository": "https://github.com/sgl-project/sglang",
-    "revision": "4a5e10efe8d617670fae3c32c76d68d459e3779a"
+    "revision": "e1dc3808466baccdb7e21639ce944552cad6bd2a"
   }
 }
