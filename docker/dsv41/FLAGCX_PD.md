@@ -58,8 +58,8 @@ C2 receiver strides and state index counts; and report failed state writes as a
 failed PD transfer instead of a successful one.
 
 Validation receipts and logs are under `/public-nvme/yjwu/sglang-fl-0518-pd`.
-The official-base image build log is `image-build-r5.log` (92 CPU tests passed,
-2 skipped; 63 subtests passed). The final tag is
+The original official-base PD image build log is `image-build-r5.log` (92 CPU tests passed,
+2 skipped; 63 subtests passed). Its tag is
 `sglang-fl-dsv41:0.5.18-flagcx-pd-r5`. Its
 `/opt/FlagCX/build/lib/libflagcx.so` SHA256 matches the manifest. The first startup failure
 caused by the missing indexer registration method is preserved as
@@ -156,3 +156,9 @@ D ranks, FlagGems W8A8 quantization and GEMM cost 25.14 ms/step versus
 capacity configuration as the receipts above. The out-of-tree platform's
 PyTorch profiler activity hook was fixed so `/start_profile` can capture
 the running service.
+The follow-up image `sglang-fl-dsv41:0.5.18-flagcx-pd-r6` contains that hook;
+its image ID is `sha256:6cac4057cd850a5bcfeaf416553ae28469251b3663cfa00aa7e53f2cafb2a56a`.
+The build passed 92 CPU tests (2 skipped, 63 subtests) and the new image's
+profiler activity mapping was verified directly. Build log and receipt are
+`/public-nvme/yjwu/sglang-fl-0518-build/image-build-r6.log` and
+`build-result-r6.json` in the same directory.
