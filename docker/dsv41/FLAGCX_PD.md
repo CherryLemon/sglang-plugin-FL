@@ -147,3 +147,12 @@ the FlagGems H100 block32 path currently uses default tiles for those shapes,
 while the source V12 branch carries shape-specific and Split-K configurations.
 That is a concrete tuning lead, not a per-kernel attribution. D was restarted
 back in the default hybrid mode after this A/B.
+
+A follow-up [steady-decode operator profile](PROFILE_STEADY_DECODE.md) captured
+10 Graph/MTP forward steps in both modes at 80 active requests. Across eight
+D ranks, FlagGems W8A8 quantization and GEMM cost 25.14 ms/step versus
+13.84 ms/step for the V4.1 vendor path; FP4 scoring differs by only
+0.27 ms/step and mHC by 0.39 ms/step. The profile uses the same prompt and
+capacity configuration as the receipts above. The out-of-tree platform's
+PyTorch profiler activity hook was fixed so `/start_profile` can capture
+the running service.

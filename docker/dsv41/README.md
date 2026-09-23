@@ -2,7 +2,7 @@
 
 本目录交付代码迁移、NVIDIA 镜像和 H100 整模联调。引擎基于官方 SGLang **v0.5.18**，插件基于 **dev/0.5.18**；具体提交、镜像 digest、模型 revision、补丁及文件 SHA256 见 [manifest.json](manifest.json)。DeepSeek V4.1 Flash 已在 `aiops-10-8-2-1` 的 8 张 H100 上以 TP8/EP8 启动；验证了非 PD 服务、DSpark/MTP 和 decode CUDA Graph。FlagCX 两机 PD 配置与验收见 [FLAGCX_PD.md](FLAGCX_PD.md)。
 
-镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。单节点已测稳态 decode TPS；两机 PD 使用 FlagCX RoCE 状态传输和 decode Graph，D attention TP2×DP4 配置已通过 80 路同时运行的 128K 输入验收。当前 hybrid 模式的每路 decode TPS 仍低于 V12 历史结果，`vendor` 对照也未达到其每路最低 100 TPS 门槛；详见 [PD 实验报告](FLAGCX_PD.md)。整模质量及更长时间稳定性仍需单独验收。
+镜像默认使用 `hybrid`：block FP8 线性层、packed FP4 索引器和 V4.1 predecessor-pre mHC 进入 FlagGems；稀疏注意力、压缩缓存和 TP/EP 专家链保留 V12 厂商实现。单节点已测稳态 decode TPS；两机 PD 使用 FlagCX RoCE 状态传输和 decode Graph，D attention TP2×DP4 配置已通过 80 路同时运行的 128K 输入验收。当前 hybrid 模式的每路 decode TPS 仍低于 V12 历史结果，`vendor` 对照也未达到其每路最低 100 TPS 门槛；详见 [PD 实验报告](FLAGCX_PD.md) 和 [稳态 decode 算子 profile](PROFILE_STEADY_DECODE.md)。整模质量及更长时间稳定性仍需单独验收。
 
 ## 代码与补丁
 
