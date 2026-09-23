@@ -25,6 +25,7 @@ The plugin is auto-loaded through its setuptools entry point, and Layer 4 is ena
 |---|---|---|---|
 | Qwen3.6-35B-A3B | BF16 | ✅ | ✅ |
 | GLM-5.2-W4A8 | W4A8 | ✅ | ✅ |
+| DeepSeek V4.1 Flash (SGLang 0.5.18, P TP8/EP8, D attention TP2/DP4, DSpark) | FP8/MXFP4 | ✅ H100; see [deployment recipe](../../docker/dsv41/FLAGCX_PD.md) | Not validated |
 
 ---
 
@@ -68,6 +69,7 @@ export SGLANG_SEND_AUX_TCP=0          # 1 → send aux data (output ids/logprobs
 | `FLAGCX_P2P_WORKERS_PER_POOL` | Number of transfer-pool workers |
 | `FLAGCX_P2P_QPS_PER_CONN` | Queue pairs per connection; raise it to get more concurrency across multiple NICs |
 | `FLAGCX_IB_HCA` | Usually **no need to set manually**: `conn.py:257` applies `setdefault` using the value of `--disaggregation-ib-device` |
+| `FLAGCX_SOCKET_IFNAME` | Bootstrap/RPC socket interface. Set it to the interface whose IP SGLang advertises to the peer, such as `bond0` for `10.8.2.x`; otherwise FlagCX can listen on a different IP. |
 | `SGLANG_FL_DISAGG_FLAGCX` | Layer 4 switch, default `1`; setting `0` makes `flagcx` an invalid backend value |
 | `SGLANG_FL_OOT_ENABLED` / `USE_FLAGGEMS` | Layer 2 / Layer 1 switches; enable them one at a time during performance tuning |
 | `SGLANG_SEND_AUX_TCP` | Optional, default:0; Send aux data (first-token metadata) over TCP instead of RDMA |
