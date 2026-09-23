@@ -133,9 +133,10 @@
       "sglang_fl/disaggregation/transfer_engine.py": "93b945df1c5bc2858accad466d620e86cb153dfab2567385707ab2381343a71e",
       "sglang_fl/dsv41/__init__.py": "995fb7ce7558145be880797af83d7429a71d4ab77c4314d169f850b1bbce7300",
       "sglang_fl/dsv41/backend.py": "8b33aea80c4ed949107c3d91cdaac51880f107d534fbf17a9187ac0f0f2fa0be",
-      "sglang_fl/dsv41/quantization.py": "3a22dbcdc8649146256a5fdf1401d22907c6e45f1e7c467eedbf3360456f540c"
+      "sglang_fl/dsv41/quantization.py": "3a22dbcdc8649146256a5fdf1401d22907c6e45f1e7c467eedbf3360456f540c",
+      "sglang_fl/platform.py": "76838053f9ee8cfa98b062eb87532d6680c5d568adddaf5484e72fbe36ea35ee"
     },
-    "package_tree": "2e86dae53ecc556ceff6c853a69018bf9e11dd53",
+    "package_tree": "bc4755de1f0c8c21f2f1569beb2d5d1bf0268384",
     "repository": "https://github.com/flagos-ai/sglang-plugin-FL",
     "upstream_branch": "dev/0.5.18"
   },
