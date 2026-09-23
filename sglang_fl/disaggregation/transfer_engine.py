@@ -75,7 +75,8 @@ class FlagCXTransferEngine:
         try:
             self.flagcx.flagcxP2pRegister(self.engine, ptr, length)
         except Exception:
-            logger.debug("FlagCX memory registration %s failed.", ptr)
+            logger.exception("FlagCX memory registration %s failed.", ptr)
+            raise
 
     def register_host(self, ptr, length):
         """Register a single host (CPU) memory region for one-sided access.
@@ -97,7 +98,7 @@ class FlagCXTransferEngine:
             for ptr, length in zip(ptrs, lengths):
                 self.flagcx.flagcxP2pRegister(self.engine, ptr, length)
         except Exception:
-            logger.debug("FlagCX batch memory registration failed.")
+            logger.exception("FlagCX batch memory registration failed.")
             return -1
         return 0
 
@@ -146,12 +147,12 @@ class FlagCXTransferEngine:
                 conn, buffers, peer_buffer_addresses, lengths
             )
         except Exception:
-            logger.debug(
-                "Failed to batch transfer data. Buffers: %s, Session: %s, "
-                "Peer addresses: %s",
-                buffers,
+            logger.exception(
+                "Failed to batch transfer %s blocks (%s bytes) to FlagCX "
+                "session %s",
+                len(lengths),
+                sum(lengths),
                 session_id,
-                peer_buffer_addresses,
             )
             return -1
         return 0
