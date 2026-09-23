@@ -6,6 +6,7 @@
     "tag": "lmsysorg/sglang:v0.5.18"
   },
   "build_wheels": {
+    "flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl": "14e12e5c33864b37ebad2f1b654546a1472d6abee824633c1120952e30686adf",
     "greenlet-3.3.2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl": "43e99d1749147ac21dde49b99c9abffcbc1e2d55c67501465ef0930d6e78e070",
     "semantic_version-2.10.0-py2.py3-none-any.whl": "de78a3b8e0feda74cabc54aab2da702113e33ac9d9eb9d2389bcf1f58b7d9177",
     "setuptools-76.1.0-py3-none-any.whl": "34750dcb17d046929f545dec9b8349fe42bf4ba13ddffee78428aec422dbfb73",
@@ -90,6 +91,15 @@
     "repository": "https://github.com/flagos-ai/FlagCX",
     "revision": "648a6c489d2d54870d173926eda2d0ea0771b39d"
   },
+  "flagtree": {
+    "branch": "triton_v3.7.x",
+    "compiler_path": "/opt/flagtree/triton",
+    "llvm_archive_sha256": "0f9d80678e969a7966da672e2648cda7bb475c246d3a36ff6a4986d09916b0eb",
+    "repository": "https://github.com/flagos-ai/FlagTree",
+    "revision": "dbf184230982e2f7cbe6b91fa3ca1ea069833d21",
+    "triton_api": "3.7.1",
+    "wheel": "flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl"
+  },
   "flaggems": {
     "base": "8ea592557659491930ebf24c24392f958b29ac21",
     "package_files": {
@@ -114,6 +124,7 @@
   "packages": {
     "SQLAlchemy": "2.0.48",
     "flag_gems": "5.3.6.dev0+dsv41",
+    "flagtree": "0.6.0+nv37.dbf18423",
     "flashinfer-python": "0.6.17",
     "greenlet": "3.3.2",
     "sglang": "0.5.18",

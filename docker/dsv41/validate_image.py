@@ -5,6 +5,7 @@ import importlib
 import importlib.metadata as metadata
 import json
 from pathlib import Path
+import triton
 
 root = Path(__file__).resolve().parent
 lock = json.loads((root / "manifest.json").read_text())
@@ -14,6 +15,17 @@ for package, expected in lock["packages"].items():
     if actual != expected:
         raise RuntimeError(f"Dependency changed: {package} {actual} != {expected}")
     versions[package] = actual
+compiler_path = Path(triton.__file__).resolve()
+if not compiler_path.is_relative_to("/opt/flagtree"):
+    raise RuntimeError(f"FlagTree is not the active Triton compiler: {compiler_path}")
+if triton.__version__ != lock["packages"]["triton"]:
+    raise RuntimeError(f"FlagTree Triton API version changed: {triton.__version__}")
+wheel_name = lock["flagtree"]["wheel"]
+wheel_sha256 = hashlib.sha256(
+    (Path("/opt/sglang-fl/flagtree-wheel") / wheel_name).read_bytes()
+).hexdigest()
+if wheel_sha256 != lock["build_wheels"][wheel_name]:
+    raise RuntimeError("Installed FlagTree wheel does not match the lock")
 for group in ("sglang.srt.plugins", "sglang.srt.platforms"):
     entry = [x for x in metadata.entry_points(group=group) if x.name == "sglang_fl"]
     assert len(entry) == 1 and callable(entry[0].load()), group
@@ -45,6 +57,7 @@ print(
     json.dumps(
         {
             "versions": versions,
+            "compiler": str(compiler_path),
             "oot_abi": ABI_VERSION,
             "rust_dsv41": True,
             "gpu_tests_run": False,

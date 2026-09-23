@@ -27,6 +27,11 @@ LABEL org.opencontainers.image.title="SGLang FL DeepSeek V4.1 code migration" \
 COPY --from=builder /build/wheels /opt/sglang-fl/wheels
 COPY wheelhouse/sqlalchemy-*.whl wheelhouse/greenlet-*.whl /opt/sglang-fl/wheels/
 RUN pip install --no-index --no-deps /opt/sglang-fl/wheels/*.whl
+COPY wheelhouse/flagtree-*.whl /opt/sglang-fl/flagtree-wheel/
+# FlagTree implements the triton module. Keep the official Triton installation
+# intact so the compiler can be selected by removing this PYTHONPATH entry.
+RUN pip install --no-index --no-deps --target=/opt/flagtree /opt/sglang-fl/flagtree-wheel/flagtree-*.whl
+ENV PYTHONPATH=/opt/flagtree
 COPY delivery /opt/sglang-fl
 COPY flagcx /opt/FlagCX
 RUN python /opt/sglang-fl/apply_patches.py /sgl-workspace/sglang
@@ -43,5 +48,8 @@ ENV SGLANG_PLUGINS=sglang_fl \
 RUN SGLANG_PLUGINS= SGLANG_FL_DSV41_REQUIRED=0 \
     python /opt/sglang-fl/validate_image.py && \
     SGLANG_PLUGINS= SGLANG_FL_DSV41_REQUIRED=0 \
-    bash /opt/sglang-fl/validate_cpu.sh
+    bash /opt/sglang-fl/validate_cpu.sh && \
+    python /opt/sglang-fl/offline_compile.py \
+    "$(python -c 'from importlib.metadata import distribution; print(distribution("flag_gems").locate_file("flag_gems"))')" \
+    > /opt/sglang-fl/offline-compile-flagtree.json
 WORKDIR /sgl-workspace/sglang

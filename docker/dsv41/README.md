@@ -43,7 +43,7 @@ FlagGems 的 block32 修复同时约束默认和调优配置的 K tile，避免�
 
 默认构建产物：`sglang-fl-dsv41:0.5.18`，平台 `linux/amd64`。
 
-保持官方镜像的 Torch `2.13.0+cu130`、Triton `3.7.1`、FlashInfer `0.6.17`、sglang-kernel `0.4.6.post1`、TileLang `0.1.11`、Transformers `5.12.1`。这里不安装通用 CUDA 配方中的 FlagTree。构建依赖安装在临时 venv，不改变最终运行时的 compiler。Rust `_multimodal` 扩展从回移后的源码重编译，确认包含 `dsv41.resize_patchify`；独立 Rust API server/router 二进制不在这个 Python 服务镜像中重建。
+保持官方镜像的 Torch `2.13.0+cu130`、Triton API `3.7.1`、FlashInfer `0.6.17`、sglang-kernel `0.4.6.post1`、TileLang `0.1.11`、Transformers `5.12.1`。额外安装从 FlagTree `triton_v3.7.x` 固定提交构建的 NVIDIA wheel；FlagTree 提供同名 `triton` 模块，镜像通过 `PYTHONPATH=/opt/flagtree` 默认使用它。官方 Triton 仍留在原目录，便于对照。FlagTree 的源码提交和 wheel SHA256 见 [manifest.json](manifest.json)，构建来源见 [FLAGTREE.md](FLAGTREE.md)。Rust `_multimodal` 扩展从回移后的源码重编译，确认包含 `dsv41.resize_patchify`；独立 Rust API server/router 二进制不在这个 Python 服务镜像中重建。
 
 准备与 `manifest.json` 匹配的 patched FlagGems checkout，或从上游基点应用补丁：
 
@@ -65,6 +65,7 @@ docker tag lmsysorg/sglang@sha256:bde16a8447b19e89056b9eea06c72be6c02801dc89d528
 python -m pip download --only-binary=:all: --no-deps --dest wheelhouse \
   setuptools==76.1.0 setuptools-scm==9.2.2 setuptools-rust==1.12.0 \
   semantic-version==2.10.0 wheel==0.46.2 SQLAlchemy==2.0.48 greenlet==3.3.2
+# 将 manifest.json 锁定的 FlagTree cp312 NVIDIA wheel 放入 wheelhouse。
 python docker/dsv41/build_image.py \
   --flaggems /absolute/path/FlagGems-dsv41 \
   --wheelhouse /absolute/path/wheelhouse \
@@ -87,7 +88,7 @@ python docker/dsv41/build_image.py \
 
 镜像默认 `USE_FLAGGEMS=0`、`SGLANG_FL_OOT_ENABLED=0`，只启用本次明确接入的 DSV4.1 数值接口，通信插件照常注册。每个接口首次执行输出 `DSV4.1 op=... backend=... quantization=...`；选择完成后不捕获异常来尝试另一后端。`Dsv41Backend.snapshot()` 可读取本进程选择记录。
 
-构建中执行依赖/源码哈希、插件 entry point、ABI、关键模块导入、Rust 符号、CPU 回归和 Triton 离线编译检查。离线编译生成 SM90/SM80 cubin；GPU 数值和整模 graph replay 另在目标机器验证。
+构建中执行依赖/源码哈希、插件 entry point、ABI、关键模块导入、Rust 符号、CPU 回归和 Triton 离线编译检查。最终镜像还校验 FlagTree 确实接管 `triton` 导入，并用它重新编译 10 个代表性 SM90/SM80 用例，结果保存在 `/opt/sglang-fl/offline-compile-flagtree.json`。GPU 数值和整模 graph replay 另在目标机器验证。
 
 GPU 数值测试入口默认跳过。在 `.1` 机器上显式运行 `RUN_DSV41_GPU_TESTS=1`，14 项通过；随后 TP8/EP8、DSpark 与 decode graph 整模服务通过 14 个已知答案及并发请求。非 PD 的 32K 稳态 decode TPS 已测；FlagCX PD 的首次两机请求与 3 路并发通过，详细结果见 [FLAGCX_PD.md](FLAGCX_PD.md)。H100 源分支的性能数字不作为本次验收结果。
 
