@@ -32,10 +32,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    filter_kv_indices_for_cp_rank,
-)
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang_fl.disaggregation import stats as flagcx_stats
 from sglang_fl.disaggregation.transfer_engine import (
     get_flagcx_transfer_engine,
@@ -1775,8 +1772,16 @@ class FlagcxKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.conclude_state = None
         self.init_time = time.time()
 
@@ -1790,24 +1795,15 @@ class FlagcxKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
-        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        self.curr_idx += len(kv_indices)
-        is_last_chunk = self.curr_idx == self.num_kv_indices
-
-        # Special handling for cp
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
-            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
-                self.kv_mgr,
-                kv_indices,
-                index_slice,
-            )
-        elif self.kv_mgr.is_dummy_cp_rank:
-            if not is_last_chunk:
-                return
-            else:
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
-                return
+        # FlagCX writes complete KV pages. The SGLang 0.5.18 token count is
+        # needed by partial-page DCP transfers, which this backend disallows.
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
+        )
+        if should_skip:
+            return
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(

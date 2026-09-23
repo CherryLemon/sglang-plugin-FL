@@ -2,7 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -10,7 +10,8 @@ import pytest
 pytest.importorskip("sglang")
 
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang_fl.disaggregation.conn import FlagcxKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang_fl.disaggregation.conn import FlagcxKVManager, FlagcxKVSender
 
 
 def _manager(state_type, *, src_item_lens=(16, 32), ratios=(2,)):
@@ -74,3 +75,33 @@ def test_dsv41_c2_rejects_different_receiver_stride_before_write():
     with ThreadPoolExecutor(max_workers=1) as executor:
         assert manager.maybe_send_extra(request, [[1, 2]], executor, registration) == -1
     manager._transfer_data.assert_not_called()
+
+
+def test_sender_accepts_sglang_0518_request_arguments():
+    manager = Mock()
+    manager.enable_all_cp_ranks_for_transfer = False
+    manager.is_dummy_cp_rank = False
+    with patch.object(CommonKVSender, "__init__", return_value=None) as base_init:
+        sender = FlagcxKVSender(
+            manager, "127.0.0.1:8998", 17, [0], 0,
+            req_has_disagg_prefill_dp_rank=True,
+        )
+    base_init.assert_called_once_with(
+        manager, "127.0.0.1:8998", 17, [0], 0, True
+    )
+    sender.kv_mgr = manager
+    sender.bootstrap_room = 17
+    sender.curr_idx = 0
+    sender.num_kv_indices = 2
+    sender.aux_index = 4
+    sender._record_transfer_indices = Mock()
+    indices = np.array([3, 4], dtype=np.int32)
+
+    sender.send(indices, state_indices=[], num_kv_tokens=256)
+
+    manager.add_transfer_request.assert_called_once()
+    args, kwargs = manager.add_transfer_request.call_args
+    assert args[:1] == (17,)
+    np.testing.assert_array_equal(args[1], indices)
+    assert args[2:] == (slice(0, 2), True)
+    assert kwargs == {"aux_index": 4, "state_indices": []}
