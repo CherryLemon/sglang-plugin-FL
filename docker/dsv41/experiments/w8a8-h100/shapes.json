@@ -1,0 +1,130 @@
+{
+  "method": "Pair quantize/GEMM grids in each CUDA stream, solve default [64,32,32] grid against checkpoint projection shapes; unique solutions; all 8 ranks match.",
+  "steps_per_rank": 10,
+  "sources": [
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-0-DP-0-EP-0.trace.json.gz",
+      "sha256": "ec7185689998a2f27188f20270324d323ececc1f389e65ca47d7041185aa61e9"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-1-DP-0-EP-1.trace.json.gz",
+      "sha256": "8c735d62cc0234255c822fada0e4c4a997bd47de43773a13b170aa1e1a1fcc51"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-2-DP-1-EP-2.trace.json.gz",
+      "sha256": "dc0feee0080ab443119fd57f51ac3227cd05a1287cb62f57beb9718a5d1d9a32"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-3-DP-1-EP-3.trace.json.gz",
+      "sha256": "941ffe59cd67b2279c32edf95181c5ef9675945721e7b0537d5c0af89bddb94c"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-4-DP-2-EP-4.trace.json.gz",
+      "sha256": "886fefafb03df71e9ea219f4f73bfe5af7b2f94113f709b96b1543ad2357d294"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-5-DP-2-EP-5.trace.json.gz",
+      "sha256": "10fb63578582aeab539836babc9178313b54b943370c56732365b1f6afb2dda3"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-6-DP-3-EP-6.trace.json.gz",
+      "sha256": "6c55aa37aa3e90a554389ba210601819cfda11716db87807badb0d856551b4e0"
+    },
+    {
+      "trace": "/public-nvme/yjwu/sglang-fl-0518-pd/node3/profiles/hybrid-80x128k8192-20260923a/hybrid-hybrid-80x128k8192-20260923a-TP-7-DP-3-EP-7.trace.json.gz",
+      "sha256": "9e08500d8e5cd35f99e8aa91417779bb5339ba8b4f6c6b91a43959a442f2b7b3"
+    }
+  ],
+  "shapes": [
+    {
+      "m": 144,
+      "n": 1792,
+      "k": 5120,
+      "calls_per_step": 40.0
+    },
+    {
+      "m": 144,
+      "n": 16384,
+      "k": 1280,
+      "calls_per_step": 40.0
+    },
+    {
+      "m": 144,
+      "n": 5120,
+      "k": 4096,
+      "calls_per_step": 40.0
+    },
+    {
+      "m": 576,
+      "n": 576,
+      "k": 5120,
+      "calls_per_step": 40.0
+    },
+    {
+      "m": 576,
+      "n": 5120,
+      "k": 288,
+      "calls_per_step": 40.0
+    },
+    {
+      "m": 144,
+      "n": 4096,
+      "k": 1280,
+      "calls_per_step": 8.0
+    },
+    {
+      "m": 120,
+      "n": 512,
+      "k": 5120,
+      "calls_per_step": 3.0
+    },
+    {
+      "m": 120,
+      "n": 1280,
+      "k": 5120,
+      "calls_per_step": 3.0
+    },
+    {
+      "m": 120,
+      "n": 16384,
+      "k": 1280,
+      "calls_per_step": 3.0
+    },
+    {
+      "m": 120,
+      "n": 5120,
+      "k": 4096,
+      "calls_per_step": 3.0
+    },
+    {
+      "m": 480,
+      "n": 576,
+      "k": 5120,
+      "calls_per_step": 3.0
+    },
+    {
+      "m": 480,
+      "n": 5120,
+      "k": 288,
+      "calls_per_step": 3.0
+    },
+    {
+      "m": 144,
+      "n": 25600,
+      "k": 6144,
+      "calls_per_step": 2.0
+    },
+    {
+      "m": 120,
+      "n": 5120,
+      "k": 15360,
+      "calls_per_step": 1.0
+    },
+    {
+      "m": 120,
+      "n": 1536,
+      "k": 5120,
+      "calls_per_step": 1.0
+    }
+  ]
+}
