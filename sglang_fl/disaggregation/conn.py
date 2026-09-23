@@ -664,6 +664,7 @@ class FlagcxKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        state_type: Optional[StateType] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -679,8 +680,21 @@ class FlagcxKVManager(CommonKVManager):
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs, dst_data_ptrs, state_type=state_type
+                )
             )
+            if not (
+                len(src_kv_ptrs)
+                == len(dst_kv_ptrs)
+                == len(item_lens)
+                == layers_current_pp_stage
+            ):
+                raise ValueError(
+                    "FlagCX MLA transfer layout mismatch: "
+                    f"src={len(src_kv_ptrs)}, dst={len(dst_kv_ptrs)}, "
+                    f"strides={len(item_lens)}"
+                )
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
@@ -1091,7 +1105,12 @@ class FlagcxKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (
+                StateType.SWA,
+                StateType.DSA,
+                StateType.SWA_RING,
+                StateType.C128_STATE,
+            ):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1103,6 +1122,28 @@ class FlagcxKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.C128_STATE and 2 in (
+                    getattr(self.kv_args, "mla_compression_ratios", None) or ()
+                ):
+                    from sglang.srt.disaggregation.dsv41_dpa_experiment import (
+                        validate_c2_strides,
+                    )
+
+                    try:
+                        validate_c2_strides(src_item_lens, dst_item_lens)
+                    except ValueError as error:
+                        logger.error("Rejecting incompatible C2 transfer: %s", error)
+                        return -1
+                if st in (StateType.SWA_RING, StateType.C128_STATE) and (
+                    len(src_indices) != len(dst_indices_local)
+                ):
+                    logger.error(
+                        "%s state index length mismatch: prefill=%d, dst=%d",
+                        st.value,
+                        len(src_indices),
+                        len(dst_indices_local),
+                    )
+                    return -1
                 if len(src_indices) > len(dst_indices_local):
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
@@ -1122,6 +1163,7 @@ class FlagcxKVManager(CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
                     )
                     or rc
                 )
@@ -1393,12 +1435,31 @@ class FlagcxKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                state_rc = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if state_rc != 0:
+                                    flagcx_stats.record_failed_transfer(self._metric_labels)
+                                    with self.session_lock:
+                                        self.session_failures[req.flagcx_session_id] += 1
+                                        self.failed_sessions.add(req.flagcx_session_id)
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send state components of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
