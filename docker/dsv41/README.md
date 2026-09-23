@@ -110,3 +110,5 @@ python /work/scripts/smoke_service.py \
 ```
 
 本次 [服务结果](/public-nvme/yjwu/sglang-fl-0518-node1/smoke-service.json) 为 14/14 请求通过，`avg_spec_accept_length=4.13`。同一轮 [服务日志](/public-nvme/yjwu/sglang-fl-0518-node1/server.log) 显示 target/draft 图捕获完成，且实际解码 batch 1/8 的 `cuda graph: True`。prefill 图按该模型的 SGLang 配置关闭；这里的 Graph 验收指 decode replay。
+
+按主线 V11 的 32K 共享前缀、1/4/16 并发、固定 512 输出 token 形状复跑的稳态 decode 结果见 [BENCHMARK_NODE1.md](BENCHMARK_NODE1.md)。单请求中位数分别为 197.5、172.9、111.4 token/s。该服务是单机非 PD，输入内容也不同，因此不将这些数值解释为相对主线双机 PD 的性能变化。
