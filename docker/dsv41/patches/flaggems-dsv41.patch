@@ -1778,7 +1778,7 @@ index 0000000..0092176
 +    )
 +    tl.store(C + offsets, tl.sum(values, 0), offsets < SIZE)
 diff --git a/src/flag_gems/ops/w8a8_block_fp8_matmul.py b/src/flag_gems/ops/w8a8_block_fp8_matmul.py
-index 46c4460..603fbc2 100644
+index 46c4460..9c4e442 100644
 --- a/src/flag_gems/ops/w8a8_block_fp8_matmul.py
 +++ b/src/flag_gems/ops/w8a8_block_fp8_matmul.py
 @@ -14,8 +14,9 @@
@@ -1930,7 +1930,7 @@ index 46c4460..603fbc2 100644
 +    if configs:
 +        if M in configs:
 +            return dict(configs[M])
-+        approximate = {m: cfg for m, cfg in configs.items() if not cfg["exact_m"]}
++        approximate = {m: cfg for m, cfg in configs.items() if not cfg.get("exact_m", False)}
 +        if approximate:
 +            return dict(approximate[min(approximate, key=lambda m: abs(m - M))])
 +    return _get_default_w8a8_block_fp8_config(block_n, block_k)
@@ -2091,7 +2091,7 @@ index 0000000..915eeeb
 +NVIDIA_H200: *sm90_shapes
 diff --git a/tests/test_w8a8_block_fp8_config.py b/tests/test_w8a8_block_fp8_config.py
 new file mode 100644
-index 0000000..8a1b71b
+index 0000000..5ab3cd3
 --- /dev/null
 +++ b/tests/test_w8a8_block_fp8_config.py
 @@ -0,0 +1,72 @@
@@ -2145,7 +2145,7 @@ index 0000000..8a1b71b
 +
 +def test_legacy_configs_keep_nearest_m():
 +    configs = {
-+        32: {"BLOCK_SIZE_M": 32, "exact_m": False},
++        32: {"BLOCK_SIZE_M": 32},
 +        128: {"BLOCK_SIZE_M": 128, "exact_m": False},
 +        144: {"BLOCK_SIZE_M": 64, "exact_m": True, "kernel": "hopper"},
 +    }
