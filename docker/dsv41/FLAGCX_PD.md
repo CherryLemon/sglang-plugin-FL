@@ -162,3 +162,6 @@ The build passed 92 CPU tests (2 skipped, 63 subtests) and the new image's
 profiler activity mapping was verified directly. Build log and receipt are
 `/public-nvme/yjwu/sglang-fl-0518-build/image-build-r6.log` and
 `build-result-r6.json` in the same directory.
+
+The H100 W8A8 optimization, config-driven FlagGems PR, and later two-node
+benchmarks are recorded in [W8A8_CONFIG_BENCHMARK.md](W8A8_CONFIG_BENCHMARK.md).
