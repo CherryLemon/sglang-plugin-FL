@@ -108,14 +108,15 @@
       "flag_gems/fused/dsv41/block_fp8_linear.py": "b5cf43ea82a1757fd95af2bb25ea8f16c2bafb42fa07bf6bdbfb8ccf837a4c27",
       "flag_gems/fused/dsv41/fp4_indexer.py": "8fa80b668a6047641b4c0c6e2f9588b48708c2fae5940ce2a4366e56b6ecb764",
       "flag_gems/fused/dsv41/mhc.py": "bae3097ba138a3e05e6f47f8a564793faad3529945259025d9efc1fb40393160",
-      "flag_gems/ops/w8a8_block_fp8_matmul.py": "d5679fbd95d3721a620c026a209868a80dd0bc99e970ebcdc89f32299ef30b05",
-      "flag_gems/ops/_w8a8_block_fp8_hopper.py": "224dd70448452b0383d1aa5f02541d9e964b4ef9bf7eb98c77b6f4343e95eec1"
+      "flag_gems/ops/w8a8_block_fp8_matmul.py": "cfb1eef93a81b0a090d387ba2d095079030edd79ea1f1b6bb208195546a36014",
+      "flag_gems/ops/_w8a8_block_fp8_hopper.py": "eeba0762909d84e1f07c0d3678601a3cf7c3432a0e4b7a4cdbd4452313f58351",
+      "flag_gems/utils/configs/fp8_w8a8-32-32.yaml": "e5099b6b74f1a0ba5619c167f5d00bcfe68fd51bc7dc319aafa2f3380a04e42c"
     },
-    "package_tree": "7a66b650b7b751d51171262a04ebc032d1d4775f",
+    "package_tree": "6e8c052121abdb5851d5c152b9791de6fb2a1684",
     "patch": "patches/flaggems-dsv41.patch",
-    "patch_sha256": "ebe7f45313295f3a93155be67684415dacd9cee1bc25349d885705ec9b9ca3e4",
+    "patch_sha256": "c0fbb484678c0ce9043720925c4385a0c046e21b2f8beec933bc9930c99dbca1",
     "repository": "https://github.com/flagos-ai/FlagGems",
-    "revision": "86ce9984966cedad671485c4184af6e9829b60fa"
+    "revision": "3d8f34f45d7fae9b719a02c2ce6bebdd97897f4a"
   },
   "model": {
     "config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
