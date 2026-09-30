@@ -49,7 +49,9 @@ _DIST_BACKEND_MAP = {
     "cambricon": "cncl",
     "mthreads": "mccl",
     "thead": "nccl",
+    "enflame": "eccl",
     "tsingmicro": "tccl",
+    "hygon": "nccl",
 }
 
 # Attention backend mapping: vendor_name -> default backend
@@ -58,25 +60,16 @@ _ATTN_BACKEND_MAP = {
     "nvidia": "flashinfer",
     "ascend": "ascend",
     "mthreads": "fa3",
+    "enflame": "fa3",
+    "thead": "fa3",
     "kunlunxin": "kunlunxin",
     "iluvatar": "triton",
+    "hygon": "hcu",
 }
 
 _MTHREADS_PROFILER_MODULE = (
     "sglang_fl.dispatch.backends.vendor.mthreads.patches.profiler"
 )
-
-
-def _get_device_detector():
-    """Lazy import DeviceDetector to avoid import errors when flag_gems not installed."""
-    try:
-        # FlagGems<=5.0.2: DeviceDetector lives in device.
-        from flag_gems.runtime.backend.device import DeviceDetector
-    except ImportError:
-        # FlagGems>5.0.2: DeviceDetector lives in device_finder.
-        from flag_gems.runtime.backend.device_finder import DeviceDetector
-
-    return DeviceDetector()
 
 
 class PlatformFL(SRTPlatform):
@@ -89,31 +82,27 @@ class PlatformFL(SRTPlatform):
 
     def __init__(self):
         super().__init__()
-        detector = _get_device_detector()
+        from sglang_fl.utils import get_device_info
 
-        # Core device identity from FlagGems
-        self._vendor_name: str = detector.vendor_name  # "nvidia", "ascend", ...
-        self._device_type: str = detector.name  # "cuda", "npu", ...
-        self._dispatch_key: str = detector.dispatch_key  # "CUDA", "NPU", ...
-        self._device_count: int = detector.device_count
+        info = get_device_info()
+        if info is None:
+            raise RuntimeError(
+                "PlatformFL cannot initialize: DeviceDetector unavailable "
+                "(flag_gems missing or hardware unrecognised)"
+            )
+        self._info = info
+        self._vendor_name: str = info.vendor_name    # "nvidia", "ascend", ...
+        self._device_type: str = info.device_type    # "cuda", "npu", ...
+        self._dispatch_key: str = info.dispatch_key  # "CUDA", "NPU", ...
+        self._device_count: int = info.device_count
 
         # Set class-level attributes expected by DeviceMixin
         self.device_name = self._device_type
         self.device_type = self._device_type
 
-        # torch device module (e.g. torch.cuda, torch.npu)
-        self._torch_device_mod = getattr(torch, self._device_type, None)
-
         # Resolve distributed backend
         self._dist_backend = self._resolve_dist_backend()
 
-        # Set up torch backend device function
-        try:
-            from flag_gems.runtime import backend
-
-            backend.set_torch_backend_device_fn(self._vendor_name)
-        except Exception:
-            pass
         logger.info(
             "PlatformFL initialized: vendor=%s, device=%s, dist_backend=%s, count=%d",
             self._vendor_name,
@@ -171,18 +160,18 @@ class PlatformFL(SRTPlatform):
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
         """Get total device memory in bytes."""
-        if self._torch_device_mod is None:
+        if self._info.torch_device_fn is None:
             raise RuntimeError(f"No torch.{self._device_type} module available")
-        props = self._torch_device_mod.get_device_properties(device_id)
+        props = self._info.torch_device_fn.get_device_properties(device_id)
         return props.total_memory
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         """Get current peak memory usage in bytes."""
-        if self._torch_device_mod is None:
+        if self._info.torch_device_fn is None:
             return 0.0
-        self._torch_device_mod.empty_cache()
-        self._torch_device_mod.reset_peak_memory_stats(device)
-        return self._torch_device_mod.max_memory_allocated(device)
+        self._info.torch_device_fn.empty_cache()
+        self._info.torch_device_fn.reset_peak_memory_stats(device)
+        return self._info.torch_device_fn.max_memory_allocated(device)
 
     # ------------------------------------------------------------------
     # Planned methods (provide implementations for future core migration)
@@ -192,8 +181,8 @@ class PlatformFL(SRTPlatform):
         return torch.device(self._device_type, local_rank)
 
     def set_device(self, device: torch.device) -> None:
-        if self._torch_device_mod is not None:
-            self._torch_device_mod.set_device(device)
+        if self._info.torch_device_fn is not None:
+            self._info.torch_device_fn.set_device(device)
 
     def get_device_name(self, device_id: int = 0) -> str:
         return self._device_type
@@ -206,17 +195,17 @@ class PlatformFL(SRTPlatform):
         return None
 
     def empty_cache(self) -> None:
-        if self._torch_device_mod is not None:
-            self._torch_device_mod.empty_cache()
+        if self._info.torch_device_fn is not None:
+            self._info.torch_device_fn.empty_cache()
 
     def synchronize(self) -> None:
-        if self._torch_device_mod is not None:
-            self._torch_device_mod.synchronize()
+        if self._info.torch_device_fn is not None:
+            self._info.torch_device_fn.synchronize()
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
-        if self._torch_device_mod is None:
+        if self._info.torch_device_fn is None:
             raise RuntimeError(f"No torch.{self._device_type} module available")
-        return self._torch_device_mod.mem_get_info(device_id)
+        return self._info.torch_device_fn.mem_get_info(device_id)
 
     def get_torch_distributed_backend_str(self) -> str:
         return self._dist_backend
@@ -308,8 +297,9 @@ class PlatformFL(SRTPlatform):
         - npu:  torch.npu.NPUGraph (via NPUGraphRunner override)
         - musa: torch_musa proxies torch.cuda.CUDAGraph, so the default
                 CudaGraphRunner works unchanged
+        - gcu:  CudaGraphRunner overrides _capture_graph
         """
-        return self._device_type in ("cuda", "npu", "musa")
+        return self._device_type in ("cuda", "npu", "musa", "gcu")
 
     def support_piecewise_cuda_graph(self) -> bool:
         return self._device_type == "cuda"
@@ -381,6 +371,14 @@ class PlatformFL(SRTPlatform):
             server_args.mm_attention_backend = "sdpa"
             server_args.disable_cuda_graph = False
         if self._vendor_name == "nvidia":
+            return
+        if self._device_type == "gcu":
+            server_args.device = "gcu"
+            server_args.attention_backend = "fa3"
+            server_args.mm_attention_backend = "fa3"
+            server_args.page_size = 64
+            server_args.watchdog_timeout = 100000
+            server_args.disable_radix_cache = True
             return
         if (
             not hasattr(server_args, "attention_backend")

@@ -80,7 +80,7 @@ jobs:
             $CHANGED_ARG
 
   unit:
-    needs: setup
+    needs: [setup]
     uses: ./.github/workflows/_unit_test.yml
     with:
       platform: ${{ inputs.platform }}
@@ -104,6 +104,7 @@ jobs:
     if: needs.setup.outputs.e2e_matrix != '[]'
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.setup.outputs.config).e2e_max_parallel || 256 }}
       matrix:
         test: ${{ fromJson(needs.setup.outputs.e2e_matrix) }}
     uses: ./.github/workflows/_e2e_test.yml

@@ -60,6 +60,8 @@ def get_platform_name() -> str:
             return "ascend"
         if hasattr(torch, "musa") and torch.musa.is_available():
             return "musa"
+        if hasattr(torch, "gcu") and torch.gcu.is_available():
+            return "gcu"
         if hasattr(torch, "corex") and torch.cuda.is_available():
             return "iluvatar"
         if torch.cuda.is_available():

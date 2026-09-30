@@ -37,6 +37,7 @@ _is_musa = hasattr(torch, "musa") and torch.musa.is_available()
 _is_npu = hasattr(torch, "npu") and torch.npu.is_available()
 _is_txda = hasattr(torch, "txda") and torch.txda.is_available()
 _is_corex = hasattr(torch, "corex") and torch.cuda.is_available()
+_is_hcu = hasattr(torch, "__hcu_version__") and torch.cuda.is_available()
 
 # Must be set before importing sglang.
 if _is_npu:
@@ -95,8 +96,22 @@ elif _is_corex:
         "attention_backend": "triton",
         "cuda_graph_max_bs": 1,
     }
+elif _is_hcu:
+    _extra_engine_kwargs = {
+        "dtype": "bfloat16",
+        "kv_cache_dtype": "bfloat16",
+        "page_size": 64,
+        "disable_radix_cache": True,
+        "enable_breakable_cuda_graph": False,
+        "trust_remote_code": True,
+    }
 else:
     _extra_engine_kwargs = {"trust_remote_code": True}
+
+# Allow overriding attention backend via env var (e.g. ATTENTION_BACKEND=triton for national platforms)
+_attn_backend = os.environ.get("ATTENTION_BACKEND", "").strip()
+if _attn_backend:
+    _extra_engine_kwargs["attention_backend"] = _attn_backend
 
 # ─── Test data ────────────────────────────────────────────────────────────────
 

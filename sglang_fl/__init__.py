@@ -30,6 +30,7 @@ This plugin registers:
   Layer 2: SGLang fused kernels via MultiPlatformOp.register_oot_forward +
            HookRegistry AROUND hook on dispatch_forward
   Layer 3: FlagCX communicator (via Platform Plugin get_communicator_class)
+  Layer 4: FlagCX PD-disaggregation KV transfer backend (opt-out via env)
 
 Environment variables:
   USE_FLAGGEMS=1|0                    Master switch for Layer 1 (default: 1)
@@ -41,7 +42,7 @@ Environment variables:
   SGLANG_FL_OOT_ENABLED=1|0           Master switch for Layer 2 (default: 1)
   SGLANG_FL_PREFER=flagos|vendor|reference  Global backend priority
   SGLANG_FL_PER_OP=op=kind|kind;...         Per-op backend override
-  SGLANG_FL_STRICT=1|0                Fallback on error (default: 1=enabled)
+  SGLANG_FL_STRICT=1|0                Strict mode: 1=no fallback, 0=fallback (default: 0)
   SGLANG_FL_OOT_WHITELIST=op1,op2     Only dispatch listed ops through OOT
   SGLANG_FL_OOT_BLACKLIST=op1,op2     Skip listed ops from OOT dispatch
   SGLANG_FL_DENY_VENDORS=v1,v2       Deny specific vendor backends
@@ -52,6 +53,7 @@ Environment variables:
   SGLANG_FL_CONFIG=<path>             YAML config file (overrides platform defaults)
   SGLANG_FL_DIST_BACKEND=nccl|hccl|flagcx   Override distributed backend
   FLAGCX_PATH=<path>                         If set, default to flagcx backend
+  SGLANG_FL_DISAGG_FLAGCX=1|0         Register FlagCX PD-disagg backend (default: 1)
 """
 
 import logging
@@ -154,12 +156,12 @@ def _build_config() -> dict:
     else:
         flagos_blacklist = yaml_cfg.get("flagos_blacklist", []) or []
 
-    # strict: SGLANG_FL_STRICT > yaml.strict > True (default: fallback enabled)
+    # strict: SGLANG_FL_STRICT > yaml.strict > False (default: fallback enabled)
     strict_str = os.environ.get("SGLANG_FL_STRICT", "").strip()
     if strict_str:
         strict = strict_str == "1"
     else:
-        strict = yaml_cfg.get("strict", True)
+        strict = yaml_cfg.get("strict", False)
 
     # deny_vendors: SGLANG_FL_DENY_VENDORS > yaml.deny_vendors > []
     deny_str = os.environ.get("SGLANG_FL_DENY_VENDORS", "").strip()
@@ -236,7 +238,7 @@ def _init_dispatch(config: dict) -> None:
 
     policy = SelectionPolicy.from_dict(
         prefer=prefer,
-        strict=config.get("strict", True),
+        strict=config.get("strict", False),
         per_op_order=per_op_order if per_op_order else None,
         deny_vendors=config.get("deny_vendors"),
         allow_vendors=config.get("allow_vendors"),
@@ -444,20 +446,14 @@ def _apply_vendor_patches() -> None:
     """
     import importlib
 
-    try:
-        try:
-            # FlagGems<=5.0.2: DeviceDetector lives in device.
-            from flag_gems.runtime.backend.device import DeviceDetector
-        except ImportError:
-            # FlagGems>5.0.2: DeviceDetector lives in device_finder.
-            from flag_gems.runtime.backend.device_finder import DeviceDetector
+    from sglang_fl.utils import get_device_info
 
-        vendor = DeviceDetector().vendor_name
-    except Exception as e:
-        logger.warning("vendor patch skipped: DeviceDetector failed (%s)", e)
+    info = get_device_info()
+    if info is None:
+        logger.warning("vendor patch skipped: DeviceDetector unavailable")
         return
 
-    module = f"sglang_fl.dispatch.backends.vendor.{vendor}.patch"
+    module = f"sglang_fl.dispatch.backends.vendor.{info.vendor_name}.patch"
     try:
         importlib.import_module(module)
         logger.info("vendor patch loaded: %s", module)
@@ -714,24 +710,18 @@ def activate_platform() -> str | None:
     Returns the fully-qualified class path of PlatformFL if hardware is detected,
     or None if FlagGems DeviceDetector fails (no supported hardware).
     """
-    try:
-        try:
-            # FlagGems<=5.0.2: DeviceDetector lives in device.
-            from flag_gems.runtime.backend.device import DeviceDetector
-        except ImportError:
-            # FlagGems>5.0.2: DeviceDetector lives in device_finder.
-            from flag_gems.runtime.backend.device_finder import DeviceDetector
+    from sglang_fl.utils import get_device_info
 
-        detector = DeviceDetector()
-        logger.info(
-            "sglang_fl platform activating: vendor=%s, device=%s",
-            detector.vendor_name,
-            detector.name,
-        )
-        return "sglang_fl.platform:PlatformFL"
-    except Exception as e:
-        logger.warning("sglang_fl platform activation failed: %s", e)
+    info = get_device_info()
+    if info is None:
+        logger.warning("sglang_fl platform activation failed: DeviceDetector unavailable")
         return None
+    logger.info(
+        "sglang_fl platform activating: vendor=%s, device=%s",
+        info.vendor_name,
+        info.device_type,
+    )
+    return "sglang_fl.platform:PlatformFL"
 
 
 # ─── General Plugin entry point ──────────────────────────────────────────────
@@ -805,7 +795,21 @@ def load_plugin():
     # 5. Vendor-specific patches — final overlay on top of all sglang_fl layers
     _apply_vendor_patches()
 
-    # 6. Summary banner — confirm plugin is active (rank 0 only)
+    # 6. FlagCX PD-disaggregation transfer backend. the FlagCX connector itself is
+    #    imported lazily, when the user actually selects this backend.
+    disagg_flagcx = _parse_bool(
+        os.environ.get("SGLANG_FL_DISAGG_FLAGCX", "1"), default=True
+    )
+    if disagg_flagcx:
+        try:
+            from sglang_fl.disaggregation.patch import apply_disaggregation_patch
+
+            apply_disaggregation_patch()
+        except Exception as e:
+            logger.warning("FlagCX PD disaggregation registration failed: %s", e)
+            disagg_flagcx = False
+
+    # 7. Summary banner — confirm plugin is active (rank 0 only)
     if _is_rank0():
         use_fg = _parse_bool(os.environ.get("USE_FLAGGEMS", "1"), default=True)
         aten_status = "OFF" if not use_fg else "ON"
@@ -823,6 +827,11 @@ def load_plugin():
             "|" + f"  Layer 1 (ATen -> FlagGems):  {aten_status}".ljust(58) + "|\n"
             "|" + f"  Layer 2 (Fused Ops):         {oot_status}".ljust(58) + "|\n"
             "|" + f"  Layer 3 (Communication):     {dist_backend}".ljust(58) + "|\n"
+            "|"
+            + f"  Layer 4 (PD Disagg):         {'flagcx' if disagg_flagcx else 'OFF'}".ljust(
+                58
+            )
+            + "|\n"
             "+" + "=" * 58 + "+"
         )
         logger.info(banner)

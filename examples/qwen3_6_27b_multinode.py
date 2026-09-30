@@ -6,7 +6,7 @@ Validates that sglang-plugin-FL correctly handles multi-node tensor parallelism
 for the dense Qwen3.6-27B model by launching a distributed SGLang server across
 2 nodes and running text, concurrent, multimodal (VL), and high-concurrency tests.
 
-Supports CUDA, MUSA, Ascend NPU, and Iluvatar CoreX; platform-specific server
+Supports CUDA, MUSA, Ascend NPU, Hygon HCU, and Iluvatar CoreX; platform-specific server
 flags and env vars are applied automatically at runtime.
 
 ============================================================================
@@ -50,6 +50,7 @@ Full tested command (2 nodes × 2 GPUs each, TP=2 PP=2):
 
 Environment variables:
   MODEL_PATH       Model path (default: /models/Qwen3.6-27B)
+  ATTENTION_BACKEND     Optional SGLang attention backend (e.g. triton)
   CUDA_VISIBLE_DEVICES  GPU selection on CUDA (e.g. 0,1)
   MUSA_VISIBLE_DEVICES  Device selection on MUSA
   ASCEND_RT_VISIBLE_DEVICES  Device selection on Ascend NPU
@@ -72,6 +73,7 @@ import base64
 import concurrent.futures
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -87,6 +89,7 @@ _is_txda = hasattr(torch, "txda") and torch.txda.is_available()
 _is_musa = hasattr(torch, "musa") and torch.musa.is_available()
 _is_npu = hasattr(torch, "npu") and torch.npu.is_available()
 _is_corex = hasattr(torch, "corex") and torch.cuda.is_available()
+_is_hcu = hasattr(torch, "__hcu_version__") and torch.cuda.is_available()
 
 # Must be set before launching sglang. Subprocesses inherit os.environ.
 if _is_txda:
@@ -120,12 +123,18 @@ elif _is_corex:
         "--cuda-graph-max-bs", "16",
         "--sleep-on-idle",
     ]
+elif _is_hcu:
+    _PLATFORM_SERVER_ARGS = [
+        "--disable-radix-cache",
+        "--page-size", "64",
+    ]
 else:
     _PLATFORM_SERVER_ARGS = []
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/Qwen3.6-27B")
+ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "").strip()
 
 _HERE = Path(__file__).resolve().parent
 IMG_DIR = Path(os.environ.get("IMAGE_DIR", _HERE / "test_images"))
@@ -336,8 +345,18 @@ def run_tests(
     print("\n=== Test 2: Longer Generation ===")
     r = chat_request(port, "List the first 5 prime numbers, separated by commas.", 64, timeout=request_timeout)
     print(f"  Q: First 5 primes  A: {r}")
-    t.check("Contains '2'", "2", r)
-    t.check("Contains '7'", "7", r)
+    expected_pattern = (
+        r"(?<!\d)2\s*,\s*3\s*,\s*5\s*,\s*7\s*,\s*11(?!\d)"
+    )
+
+    t.total += 1
+    if re.search(expected_pattern, r):
+        print("  PASS: First 5 primes = 2, 3, 5, 7, 11")
+        t.passed += 1
+    else:
+        print("  FAIL: Expected first 5 primes = 2, 3, 5, 7, 11")
+        print(f"        Actual response: {r}")
+        t.failed += 1
 
     # Test 3: Concurrent Text x4
     print("\n=== Test 3: Concurrent Text x4 ===")
@@ -546,6 +565,8 @@ def run_master(args):
         "--trust-remote-code",
         *_PLATFORM_SERVER_ARGS,
     ]
+    if ATTENTION_BACKEND:
+        cmd.extend(["--attention-backend", ATTENTION_BACKEND])
 
     if _is_txda:
         insert_pos = cmd.index("--mem-fraction-static")
@@ -653,6 +674,8 @@ def run_worker(args):
         "--trust-remote-code",
         *_PLATFORM_SERVER_ARGS,
     ]
+    if ATTENTION_BACKEND:
+        cmd.extend(["--attention-backend", ATTENTION_BACKEND])
 
     if _is_txda:
         insert_pos = cmd.index("--mem-fraction-static")
