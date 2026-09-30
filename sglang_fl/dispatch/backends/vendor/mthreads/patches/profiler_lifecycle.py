@@ -12,46 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Transactional profiler cleanup for the fixed SGLang v0.5.11 target.
+"""Transactional cleanup for SGLang's legacy and composite profilers.
 
-This module contains no MUSA behavior. It only closes v0.5.11 failure paths so
-an external profiler-marker error cannot leave already-started profilers or the
-legacy scheduler state active. Keep this shim isolated and version-locked.
+The legacy adapter requires stage-aware start/stop methods and the scheduler's
+existing profiler state. Its stop path must stop the other profilers before the
+capture marker. The composite adapter requires an ordered ``inners`` collection
+whose members expose start/stop. Keep these internal API assumptions isolated
+from the Torch/MUSA leaf redirects.
 """
 
 from __future__ import annotations
 
 import logging
 from functools import wraps
-from importlib import metadata
+from inspect import signature
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_SGLANG_VERSION = "0.5.11"
 _patches_applied = False
 
 
-def _installed_sglang_version() -> str:
+def _require_profiler_contract(profiler_mixin, profiler_list) -> None:
+    """Check the APIs used by both adapters before changing either class."""
     try:
-        return metadata.version("sglang")
-    except metadata.PackageNotFoundError:
-        import sglang
+        for method in (profiler_mixin.start_profile, profiler_mixin.stop_profile):
+            method_signature = signature(method)
+            if "stage" not in method_signature.parameters:
+                raise ValueError("legacy profiler methods must expose stage")
+            method_signature.bind(None)
+            method_signature.bind(None, stage=None)
 
-        version = getattr(sglang, "__version__", None)
-        return str(version) if version is not None else "unknown"
-
-
-def _base_version(version: str) -> str:
-    return version.split("+", 1)[0].split(".post", 1)[0]
-
-
-def _require_supported_sglang() -> None:
-    installed = _installed_sglang_version()
-    if _base_version(installed) != _SUPPORTED_SGLANG_VERSION:
+        signature(profiler_list.start).bind(None)
+        signature(profiler_list.stop).bind(None)
+        inners = [object(), object()]
+        if list(profiler_list(inners).inners) != inners:
+            raise ValueError("composite profiler must preserve inner order")
+    except (AttributeError, TypeError, ValueError) as exc:
         raise RuntimeError(
-            "The MUSA profiler lifecycle compatibility patch requires SGLang "
-            f"{_SUPPORTED_SGLANG_VERSION}, but found {installed}."
-        )
+            "SGLang profiler cleanup requires stage-aware "
+            "SchedulerProfilerMixin.start_profile/stop_profile and "
+            "_ProfilerList(inners).start/stop with an ordered inners collection."
+        ) from exc
 
 
 def _reset_legacy_state(scheduler) -> None:
@@ -66,6 +67,7 @@ def _wrap_legacy_profiler_lifecycle(profiler_mixin, marker_error_type: type) -> 
 
     original_start = profiler_mixin.start_profile
     original_stop = profiler_mixin.stop_profile
+    start_signature = signature(original_start)
 
     @wraps(original_start)
     def start_profile_with_rollback(self, *args, **kwargs):
@@ -73,14 +75,22 @@ def _wrap_legacy_profiler_lifecycle(profiler_mixin, marker_error_type: type) -> 
             return original_start(self, *args, **kwargs)
         except marker_error_type:
             if getattr(self, "profile_in_progress", False):
+                stage = start_signature.bind(self, *args, **kwargs).arguments.get(
+                    "stage"
+                )
                 try:
                     # Let SGLang stop the profilers it successfully started.
-                    original_stop(self, *args, **kwargs)
+                    original_stop(self, stage=stage)
+                except marker_error_type:
+                    # Other profilers have stopped before the failed marker.
+                    logger.exception("Capture-marker stop failed during rollback")
                 except Exception:
                     logger.exception(
                         "Failed to fully roll back SGLang profilers after a "
                         "capture-marker start error"
                     )
+                    # Preserve active state when native cleanup is incomplete.
+                    raise
             _reset_legacy_state(self)
             raise
 
@@ -89,7 +99,7 @@ def _wrap_legacy_profiler_lifecycle(profiler_mixin, marker_error_type: type) -> 
         try:
             return original_stop(self, *args, **kwargs)
         except marker_error_type:
-            # The capture marker is the last stop operation in SGLang v0.5.11;
+            # The legacy contract places capture-marker stop after other stops;
             # Torch, RPD, and memory profilers have already been stopped here.
             _reset_legacy_state(self)
             raise
@@ -145,17 +155,21 @@ def _wrap_profiler_list_lifecycle(profiler_list) -> None:
 def apply_profiler_lifecycle_patch(
     marker_error_type: type,
 ) -> None:
-    """Apply only the cleanup SGLang v0.5.11 is missing."""
+    """Adapt the required legacy/composite APIs without a version-string gate."""
     global _patches_applied
     if _patches_applied:
         return
 
-    _require_supported_sglang()
+    try:
+        from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+        from sglang.srt.utils.profile_utils import _ProfilerList
+    except ImportError as exc:
+        raise RuntimeError(
+            "Required SGLang profiler cleanup APIs are unavailable"
+        ) from exc
 
-    from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
-    from sglang.srt.utils.profile_utils import _ProfilerList
-
+    _require_profiler_contract(SchedulerProfilerMixin, _ProfilerList)
     _wrap_legacy_profiler_lifecycle(SchedulerProfilerMixin, marker_error_type)
     _wrap_profiler_list_lifecycle(_ProfilerList)
     _patches_applied = True
-    logger.info("SGLang v0.5.11 profiler transactional cleanup patch applied")
+    logger.info("SGLang profiler transactional cleanup patch applied")

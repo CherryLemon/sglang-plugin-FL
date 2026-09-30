@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import logging
-from types import SimpleNamespace
+import sys
+from importlib import metadata
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -279,32 +281,222 @@ def test_profile_v2_list_attempts_every_stop_before_raising():
     assert events == ["torch_stop", "marker_stop", "rpd_stop"]
 
 
-@pytest.mark.parametrize(
-    "version", ["0.5.10", "0.5.12", "0.5.110", "0.5.11rc1", "unknown"]
-)
-def test_sglang_profiler_lifecycle_patch_rejects_other_versions(monkeypatch, version):
-    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: version)
+@pytest.fixture
+def profiler_contract(monkeypatch):
+    class SchedulerProfilerMixin:
+        def start_profile(self, stage=None):
+            pass
 
-    with pytest.raises(RuntimeError, match="requires SGLang 0.5.11"):
-        lifecycle._require_supported_sglang()
+        def stop_profile(self, stage=None):
+            pass
 
+    class ProfilerList:
+        def __init__(self, inners):
+            self.inners = inners
 
-@pytest.mark.parametrize("version", ["0.5.11", "0.5.11+vendor", "0.5.11.post1"])
-def test_lifecycle_accepts_supported_base_version(monkeypatch, version):
-    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: version)
-    lifecycle._require_supported_sglang()
+        def start(self):
+            pass
 
+        def stop(self):
+            pass
 
-def test_unsupported_version_does_not_install_torch_redirects(monkeypatch):
+    scheduler_module = ModuleType("sglang.srt.managers.scheduler_profiler_mixin")
+    scheduler_module.SchedulerProfilerMixin = SchedulerProfilerMixin
+    list_module = ModuleType("sglang.srt.utils.profile_utils")
+    list_module._ProfilerList = ProfilerList
+    monkeypatch.setitem(sys.modules, scheduler_module.__name__, scheduler_module)
+    monkeypatch.setitem(sys.modules, list_module.__name__, list_module)
     monkeypatch.setattr(musa_profiler, "_patches_applied", False)
     monkeypatch.setattr(lifecycle, "_patches_applied", False)
-    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: "0.5.12")
+    return SchedulerProfilerMixin, ProfilerList
+
+
+@pytest.mark.parametrize("version", ["release-build", "vendor-build"])
+def test_contract_install_does_not_gate_redirects_by_version(
+    monkeypatch, profiler_contract, version
+):
+    # These are API doubles, not validation of another SGLang distribution.
+    monkeypatch.setattr(metadata, "version", lambda _name: version)
+    fake_activity = SimpleNamespace(CUDA="cuda", PrivateUse1="privateuse1")
+    original_cudart = lambda: SimpleNamespace(cudaHostRegister="host_register")
+    fake_torch = SimpleNamespace(
+        profiler=SimpleNamespace(ProfilerActivity=fake_activity),
+        cuda=SimpleNamespace(cudart=original_cudart),
+    )
+    monkeypatch.setattr(musa_profiler, "torch", fake_torch)
+    monkeypatch.setattr(musa_profiler, "_MUSA_CUDART_PROXY", None)
+
+    musa_profiler.apply_musa_profiler_patches()
+
+    assert fake_activity.CUDA == "privateuse1"
+    assert isinstance(fake_torch.cuda.cudart(), musa_profiler.MusaCudartProxy)
+    assert lifecycle._patches_applied
+    assert musa_profiler._patches_applied
+
+
+@pytest.mark.parametrize(
+    "invalid_api",
+    ["legacy_start", "legacy_stop", "list_start", "list_stop", "inner_order"],
+)
+def test_invalid_contract_fails_before_any_patch(
+    monkeypatch, profiler_contract, invalid_api
+):
+    scheduler, profiler_list = profiler_contract
+    if invalid_api == "legacy_start":
+        scheduler.start_profile = lambda self: None
+    elif invalid_api == "legacy_stop":
+        scheduler.stop_profile = lambda self, required_argument: None
+    elif invalid_api == "list_start":
+        profiler_list.start = None
+    elif invalid_api == "list_stop":
+        profiler_list.stop = lambda self, required_argument: None
+    else:
+        profiler_list.__init__ = lambda self, inners: setattr(
+            self, "inners", list(reversed(inners))
+        )
+    original_start = scheduler.start_profile
+    original_list_start = profiler_list.start
     monkeypatch.setattr(
         musa_profiler,
         "_install_torch_profiler_redirects",
-        lambda: pytest.fail("must check the compatibility boundary first"),
+        lambda: pytest.fail("must check the lifecycle contract first"),
     )
-    with pytest.raises(RuntimeError, match="requires SGLang 0.5.11"):
+
+    with pytest.raises(RuntimeError, match="SGLang profiler cleanup requires"):
         musa_profiler.apply_musa_profiler_patches()
+
+    assert scheduler.start_profile is original_start
+    assert profiler_list.start is original_list_start
+    assert not getattr(scheduler, "_musa_profiler_lifecycle_patched", False)
+    assert not getattr(profiler_list, "_musa_profiler_lifecycle_patched", False)
     assert not musa_profiler._patches_applied
     assert not lifecycle._patches_applied
+
+
+@pytest.mark.parametrize("missing_api", ["activity", "cudart"])
+def test_missing_torch_api_fails_before_any_patch(
+    monkeypatch, profiler_contract, missing_api
+):
+    scheduler, profiler_list = profiler_contract
+    activity = SimpleNamespace(CUDA="cuda")
+    if missing_api != "activity":
+        activity.PrivateUse1 = "privateuse1"
+    cuda = SimpleNamespace()
+    if missing_api != "cudart":
+        cuda.cudart = lambda: object()
+    monkeypatch.setattr(
+        musa_profiler,
+        "torch",
+        SimpleNamespace(profiler=SimpleNamespace(ProfilerActivity=activity), cuda=cuda),
+    )
+    with pytest.raises(musa_profiler.MusaProfilerError):
+        musa_profiler.apply_musa_profiler_patches()
+
+    assert activity.CUDA == "cuda"
+    assert not getattr(scheduler, "_musa_profiler_lifecycle_patched", False)
+    assert not getattr(profiler_list, "_musa_profiler_lifecycle_patched", False)
+    assert not lifecycle._patches_applied
+    assert not musa_profiler._patches_applied
+
+
+def test_missing_lifecycle_api_fails_before_any_patch(monkeypatch, profiler_contract):
+    scheduler, profiler_list = profiler_contract
+    monkeypatch.delattr(sys.modules["sglang.srt.utils.profile_utils"], "_ProfilerList")
+    monkeypatch.setattr(
+        musa_profiler,
+        "_install_torch_profiler_redirects",
+        lambda: pytest.fail("must reject the missing cleanup API first"),
+    )
+
+    with pytest.raises(RuntimeError, match="profiler cleanup APIs are unavailable"):
+        musa_profiler.apply_musa_profiler_patches()
+
+    assert not getattr(scheduler, "_musa_profiler_lifecycle_patched", False)
+    assert not getattr(profiler_list, "_musa_profiler_lifecycle_patched", False)
+    assert not lifecycle._patches_applied
+    assert not musa_profiler._patches_applied
+
+
+def test_legacy_rollback_preserves_state_when_native_cleanup_fails():
+    class MarkerError(RuntimeError):
+        pass
+
+    class SchedulerProfilerMixin:
+        def start_profile(self, stage=None):
+            self.profile_in_progress = True
+            raise MarkerError("marker start failed")
+
+        def stop_profile(self, stage=None):
+            raise RuntimeError("torch stop failed")
+
+    lifecycle._wrap_legacy_profiler_lifecycle(SchedulerProfilerMixin, MarkerError)
+    scheduler = SchedulerProfilerMixin()
+    profiler = object()
+    scheduler.torch_profiler = profiler
+    scheduler.profiler_start_forward_ct = 10
+
+    with pytest.raises(RuntimeError, match="torch stop failed") as exc:
+        scheduler.start_profile()
+
+    assert isinstance(exc.value.__context__, MarkerError)
+    assert scheduler.torch_profiler is profiler
+    assert scheduler.profile_in_progress
+    assert scheduler.profiler_start_forward_ct == 10
+
+
+def test_legacy_rollback_forwards_only_stage_to_stop_after_marker_error():
+    events = []
+
+    class MarkerError(RuntimeError):
+        pass
+
+    class SchedulerProfilerMixin:
+        def start_profile(self, stage=None, *, trace_option=None):
+            self.profile_in_progress = True
+            raise MarkerError("marker start failed")
+
+        def stop_profile(self, stage=None):
+            events.extend([("torch_stop", stage), ("marker_stop", stage)])
+            raise MarkerError("marker stop failed")
+
+    lifecycle._wrap_legacy_profiler_lifecycle(SchedulerProfilerMixin, MarkerError)
+    scheduler = SchedulerProfilerMixin()
+    scheduler.torch_profiler = object()
+    scheduler.profiler_start_forward_ct = 10
+
+    with pytest.raises(MarkerError, match="marker start failed"):
+        scheduler.start_profile("prefill", trace_option=True)
+
+    assert events == [("torch_stop", "prefill"), ("marker_stop", "prefill")]
+    assert scheduler.torch_profiler is None
+    assert not scheduler.profile_in_progress
+    assert scheduler.profiler_start_forward_ct is None
+
+
+def test_legacy_marker_stop_failure_clears_state_after_native_stops():
+    events = []
+
+    class MarkerError(RuntimeError):
+        pass
+
+    class SchedulerProfilerMixin:
+        def start_profile(self, stage=None):
+            pass
+
+        def stop_profile(self, stage=None):
+            events.extend(["torch_stop", "memory_stop", "marker_stop"])
+            raise MarkerError("marker stop failed")
+
+    lifecycle._wrap_legacy_profiler_lifecycle(SchedulerProfilerMixin, MarkerError)
+    scheduler = SchedulerProfilerMixin()
+    scheduler.torch_profiler = object()
+    scheduler.profile_in_progress = True
+    scheduler.profiler_start_forward_ct = 10
+
+    with pytest.raises(MarkerError, match="marker stop failed"):
+        scheduler.stop_profile()
+
+    assert events == ["torch_stop", "memory_stop", "marker_stop"]
+    assert scheduler.torch_profiler is None
+    assert not scheduler.profile_in_progress
+    assert scheduler.profiler_start_forward_ct is None

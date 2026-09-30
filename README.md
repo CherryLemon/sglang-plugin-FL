@@ -588,7 +588,7 @@ The plugin scans `dispatch/backends/vendor/*/register_ops.py` at startup. If `is
 
 #### Performance profiling with msys
 
-The MThreads backend lets SGLang v0.5.11 own the profiler lifecycle and
+The MThreads backend lets SGLang own the profiler lifecycle and
 redirects its two CUDA-oriented leaves on MUSA workers:
 
 | SGLang activity | MUSA behavior | Purpose |
@@ -596,12 +596,17 @@ redirects its two CUDA-oriented leaves on MUSA workers:
 | `GPU` | `torch.profiler.ProfilerActivity.PrivateUse1` (`MUSA`) | PyTorch/MUSA Chrome traces |
 | `CUDA_PROFILER` | `musaProfilerStart/Stop` | msys capture-range control |
 
-This integration targets SGLang v0.5.11 exactly. The MThreads branch of
-`PlatformFL.init_backend` follows SGLang's existing `torch_npu` pattern by
-redirecting the Torch activity and runtime marker APIs instead of replacing
-SGLang's legacy or profile-v2 implementations. A small, version-locked
-compatibility shim adds transactional cleanup to v0.5.11's profiler failure
-paths.
+The MThreads branch of `PlatformFL.init_backend` follows SGLang's existing
+`torch_npu` pattern by redirecting the Torch activity and runtime marker APIs
+instead of replacing
+SGLang's legacy or profile-v2 implementations. A small compatibility shim adds
+transactional cleanup to the stage-aware legacy scheduler and ordered
+`_ProfilerList` APIs. Initialization checks these interfaces before patching
+either class; it does not select support by a framework version string. The
+legacy stop contract requires other profilers to stop before the capture
+marker. Interface checks alone do not validate another framework's cleanup
+behavior; actual version and validation boundaries are recorded in
+[PR #72](https://github.com/flagos-ai/sglang-plugin-FL/pull/72).
 
 Launch the server under msys, then use SGLang's existing endpoints to delimit
 the steady-state capture:
@@ -626,9 +631,9 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
-SGLang v0.5.11 requires `SGLANG_PROFILE_V2=0` for manual start/stop; V2 only
-supports stage-based triggering. MUSA 4.3 may return error 801 from the
-profiler API even when msys accepts the marker. The plugin clears that sticky
+Use `SGLANG_PROFILE_V2=0` for manual start/stop in the validated configuration;
+its V2 path only supports stage-based triggering. MUSA 4.3 may return error 801
+from the profiler API even when msys accepts the marker. The plugin clears that sticky
 runtime error and treats only error 801 as the observed msys compatibility
 case; every other non-zero result raises an error after cleanup. On the first
 `CUDA_PROFILER` marker, the plugin verifies the required symbols in the active

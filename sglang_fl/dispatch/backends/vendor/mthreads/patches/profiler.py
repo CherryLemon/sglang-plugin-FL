@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MUSA redirects for SGLang v0.5.11's CUDA-oriented profiler APIs.
+"""MUSA redirects for SGLang's CUDA-oriented profiler APIs.
 
-SGLang v0.5.11 owns the profiler lifecycle and recognizes the public activity
+SGLang owns the profiler lifecycle and recognizes the public activity
 names ``GPU`` and ``CUDA_PROFILER``. On MUSA workers this module redirects the
 two CUDA-specific leaves used by that implementation:
 
@@ -23,8 +23,8 @@ two CUDA-specific leaves used by that implementation:
   call ``musaProfilerStart`` and ``musaProfilerStop``.
 
 No SGLang profiler implementation is copied here. The only SGLang-internal
-compatibility patch is a version-locked transactional cleanup shim for failure
-paths that v0.5.11 does not roll back itself.
+compatibility patch adds transactional cleanup for the legacy scheduler and
+ordered composite-profiler APIs.
 """
 
 from __future__ import annotations
@@ -234,23 +234,32 @@ def _torch_musa_activity():
     return activity
 
 
+def _torch_profiler_redirect_targets():
+    activity = _torch_musa_activity()
+    original_cudart = getattr(torch.cuda, "cudart", None)
+    if not callable(original_cudart):
+        raise MusaProfilerError(
+            "This PyTorch build does not expose torch.cuda.cudart()"
+        )
+    return activity, original_cudart
+
+
 def _install_torch_profiler_redirects() -> None:
     global _MUSA_CUDART_PROXY
 
-    torch.profiler.ProfilerActivity.CUDA = _torch_musa_activity()
-
-    original_cudart = torch.cuda.cudart
+    activity, original_cudart = _torch_profiler_redirect_targets()
     _MUSA_CUDART_PROXY = MusaCudartProxy(original_cudart, _MUSA_PROFILER_API)
 
     @wraps(original_cudart)
     def musa_cudart():
         return _MUSA_CUDART_PROXY
 
+    torch.profiler.ProfilerActivity.CUDA = activity
     torch.cuda.cudart = musa_cudart
 
 
 def apply_musa_profiler_patches() -> None:
-    """Install the version-locked SGLang v0.5.11 profiler adaptation once.
+    """Install the SGLang profiler adaptation for the required APIs once.
 
     ``libmusart.so`` remains lazy: workers that never request
     ``CUDA_PROFILER`` do not need to load the capture-range marker ABI.
@@ -259,10 +268,11 @@ def apply_musa_profiler_patches() -> None:
     if _patches_applied:
         return
 
+    _torch_profiler_redirect_targets()
     apply_profiler_lifecycle_patch(MusaProfilerError)
     _install_torch_profiler_redirects()
     _patches_applied = True
     logger.info(
-        "MUSA profiler redirects applied for SGLang v0.5.11: "
+        "MUSA profiler redirects applied: "
         "GPU->PrivateUse1 and CUDA_PROFILER->musaProfilerStart/Stop"
     )
