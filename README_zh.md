@@ -640,7 +640,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
-`SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，并且只把 801 作为已验证的 msys 兼容情况继续执行，其他非零错误在清理后抛出。首次使用 `CUDA_PROFILER` marker 时，插件会检查当前 `libmusart.so` 的必需符号；marker 报错时，如果接口可用，诊断信息会包含 runtime 版本。该路径已在 MUSA Runtime 4.3.x、Torch/TorchMUSA 2.9.0 和 Moore Perf System 1.8.0 上验证。以生成的 `.msys-rep` 为最终判断依据；Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
+`SGLANG_PROFILE_V2=0` 是 SGLang v0.5.11 手动 start/stop 端点的要求；V2 当前只支持按 stage 触发。MUSA 4.3 的 runtime 可能让 profiler API 返回错误码 801，但 msys 仍接受 range marker；插件会立即清除 sticky runtime error，并且只把 801 作为已验证的 msys 兼容情况继续执行，其他非零错误在清理后抛出。首次使用 `CUDA_PROFILER` marker 时，插件会检查当前 `libmusart.so` 的必需符号；marker 报错时，如果接口可用，诊断信息会包含 runtime 版本。早期版本曾在 MUSA Runtime 4.3.x、Torch/TorchMUSA 2.9.0 和 Moore Perf System 1.8.0 上验证 msys 流程；当前叶子重定向与 lifecycle 重构仅完成 CPU 单测，尚未实机复验。以生成的 `.msys-rep` 为最终判断依据；Moore Perf System 1.8.0 在实测环境中会等被包裹的服务进程退出后完成报告落盘。
 
 ## 项目结构
 
@@ -691,7 +691,7 @@ sglang_fl/
                 │   ├── patch.py      # MUSA patch 统一入口
                 │   └── patches/
                 │       ├── profiler.py # TorchMUSA + msys API 重定向
-                │       └── sglang_0_5_11_profiler_lifecycle.py # 失败回滚兼容层
+                │       └── profiler_lifecycle.py # 仅 SGLang 0.5.11 的失败回滚兼容层
                 └── template/         # 新厂商模板
 ```
 
