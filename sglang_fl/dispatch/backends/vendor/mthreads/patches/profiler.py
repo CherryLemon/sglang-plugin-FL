@@ -36,9 +36,7 @@ from typing import Callable
 
 import torch
 
-from .sglang_0_5_11_profiler_lifecycle import (
-    apply_sglang_0_5_11_profiler_lifecycle_patch,
-)
+from .profiler_lifecycle import apply_profiler_lifecycle_patch
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +259,7 @@ def apply_musa_profiler_patches() -> None:
     if _patches_applied:
         return
 
-    apply_sglang_0_5_11_profiler_lifecycle_patch(MusaProfilerError)
+    apply_profiler_lifecycle_patch(MusaProfilerError)
     _install_torch_profiler_redirects()
     _patches_applied = True
     logger.info(

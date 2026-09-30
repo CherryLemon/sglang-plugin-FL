@@ -45,7 +45,7 @@ def _base_version(version: str) -> str:
     return version.split("+", 1)[0].split(".post", 1)[0]
 
 
-def _require_sglang_0_5_11() -> None:
+def _require_supported_sglang() -> None:
     installed = _installed_sglang_version()
     if _base_version(installed) != _SUPPORTED_SGLANG_VERSION:
         raise RuntimeError(
@@ -142,7 +142,7 @@ def _wrap_profiler_list_lifecycle(profiler_list) -> None:
     profiler_list._musa_profiler_lifecycle_patched = True
 
 
-def apply_sglang_0_5_11_profiler_lifecycle_patch(
+def apply_profiler_lifecycle_patch(
     marker_error_type: type,
 ) -> None:
     """Apply only the cleanup SGLang v0.5.11 is missing."""
@@ -150,7 +150,7 @@ def apply_sglang_0_5_11_profiler_lifecycle_patch(
     if _patches_applied:
         return
 
-    _require_sglang_0_5_11()
+    _require_supported_sglang()
 
     from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
     from sglang.srt.utils.profile_utils import _ProfilerList

@@ -21,7 +21,7 @@ from sglang_fl.dispatch.backends.vendor.mthreads.patches import (
     profiler as musa_profiler,
 )
 from sglang_fl.dispatch.backends.vendor.mthreads.patches import (
-    sglang_0_5_11_profiler_lifecycle as lifecycle,
+    profiler_lifecycle as lifecycle,
 )
 
 
@@ -154,7 +154,7 @@ def test_patch_install_keeps_musart_loading_lazy(monkeypatch):
     monkeypatch.setattr(musa_profiler, "_patches_applied", False)
     monkeypatch.setattr(
         musa_profiler,
-        "apply_sglang_0_5_11_profiler_lifecycle_patch",
+        "apply_profiler_lifecycle_patch",
         lambda _error_type: None,
     )
     monkeypatch.setattr(
@@ -279,8 +279,32 @@ def test_profile_v2_list_attempts_every_stop_before_raising():
     assert events == ["torch_stop", "marker_stop", "rpd_stop"]
 
 
-def test_sglang_profiler_lifecycle_patch_rejects_other_versions(monkeypatch):
-    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: "0.5.12")
+@pytest.mark.parametrize(
+    "version", ["0.5.10", "0.5.12", "0.5.110", "0.5.11rc1", "unknown"]
+)
+def test_sglang_profiler_lifecycle_patch_rejects_other_versions(monkeypatch, version):
+    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: version)
 
     with pytest.raises(RuntimeError, match="requires SGLang 0.5.11"):
-        lifecycle._require_sglang_0_5_11()
+        lifecycle._require_supported_sglang()
+
+
+@pytest.mark.parametrize("version", ["0.5.11", "0.5.11+vendor", "0.5.11.post1"])
+def test_lifecycle_accepts_supported_base_version(monkeypatch, version):
+    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: version)
+    lifecycle._require_supported_sglang()
+
+
+def test_unsupported_version_does_not_install_torch_redirects(monkeypatch):
+    monkeypatch.setattr(musa_profiler, "_patches_applied", False)
+    monkeypatch.setattr(lifecycle, "_patches_applied", False)
+    monkeypatch.setattr(lifecycle, "_installed_sglang_version", lambda: "0.5.12")
+    monkeypatch.setattr(
+        musa_profiler,
+        "_install_torch_profiler_redirects",
+        lambda: pytest.fail("must check the compatibility boundary first"),
+    )
+    with pytest.raises(RuntimeError, match="requires SGLang 0.5.11"):
+        musa_profiler.apply_musa_profiler_patches()
+    assert not musa_profiler._patches_applied
+    assert not lifecycle._patches_applied
