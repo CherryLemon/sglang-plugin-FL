@@ -55,6 +55,8 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
+from sglang_fl.dispatch import resolve_op
+
 logger = logging.getLogger(__name__)
 
 # Keep CPU/plugin imports independent of Triton.  The lazy kernel builder
@@ -108,9 +110,7 @@ def _model_contract_from_config(config: Any) -> _MoeModelContract:
         model_type = _typed_config_field(config, "model_type", str)
         hidden_size = _typed_config_field(config, "hidden_size", int)
         num_experts = _typed_config_field(config, "num_experts", int)
-        num_experts_per_tok = _typed_config_field(
-            config, "num_experts_per_tok", int
-        )
+        num_experts_per_tok = _typed_config_field(config, "num_experts_per_tok", int)
         moe_intermediate_size = _typed_config_field(
             config, "moe_intermediate_size", int
         )
@@ -596,67 +596,70 @@ def _wrap_moe_sum_reduce(original: Callable[..., Any]) -> Callable[..., Any]:
         return original
 
     @wraps(original)
-    def wrapped(
-        routed: torch.Tensor,
-        output: torch.Tensor,
-        routed_scaling_factor: float | None,
-        *args: Any,
-        **kwargs: Any,
-    ):
-        context = _ACTIVE_CONTEXT.get()
-        if context is None or not _contract_matches(
-            routed, output, routed_scaling_factor, context
-        ):
-            return original(routed, output, routed_scaling_factor, *args, **kwargs)
-
-        try:
-            if context.decode_graph_dual_stream:
-                # Python reaches this seam only after all routed-expert work
-                # has been enqueued on ``alt_stream``.  The shared branch was
-                # enqueued earlier on the primary stream, so this tail wait
-                # preserves overlap and joins the two producers immediately
-                # before their fused consumer.
-                consumer_stream = torch.musa.current_stream()
-                if (
-                    context.shared_stream is None
-                    or consumer_stream == context.shared_stream
-                ):
-                    raise RuntimeError("decode-graph combine stream contract mismatch")
-                context.shared_unweighted.record_stream(consumer_stream)
-                context.gate_logits.record_stream(consumer_stream)
-                consumer_stream.wait_stream(context.shared_stream)
-            _launch_candidate(routed, output, context)
-        except Exception as exc:  # noqa: BLE001 - preserve old chain on any failure
-            global _CANDIDATE_DISABLED, _DECODE_GRAPH_CANDIDATE_DISABLED
-            context.used = False
-            if context.decode_graph_dual_stream:
-                first_failure = not _DECODE_GRAPH_CANDIDATE_DISABLED
-                _DECODE_GRAPH_CANDIDATE_DISABLED = True
-                path = "decode-graph"
-            else:
-                first_failure = not _CANDIDATE_DISABLED
-                _CANDIDATE_DISABLED = True
-                path = "eager/prefill"
-            if first_failure:
-                logger.warning(
-                    "MUSA deterministic MoE %s combine disabled after first failure; "
-                    "using original reduction: %s",
-                    path,
-                    exc,
-                )
-            return original(routed, output, routed_scaling_factor, *args, **kwargs)
-
-        # The launch is asynchronous but the caller's stream/event semantics
-        # are unchanged.  The model wrapper skips the shared add only after the
-        # launch was submitted.
-        context.used = True
-        _log_success_once(
-            "decode-graph" if context.decode_graph_dual_stream else "eager/prefill"
+    def wrapped(routed, output, routed_scaling_factor, *args, **kwargs):
+        return resolve_op("moe_sum_reduce")(
+            original, routed, output, routed_scaling_factor, *args, **kwargs
         )
-        return None
 
     setattr(wrapped, _PATCH_MARKER, True)
     return wrapped
+
+
+def moe_sum_reduce_musa(
+    original, routed, output, routed_scaling_factor, *args, **kwargs
+):
+    """Registered vendor implementation; bridge owns the per-call context."""
+    context = _ACTIVE_CONTEXT.get()
+    if context is None or not _contract_matches(
+        routed, output, routed_scaling_factor, context
+    ):
+        return original(routed, output, routed_scaling_factor, *args, **kwargs)
+
+    try:
+        if context.decode_graph_dual_stream:
+            # Python reaches this seam only after all routed-expert work
+            # has been enqueued on ``alt_stream``.  The shared branch was
+            # enqueued earlier on the primary stream, so this tail wait
+            # preserves overlap and joins the two producers immediately
+            # before their fused consumer.
+            consumer_stream = torch.musa.current_stream()
+            if (
+                context.shared_stream is None
+                or consumer_stream == context.shared_stream
+            ):
+                raise RuntimeError("decode-graph combine stream contract mismatch")
+            context.shared_unweighted.record_stream(consumer_stream)
+            context.gate_logits.record_stream(consumer_stream)
+            consumer_stream.wait_stream(context.shared_stream)
+        _launch_candidate(routed, output, context)
+    except Exception as exc:  # noqa: BLE001 - preserve old chain on any failure
+        global _CANDIDATE_DISABLED, _DECODE_GRAPH_CANDIDATE_DISABLED
+        context.used = False
+        if context.decode_graph_dual_stream:
+            first_failure = not _DECODE_GRAPH_CANDIDATE_DISABLED
+            _DECODE_GRAPH_CANDIDATE_DISABLED = True
+            path = "decode-graph"
+        else:
+            first_failure = not _CANDIDATE_DISABLED
+            _CANDIDATE_DISABLED = True
+            path = "eager/prefill"
+        if first_failure:
+            logger.warning(
+                "MUSA deterministic MoE %s combine disabled after first failure; "
+                "using original reduction: %s",
+                path,
+                exc,
+            )
+        return original(routed, output, routed_scaling_factor, *args, **kwargs)
+
+    # The launch is asynchronous but the caller's stream/event semantics
+    # are unchanged.  The model wrapper skips the shared add only after the
+    # launch was submitted.
+    context.used = True
+    _log_success_once(
+        "decode-graph" if context.decode_graph_dual_stream else "eager/prefill"
+    )
+    return None
 
 
 def _extract_linear_output(value: Any) -> Any:

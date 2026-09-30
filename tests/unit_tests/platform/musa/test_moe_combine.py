@@ -21,6 +21,8 @@ import torch
 
 from sglang_fl.dispatch.backends.vendor.mthreads.patches import moe_combine
 
+pytestmark = pytest.mark.usefixtures("musa_dispatch")
+
 
 class _FakeDevice:
     type = "musa"
@@ -56,9 +58,14 @@ def _accept_fake_contract_tensors(monkeypatch):
     """
 
     if not hasattr(torch, "musa"):
-        monkeypatch.setattr(torch, "musa", SimpleNamespace(
-            current_stream=lambda: None, stream=lambda _: nullcontext()
-        ), raising=False)
+        monkeypatch.setattr(
+            torch,
+            "musa",
+            SimpleNamespace(
+                current_stream=lambda: None, stream=lambda _: nullcontext()
+            ),
+            raising=False,
+        )
     real_is_tensor = moe_combine._is_tensor
 
     def is_tensor(value):
@@ -213,9 +220,7 @@ def test_unreadable_config_does_not_break_construction():
         def __init__(self, layer_id, config):
             self.layer_id = layer_id
 
-    wrapped = moe_combine._make_qwen_init(
-        RealLikeQwen2MoeSparseMoeBlock.__init__
-    )
+    wrapped = moe_combine._make_qwen_init(RealLikeQwen2MoeSparseMoeBlock.__init__)
     instance = RealLikeQwen2MoeSparseMoeBlock.__new__(RealLikeQwen2MoeSparseMoeBlock)
     wrapped(instance, 0, ExplodingConfig())
 
@@ -257,7 +262,9 @@ def test_full_install_is_idempotent(monkeypatch):
 def test_real_qwen_class_constructor_marker_without_self_config(monkeypatch):
     qwen_module = pytest.importorskip("sglang.srt.models.qwen2_moe")
     if not hasattr(qwen_module, "get_tensor_model_parallel_world_size"):
-        pytest.skip("constructor integration requires the pinned MUSA SGLang 0.5.11 API")
+        pytest.skip(
+            "constructor integration requires the pinned MUSA SGLang 0.5.11 API"
+        )
     cls = qwen_module.Qwen2MoeSparseMoeBlock
 
     class FakeTopK:
@@ -710,7 +717,11 @@ def test_model_wrapper_consumed_skips_shared_add(monkeypatch):
         return torch.zeros_like(value)
 
     block._forward_router_experts = router
-    monkeypatch.setattr(moe_combine, "_model_contract_matches", lambda *args, **kwargs: not kwargs.get("decode_graph", False))
+    monkeypatch.setattr(
+        moe_combine,
+        "_model_contract_matches",
+        lambda *args, **kwargs: not kwargs.get("decode_graph", False),
+    )
     wrapped = moe_combine._make_qwen_forward(
         qwen_module, lambda *args, **kwargs: pytest.fail("unexpected fallback")
     )
@@ -725,7 +736,11 @@ def test_model_wrapper_unconsumed_adds_original_shared_term(monkeypatch):
     qwen_module = _fake_qwen_module()
     block, hidden = _fake_block()
     block._forward_router_experts = lambda value: torch.zeros_like(value)
-    monkeypatch.setattr(moe_combine, "_model_contract_matches", lambda *args, **kwargs: not kwargs.get("decode_graph", False))
+    monkeypatch.setattr(
+        moe_combine,
+        "_model_contract_matches",
+        lambda *args, **kwargs: not kwargs.get("decode_graph", False),
+    )
     wrapped = moe_combine._make_qwen_forward(
         qwen_module, lambda *args, **kwargs: pytest.fail("unexpected fallback")
     )
@@ -930,7 +945,11 @@ def test_model_exception_resets_context(monkeypatch):
         raise RuntimeError("router failure")
 
     block._forward_router_experts = router
-    monkeypatch.setattr(moe_combine, "_model_contract_matches", lambda *args, **kwargs: not kwargs.get("decode_graph", False))
+    monkeypatch.setattr(
+        moe_combine,
+        "_model_contract_matches",
+        lambda *args, **kwargs: not kwargs.get("decode_graph", False),
+    )
     wrapped = moe_combine._make_qwen_forward(qwen_module, lambda *args, **kwargs: None)
 
     with pytest.raises(RuntimeError, match="router failure"):

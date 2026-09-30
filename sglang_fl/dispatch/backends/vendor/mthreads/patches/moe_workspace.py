@@ -8,7 +8,7 @@ import inspect
 import logging
 from functools import wraps
 
-from ..moe.dispatch import _enabled
+from ..env import enabled as _enabled
 
 logger = logging.getLogger(__name__)
 _PATCH_MARKER = "_sglang_fl_musa_moe_pre_kv_workspace"

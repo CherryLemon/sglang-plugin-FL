@@ -6,8 +6,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from sglang_fl.dispatch.backends.vendor.mthreads.impl import fused_moe as entry
-from sglang_fl.dispatch.backends.vendor.mthreads.moe import dispatch
+from sglang_fl.dispatch.backends.vendor.mthreads.impl import fused_moe as dispatch
 from sglang_fl.dispatch.backends.vendor.mthreads.patches import moe_workspace
 
 
@@ -170,7 +169,7 @@ def test_dispatch_falls_back_exactly_once_and_preserves_return(monkeypatch):
     calls, sentinel = [], object()
     obj = NS(forward_musa=lambda *a: calls.append(a) or sentinel)
     layer, output = object(), object()
-    assert entry.fused_moe_musa(obj, layer, output) is sentinel
+    assert dispatch.fused_moe_musa(obj, layer, output) is sentinel
     assert calls == [(layer, output)]
 
 
@@ -191,7 +190,7 @@ def test_dispatch_hit_and_kernel_error_are_not_retried(monkeypatch):
     obj = NS(forward_musa=forbidden)
     sentinel = object()
     monkeypatch.setattr(dispatch, "maybe_forward", lambda *a: sentinel)
-    assert entry.fused_moe_musa(obj, object(), object()) is sentinel
+    assert dispatch.fused_moe_musa(obj, object(), object()) is sentinel
     error = RuntimeError("launch failed")
 
     def fail(*args):
@@ -199,7 +198,7 @@ def test_dispatch_hit_and_kernel_error_are_not_retried(monkeypatch):
 
     monkeypatch.setattr(dispatch, "maybe_forward", fail)
     with pytest.raises(RuntimeError) as exc:
-        entry.fused_moe_musa(obj, object(), object())
+        dispatch.fused_moe_musa(obj, object(), object())
     assert exc.value is error
 
 

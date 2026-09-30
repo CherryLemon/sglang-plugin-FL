@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import os
 
+from sglang_fl.dispatch import resolve_op
+
 logger = logging.getLogger(__name__)
 
 _ENV_NAME = "SGLANG_MUSA_CUSTOM_AR_FUSED_RMSNORM"
@@ -91,16 +93,7 @@ def _forward_with_musa_allreduce_fusion(
     if post_residual_addition is not None:
         residual = residual + post_residual_addition
 
-    fused_result = group.fused_allreduce_rmsnorm(
-        x, residual, weight, norm_module.variance_epsilon
-    )
-    if fused_result is not None:
-        return fused_result
-
-    # Unsupported shapes, missing JIT dependencies, or an explicitly disabled
-    # communicator retain the pre-patch all-reduce then RMSNorm semantics.
-    x = group.all_reduce(x)
-    return norm_module.forward(x, residual, None)
+    return resolve_op("allreduce_rms_norm")(group, norm_module, x, residual, weight)
 
 
 def _musa_fusion_gate(original_gate, batch_size: int) -> bool:

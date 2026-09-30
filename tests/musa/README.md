@@ -3,9 +3,9 @@
 Run from the repository root with the pinned image's TorchMUSA interpreter.
 The supported stack and historical results are recorded in
 [the MoE integration notes](../../sglang_fl/dispatch/backends/vendor/mthreads/moe/README.md).
-These commands validate the current checkout; the historical `b6995b4` results
-do not validate later fixes. Save the command, full logs, installed plugin commit,
-model revision, MATE revision and image digest alongside each result.
+These commands validate the current checkout; the historical hardware results
+at `f4bec31` do not validate eventfd removal or the later dispatch refactor.
+Save the command, full logs, installed plugin commit, model revision, MATE revision and image digest alongside each result.
 
 The current S5000 acceptance requires the isolated MATE GDN H-ready patch
 described [below](#mate-gdn-prefill-synchronization-check). Both tested MATE
@@ -176,53 +176,23 @@ refused. This is a correctness probe, and its elapsed time is not a benchmark.
 The full-model and matched performance gates must still pass with the exact
 dependency source that will be delivered.
 
-## Local pre-push checks (2026-09-20)
+## Current validation status
 
-On macOS with Python 3.12, Torch 2.11 and pytest 9.1:
+The current code uses the core Event completion path. It has not been
+revalidated on S5000 after eventfd removal and the unified-dispatch refactor.
+Historical benchmark detail and previous local checks are preserved in the
+[immutable record](https://github.com/CherryLemon/sglang-plugin-FL/blob/b3cd3b1d099d0a2e315680d43ab63f2cbae4a2ea/tests/musa/README.md).
+See [the evidence summary](acceptance_20260920.md) for tested identities, C4
+findings, dependency hashes and limits.
 
-- MUSA unit tests plus collection of the new functional tests: 216 passed,
-  8 skipped, 9 subtests passed. Six skips are the S5000 functional cases; two
-  existing unit checks require installed SGLang/Triton APIs.
-- Full unit suite with collection errors retained: 392 passed, 2 skipped,
-  5 failed and 1 collection error. Every failure/error is `ModuleNotFoundError:
-  No module named 'sglang'`; the pinned runtime full-suite gate remains open.
-- Python compilation, changed-file syntax/import lint (repository E731
-  exemption), YAML case discovery and `git diff --check` pass.
+`qwen36_perf.env` retains the opt-in runtime controls for reproducing the
+campaign configuration, now without eventfd. Set the model path, visible
+devices, communication interface and isolated patched MATE path separately.
+The explicit environment blacklist replaces the YAML list. Its filename and
+historical origin do not establish current performance acceptance.
 
-Those local checks do not provide S5000 kernel, model, graph replay or
-performance evidence. Subsequent target-machine results and their dependency
-requirements are recorded in [the integration acceptance](acceptance_20260920.md).
-
-## Historical optimized performance profile
-
-The conservative smoke case above does not reproduce the campaign's performance
-configuration. For that comparison, source `tests/musa/qwen36_perf.env` before
-launching the pinned runtime. Set the model path, device visibility, communication
-interface and pinned MATE compatibility path for the target machine separately.
-The explicit blacklist in this profile includes native `index`, `copy_` and
-`index_put` paths; an environment blacklist replaces the YAML list.
-
-Use BF16 TP2/PP1/DP1, context 262144, page size 64, full decode graph buckets
-`1,2,4,8,12,16,24,32,40,48,56,64`, no piecewise graphs, no radix cache,
-`mamba-scheduler-strategy=no_buffer`, max-running-requests 64, max-prefill-tokens
-16384, chunked-prefill-size 16384, flashinfer sampling and FA3 attention.
-First validate startup and all graph captures at memory fraction `.970`.
-The retained September-17 measurements used `.965`; a separate matched `.965`
-run reproduces that historical comparison and must be labelled separately.
-
-The historical client sends direct integer token IDs to `/v1/completions`, with
-streaming disabled, temperature 0, ignore-EOS enabled, output length 1024,
-256 requests, concurrency 64 and seed 0. Input lengths are 1024, 4096, 16384 and
-65536. Reuse the retained prompt generator and compare its prompt digests;
-decoding and retokenizing IDs changes the workload. Exclude tokenizer loading,
-workload construction and warmup from timing. Validate every response's usage
-and finish reason, retain five measured rounds and concurrent telemetry, and
-report the median output token rate. This is an engineering reproduction
-protocol, separate from streaming FlagRelease measurements and dataset accuracy.
-
-The release/perf integration retains the release-side scheduling guards, MATE
-loader, MoE workspace and test layout. It retains FlagCX in-place self-copy
-avoidance from the perf branch. Output completion uses the core Event path;
-the plugin eventfd provider, patch and native callback have been removed. The standalone GPU
-combine test uses native MUSA streams and forks from the actual capture stream;
-each replay must overwrite poisoned output, so an empty capture cannot pass.
+On the target image, verify common dispatch preference/per-op/vendor filters
+for `fused_moe`, `shared_expert_gate_tail`, `moe_sum_reduce` and
+`allreduce_rms_norm`. The last three use the common resolver before execution,
+so a failed in-place launch/collective is not retried by the dispatch manager.
+Keep the full existing CPU and GPU test suites; GPU skips are not acceptance.

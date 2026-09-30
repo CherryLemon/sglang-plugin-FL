@@ -10,9 +10,10 @@ from contextvars import ContextVar
 from functools import wraps
 
 import torch
-import torch.nn.functional as F
 
-from ..moe.dispatch import _enabled
+from sglang_fl.dispatch import resolve_op
+
+from ..env import enabled as _enabled
 
 logger = logging.getLogger(__name__)
 _ENV = "SGLANG_MUSA_SHARED_EXPERT_GATE_TAIL_FUSED"
@@ -62,34 +63,8 @@ def _eligible(module, block, hidden, batch, reduce_scatter, allreduce_fusion):
 
 
 def _shared_forward(block, hidden):
-    from ..moe import shared_expert_gate_tail as kernel
-
-    shared = block.shared_expert(hidden)
-    gate = block.shared_expert_gate
-    if (
-        getattr(gate, "bias", None) is None
-        and kernel.triton is not None
-        and kernel.candidate_guard_reason(
-            hidden,
-            gate.weight,
-            shared,
-            enabled=True,
-            capturing=False,
-        )
-        == "eligible"
-    ):
-        # Fixed-shape allocation is graph-owned, as in the measured core path;
-        # the kernel receives an explicit output and never allocates implicitly.
-        output = torch.empty_like(shared)
-        return kernel.fused_shared_expert_gate_tail(
-            hidden,
-            gate.weight,
-            shared,
-            out=output,
-            enabled=True,
-        )
-    # Keep the original MUSA materialization order without repeating the MLP.
-    return F.sigmoid(gate(hidden)) * shared
+    # Resolve through the common policy/cache without retrying a failed launch.
+    return resolve_op("shared_expert_gate_tail")(block, hidden)
 
 
 def _patch_block(module):

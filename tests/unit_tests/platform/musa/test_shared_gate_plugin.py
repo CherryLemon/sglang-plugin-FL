@@ -10,6 +10,8 @@ from sglang_fl.dispatch.backends.vendor.mthreads.patches import (
     shared_expert_gate_tail as patch,
 )
 
+pytestmark = pytest.mark.usefixtures("musa_dispatch")
+
 
 def _runtime():
     module = NS(
@@ -194,8 +196,8 @@ def test_wrapper_fallback_and_constructor_marker(monkeypatch):
 def test_existing_shared_override_is_not_replaced():
     module = _fake_module([])
     cls = module.Qwen2MoeSparseMoeBlock
-    cls._forward_shared_experts = (
-        lambda self, hidden_states, use_musa_gate_tail=False: None
+    cls._forward_shared_experts = lambda self, hidden_states, use_musa_gate_tail=False: (
+        None
     )
     originals = (cls.__init__, cls.forward, cls._forward_shared_experts)
     assert not patch._patch_block(module)

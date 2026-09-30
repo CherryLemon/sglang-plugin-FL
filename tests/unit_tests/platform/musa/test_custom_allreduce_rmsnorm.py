@@ -5,9 +5,13 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from sglang_fl.dispatch.backends.vendor.mthreads.patches import (
     custom_allreduce_rmsnorm as patch,
 )
+
+pytestmark = pytest.mark.usefixtures("musa_dispatch")
 
 
 class _Norm:
