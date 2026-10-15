@@ -9,12 +9,15 @@ import logging
 from functools import wraps
 
 from ..env import enabled as _enabled
+from ..env import is_s5000
 
 logger = logging.getLogger(__name__)
 _PATCH_MARKER = "_sglang_fl_musa_moe_pre_kv_workspace"
 
 
 def _reserve(runner):
+    if not is_s5000(runner.device):
+        return False
     from ..moe.fused_moe import maybe_preallocate_musa_m16k_moe_down_workspace
 
     return maybe_preallocate_musa_m16k_moe_down_workspace(
@@ -44,7 +47,7 @@ def _patch_runner(runner_cls):
 
     @wraps(original)
     def init_memory_pool(self, pre_model_load_memory):
-        if _enabled("SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE"):
+        if _enabled("SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE", default=True):
             _reserve(self)
         return original(self, pre_model_load_memory)
 
@@ -54,7 +57,7 @@ def _patch_runner(runner_cls):
 
 
 def apply_musa_moe_workspace_patch():
-    if not _enabled("SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE"):
+    if not _enabled("SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE", default=True):
         return False
     try:
         module = importlib.import_module("sglang.srt.model_executor.model_runner")

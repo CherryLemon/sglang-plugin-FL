@@ -14,6 +14,7 @@ import torch
 from sglang_fl.dispatch import resolve_op
 
 from ..env import enabled as _enabled
+from ..env import is_s5000
 
 logger = logging.getLogger(__name__)
 _ENV = "SGLANG_MUSA_SHARED_EXPERT_GATE_TAIL_FUSED"
@@ -29,13 +30,14 @@ def _none_or_empty_items(value):
 
 
 def _eligible(module, block, hidden, batch, reduce_scatter, allreduce_fusion):
-    if batch is None or not _enabled(_ENV):
+    if batch is None or not _enabled(_ENV, default=True):
         return False
     try:
         return (
             hidden.device.type == "musa"
             and hidden.dtype == torch.bfloat16
             and tuple(hidden.shape) == (4, 2048)
+            and is_s5000(hidden.device)
             and getattr(block, _MODEL_MARKER, False)
             and block.tp_size == 2
             and module.get_pp_group().world_size == 1
@@ -155,7 +157,7 @@ def _patch_block(module):
 
 
 def apply_musa_shared_expert_gate_tail_patch():
-    if not _enabled(_ENV):
+    if not _enabled(_ENV, default=True):
         return False
     try:
         module = importlib.import_module("sglang.srt.models.qwen2_moe")

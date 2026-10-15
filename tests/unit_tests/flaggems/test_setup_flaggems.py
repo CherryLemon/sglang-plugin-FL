@@ -321,6 +321,7 @@ def test_musa_platform_uses_native_copy_and_index_put() -> None:
 
     assert config is not None
     assert "copy_" in config["flagos_blacklist"]
+    assert {"index", "mul"}.issubset(config["flagos_blacklist"])
     assert {"index_put", "index_put_", "_index_put_impl_"}.issubset(
         config["flagos_blacklist"]
     )

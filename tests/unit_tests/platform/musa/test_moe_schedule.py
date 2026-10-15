@@ -210,19 +210,19 @@ def test_schedule_can_be_disabled(monkeypatch):
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 64) is sentinel
 
 
-def test_r2_m4_baseline_is_explicit_and_returns_independent_configs(monkeypatch):
+def test_r2_m4_baseline_is_default_and_returns_independent_configs(monkeypatch):
     monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S5000")
     monkeypatch.delenv("SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE", raising=False)
     sentinel = object()
     wrapped = moe_schedule._wrap_try_get_optimal_moe_config(lambda *a, **kw: sentinel)
-    assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) is sentinel
-    monkeypatch.setenv("SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE", "1")
     expected = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=1)
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == expected
     up, down = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4, return_down_config=True)
     assert up == expected and down == (None, None)
     up['BLOCK_SIZE_N'] = 64
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == expected
+    monkeypatch.setenv("SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE", "0")
+    assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) is sentinel
 
 
 def test_decode_accepts_canonical_intermediate_size_512(monkeypatch):

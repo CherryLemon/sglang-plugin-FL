@@ -13,6 +13,11 @@ from sglang_fl.dispatch.backends.vendor.mthreads.patches import (
 pytestmark = pytest.mark.usefixtures("musa_dispatch")
 
 
+@pytest.fixture(autouse=True)
+def s5000_runtime(monkeypatch):
+    monkeypatch.setattr(patch, "is_s5000", lambda device: True)
+
+
 def _runtime():
     module = NS(
         get_pp_group=lambda: NS(world_size=1),
@@ -39,11 +44,17 @@ def _runtime():
 
 
 def test_exact_context_and_empty_optional_lists(monkeypatch):
-    monkeypatch.setenv(patch._ENV, "1")
+    monkeypatch.delenv(patch._ENV, raising=False)
     module, block, hidden, batch = _runtime()
     assert patch._eligible(module, block, hidden, batch, False, False)
     batch.lora_ids, batch.mm_inputs = [None] * 4, (None,) * 4
     assert patch._eligible(module, block, hidden, batch, False, False)
+
+
+def test_non_s5000_retains_original_shared_path(monkeypatch):
+    monkeypatch.delenv(patch._ENV, raising=False)
+    monkeypatch.setattr(patch, "is_s5000", lambda device: False)
+    assert not patch._eligible(*_runtime(), False, False)
 
 
 @pytest.mark.parametrize(

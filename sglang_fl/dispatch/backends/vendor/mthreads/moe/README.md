@@ -14,7 +14,7 @@ core files on top; this candidate moves those additions into the plugin:
 
 | Former core change | Plugin owner |
 | --- | --- |
-| `environ.py` capability flag | `impl/fused_moe.py`, reads the existing opt-in environment variable |
+| `environ.py` capability flag | `impl/fused_moe.py`, uses guarded code defaults with environment overrides |
 | MUSA FA3 capture metadata | `patches/fa3_graph_metadata.py` |
 | Triton runner quant-info field | Existing MThreads fused-MoE dispatch, no dataclass ABI change |
 | MoE sequence, M4 scheduling, M16K scratch | `moe/fused_moe.py` |
@@ -45,12 +45,15 @@ The routed adapter rechecks loaded weights rather than caching a capability
 in a core dataclass. A launch/allocation error is propagated, never retried
 against possibly modified in-place inputs.
 
-Retained opt-in controls:
+The following paths are enabled by default under their existing S5000,
+model/shape/dtype/TP guards. They no longer need explicit `=1` exports; each
+variable remains an override (`0`/`off` disables, `auto` uses the default):
 
 - `SGLANG_MUSA_FUSE_MOE_SWIGLU_EPILOGUE=1`: canonical-W13 fused prefill;
   the kernel sequence still disables fusion below 2048 tokens.
 - `SGLANG_MUSA_M4_W13_BN64=1`: exact M4 up tile; original down/alignment config
-  is not modified. The reference also enables the R2 M4 baseline resolver.
+  is not modified. The exact R2 M4 baseline resolver is also on by default;
+  `SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE=0` restores the original resolver.
 - `SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE=1`: reserve the 512 MiB
   fixed M16K routed-down scratch before KV-memory sizing, under the exact
   model/TP2/BF16 guard. The hook runs just before `init_memory_pool`; relative
@@ -58,6 +61,15 @@ Retained opt-in controls:
   inline call and requires checking if that mode is enabled.
 - `SGLANG_MUSA_SHARED_EXPERT_GATE_TAIL_FUSED=1`: narrow text-only M4 decode
   gate-tail path, with the original router, in-place addition and TP collective.
+
+S5000 TP2 custom all-reduce uses 128 MiB by default. Other hardware/group
+sizes retain 512 MiB. Payloads above the bound use the existing collective
+fallback; `SGLANG_MUSA_CUSTOM_AR_MAX_SIZE_MB` overrides capacity explicitly.
+The MUSA YAML includes native `index` and `mul` alongside copy/index-put, so
+an explicit campaign blacklist is unnecessary.
+
+Additional controls:
+
 - `SGLANG_MUSA_FA3_GRAPH_CAPTURE_CAPACITY=0`: diagnostic opt-out of the paged
   graph capacity correction. It is on by default for the supported inherited
   MUSA capture API. Existing backend overrides and changed signatures are

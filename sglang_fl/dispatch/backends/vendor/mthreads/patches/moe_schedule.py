@@ -37,6 +37,8 @@ import os
 from functools import wraps
 from typing import Any, Callable
 
+from ..env import enabled as _env_enabled
+
 logger = logging.getLogger(__name__)
 
 _ENV_NAME = "SGLANG_MUSA_MOE_DECODE_SCHEDULE"
@@ -51,7 +53,7 @@ _prefill_m16k_match_logged = False
 _r2_m4_match_logged = False
 # R2's core M4 BN64 selector requires this original SGLang baseline tile.
 # The August image's TorchAda table instead selects BM128/G64 at M4.
-# Explicit restoration only; do not change any other image table entry.
+# Restore the exact measured shape by default; other table entries are untouched.
 _R2_M4_BASELINE_ENV = "SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE"
 _R2_M4_BASELINE_CONFIG = {
     "BLOCK_SIZE_M": 16,
@@ -199,8 +201,8 @@ def _select_musa_moe_schedule(
     global _r2_m4_match_logged
     # Disabled or non-target calls must reach the original resolver without
     # inspecting its shape objects. Keep these checks per call: the runtime
-    # switches can change after installation, including the independent M4 opt-in.
-    m4_enabled = os.environ.get(_R2_M4_BASELINE_ENV, "0") == "1"
+    # switches can change after installation, including the independent M4 override.
+    m4_enabled = _env_enabled(_R2_M4_BASELINE_ENV, default=True)
     if not (m4_enabled or _enabled() or _prefill_enabled()) or not _on_s5000():
         return None, {}, False
     if not _matches_common_weight_contract(
@@ -222,7 +224,7 @@ def _select_musa_moe_schedule(
         if not _r2_m4_match_logged:
             logger.info(
                 "Restored R2 M4 baseline MoE tile BM16/BN32/BK64/G1; "
-                "W13 BN64 remains a separate core opt-in"
+                "W13 BN64 is selected separately by the guarded plugin implementation"
             )
             _r2_m4_match_logged = True
         # R2 baseline has no independent down schedule. The core uses the
@@ -353,11 +355,16 @@ def _patch_resolver(config_module_name: str, fused_moe_module_name: str) -> bool
 def apply_musa_moe_schedule_patch() -> bool:
     """Patch SGLang/TorchAda config resolvers and already-imported aliases."""
 
-    if not (_enabled() or _prefill_enabled()):
+    if not (
+        _enabled()
+        or _prefill_enabled()
+        or _env_enabled(_R2_M4_BASELINE_ENV, default=True)
+    ):
         logger.info(
-            "MUSA S5000 MoE schedule patch disabled by %s and %s",
+            "MUSA S5000 MoE schedule patch disabled by %s, %s and %s",
             _ENV_NAME,
             _PREFILL_ENV_NAME,
+            _R2_M4_BASELINE_ENV,
         )
         return False
 

@@ -1,5 +1,5 @@
-# MUSA Qwen3.6 candidate smoke case. Opt-in features are supplied by the
-# validation command, not by platform-wide env_defaults. See tests/musa/README.md.
+# MUSA Qwen3.6 candidate smoke case. Guarded plugin paths select by default.
+# The validation command separately exercises decode combine. See tests/musa/README.md.
 llm:
   model: "/data/models/Qwen/Qwen3.6-35B-A3B"
   tp_size: 2

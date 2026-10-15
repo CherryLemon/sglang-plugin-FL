@@ -30,6 +30,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from sglang_fl.dispatch.backends.vendor.mthreads import env as musa_env
+
 _SOURCE = (
     Path(__file__).resolve().parents[4]
     / "sglang_fl/dispatch/backends/vendor/mthreads/jit_custom_ar/communicator.py"
@@ -177,6 +179,7 @@ def _load_communicator():
     fake_csrc.allreduce = fake_jit_ar
 
     stubs = {
+        "sglang_fl.dispatch.backends.vendor.mthreads.env": musa_env,
         "sglang": _module("sglang"),
         "sglang.srt": _module("sglang.srt"),
         "sglang.srt.compilation": _module("sglang.srt.compilation"),
@@ -316,6 +319,26 @@ class TestGraphRankDataLayout(unittest.TestCase):
         self.assertEqual(
             allocations, [128 + 512 * 1024 * 1024, 512 * 1024 * 1024]
         )
+
+    def test_s5000_tp2_default_and_explicit_workspace_override(self):
+        with mock.patch.object(COMMUNICATOR, "is_s5000", return_value=True):
+            allocations = []
+            comm = _make_communicator(allocation_sizes=allocations)
+            self.assertEqual(comm.max_size, 128 * 1024 * 1024)
+            self.assertEqual(allocations, [128 + 128 * 1024 * 1024, 128 * 1024 * 1024])
+            large = _FakeTensor((32769, 2048), dtype=COMMUNICATOR.torch.bfloat16)
+            self.assertFalse(comm.should_custom_ar(large))
+            overridden = _make_communicator(max_size=256 * 1024 * 1024)
+            self.assertEqual(overridden.max_size, 256 * 1024 * 1024)
+            self.assertTrue(overridden.should_custom_ar(large))
+
+    def test_s5000_larger_group_retains_broad_workspace(self):
+        with (
+            mock.patch.object(COMMUNICATOR, "is_s5000", return_value=True),
+            mock.patch.object(COMMUNICATOR.dist, "get_world_size", return_value=4),
+        ):
+            comm = _make_communicator()
+        self.assertEqual(comm.max_size, 512 * 1024 * 1024)
 
     def test_factory_opt_in_128(self):
         env_name = COMMUNICATOR._MUSA_CUSTOM_AR_MAX_SIZE_MB_ENV

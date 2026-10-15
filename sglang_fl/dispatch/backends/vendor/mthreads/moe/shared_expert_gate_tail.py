@@ -1,9 +1,9 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Opt-in MUSA shared-expert gate-tail fusion.
+"""Guarded MUSA shared-expert gate-tail fusion.
 
-The plugin's guarded shared-expert hook integrates this default-off kernel
+The plugin's guarded shared-expert hook integrates this default-on kernel
 for the small, bias-free shared-expert gate used by the
 Qwen3.6 product shape (M=4, H=2048):
 
@@ -28,10 +28,11 @@ production calls leave both unset, so no debug stores are emitted.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn.functional as F
+
+from ..env import enabled as _enabled
+from ..env import is_s5000
 
 try:  # Importing this module must remain possible in CPU-only tests.
     import triton
@@ -48,12 +49,7 @@ BLOCK_H = 256
 
 
 def _env_enabled() -> bool:
-    return os.environ.get(FUSE_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return _enabled(FUSE_ENV, default=True)
 
 
 def _capture_active(device: torch.device) -> bool:
@@ -122,8 +118,7 @@ def candidate_guard_reason(
 
     The reasons are intentionally conservative and stable enough for a
     harness to record.  ``enabled`` is injectable for CPU policy tests; the
-    production default is the environment variable above, whose default is
-    disabled.
+    production default enables the guarded S5000 path unless explicitly disabled.
     """
 
     if enabled is None:
@@ -219,6 +214,8 @@ def candidate_guard_reason(
 
     if hidden.device.type != "musa":
         return "device_not_musa"
+    if not is_s5000(hidden.device):
+        return "device_not_s5000"
     return "eligible"
 
 

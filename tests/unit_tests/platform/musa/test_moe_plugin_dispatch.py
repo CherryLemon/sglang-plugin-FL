@@ -1,6 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 from types import SimpleNamespace as NS
 
 import pytest
@@ -183,6 +184,60 @@ def test_cpu_falls_back_even_when_requested(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("tokens", [4, 2048, 16384])
+def test_guarded_moe_is_selected_without_launch_controls(monkeypatch, tokens):
+    for name in ("SGLANG_MUSA_FUSE_MOE_SWIGLU_EPILOGUE", "SGLANG_MUSA_M4_W13_BN64"):
+        monkeypatch.delenv(name, raising=False)
+
+    class MusaTensor(torch.Tensor):
+        @property
+        def device(self):
+            return NS(type="musa", index=0)
+
+    class Method:
+        pass
+
+    contract, layer, args, a2a = _contract()
+    method = Method()
+    method.__dict__.update(vars(contract))
+    hidden = torch.zeros(tokens, 2048, dtype=torch.bfloat16).as_subclass(MusaTensor)
+    weights = _tensor((tokens, 8), torch.float32)
+    ids = _tensor((tokens, 8), torch.int32)
+    output = NS(hidden_states=hidden, topk_output=(weights, ids, None))
+    calls, result = [], object()
+
+    def fused_experts(**kwargs):
+        calls.append(kwargs)
+        return result
+
+    modules = {
+        "sglang.srt.layers.moe.token_dispatcher.standard": NS(StandardCombineInput=NS),
+        "sglang.srt.layers.moe.topk": NS(
+            TopKOutputChecker=NS(format_is_standard=lambda output: True)
+        ),
+        "sglang.srt.layers.moe.utils": NS(get_moe_a2a_backend=lambda: a2a),
+        "sglang.srt.layers.quantization.unquant": NS(UnquantizedFusedMoEMethod=Method),
+        "sglang.srt.server_args": NS(get_global_server_args=lambda: args),
+        "sglang_fl.dispatch.backends.vendor.mthreads.moe.fused_moe": NS(
+            fused_experts=fused_experts
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(dispatch, "_is_s5000", lambda device: True)
+    with torch.no_grad():
+        assert dispatch.maybe_forward(method, layer, output).hidden_states is result
+        assert len(calls) == 1 and calls[0]["fuse_swiglu_epilogue"] is True
+        monkeypatch.setattr(dispatch, "_is_s5000", lambda device: False)
+        assert dispatch.maybe_forward(method, layer, output) is None
+        assert len(calls) == 1
+        monkeypatch.setattr(dispatch, "_is_s5000", lambda device: True)
+        monkeypatch.setenv("SGLANG_MUSA_FUSE_MOE_SWIGLU_EPILOGUE", "off")
+        monkeypatch.setenv("SGLANG_MUSA_M4_W13_BN64", "0")
+        assert dispatch.maybe_forward(method, layer, output) is None
+        assert len(calls) == 1
+
+
 def test_dispatch_hit_and_kernel_error_are_not_retried(monkeypatch):
     def forbidden(*args):
         pytest.fail("native fallback must not run after a candidate hit")
@@ -214,7 +269,7 @@ def test_workspace_precedes_memory_measurement_and_preserves_parent(monkeypatch)
         pass
 
     original = Parent.init_memory_pool
-    monkeypatch.setenv("SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE", "1")
+    monkeypatch.delenv("SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE", raising=False)
     monkeypatch.setattr(
         moe_workspace, "_reserve", lambda r: events.append(("reserve", r))
     )
@@ -255,3 +310,8 @@ def test_workspace_unknown_abi_does_not_patch():
     original = Runner.init_memory_pool
     assert not moe_workspace._patch_runner(Runner)
     assert Runner.init_memory_pool is original
+
+
+def test_non_s5000_workspace_skips_kernel_import(monkeypatch):
+    monkeypatch.setattr(moe_workspace, "is_s5000", lambda device: False)
+    assert not moe_workspace._reserve(NS(device="cpu"))

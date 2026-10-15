@@ -90,8 +90,8 @@ def _matches_inputs(layer, hidden, topk_weights, topk_ids):
 
 def maybe_forward(method, layer, dispatch_output):
     """Return a StandardCombineInput on a hit; None leaves forward_musa intact."""
-    fused = _enabled("SGLANG_MUSA_FUSE_MOE_SWIGLU_EPILOGUE")
-    m4 = _enabled("SGLANG_MUSA_M4_W13_BN64")
+    fused = _enabled("SGLANG_MUSA_FUSE_MOE_SWIGLU_EPILOGUE", default=True)
+    m4 = _enabled("SGLANG_MUSA_M4_W13_BN64", default=True)
     if not (fused or m4):
         return None
     hidden = getattr(dispatch_output, "hidden_states", None)

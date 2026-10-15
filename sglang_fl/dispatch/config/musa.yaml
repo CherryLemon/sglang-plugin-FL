@@ -29,6 +29,10 @@ flagos_blacklist:
   # long-prefill traces.  The native MUSA path is faster after its one-time
   # shape specialization and also improves the graph-captured decode path.
   - copy_
+  # Retain the campaign's native gather/multiply choices without requiring
+  # a launch-time blacklist override that replaces this entire YAML list.
+  - index
+  - mul
   # FlagGems' generated index-put kernel is especially slow for the large
   # prefill KV-cache writes used by Qwen3.6 on S5000.  Keep all three ATen
   # entry points on the native MUSA implementation so indexing syntax,

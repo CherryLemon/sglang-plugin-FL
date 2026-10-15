@@ -37,26 +37,15 @@ actually ran; a skip on a CPU host is not GPU acceptance.
 
 ## TP2 full-graph model smoke
 
-Use these candidate controls in the candidate runtime only. Apply the retained
+Use this additional correctness control in the candidate runtime only. Apply the retained
 reference's own launch environment when collecting reference records. Keep the
 same physical cards, model weights, memory fraction and request protocol for
 both arms.
 
 ```bash
-export SGLANG_FL_FLAGOS_BLACKLIST=mul,sort
-export SGLANG_MUSA_MATE_GDN=auto
-export SGLANG_MUSA_MATE_GDN_PREFILL=auto
-export SGLANG_MUSA_TOPK_SCHEDULE=auto
-export SGLANG_MUSA_MOE_DECODE_SCHEDULE=auto
-export SGLANG_MUSA_MOE_PREFILL_SCHEDULE=auto
-export SGLANG_MUSA_FUSE_MOE_SWIGLU_EPILOGUE=1
-export SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE=1
-export SGLANG_MUSA_M4_W13_BN64=1
-export SGLANG_MUSA_M16K_MOE_PREALLOCATE_DOWN_WORKSPACE=1
-export SGLANG_MUSA_SHARED_EXPERT_GATE_TAIL_FUSED=1
-export SGLANG_MUSA_DETERMINISTIC_MOE_COMBINE=auto
+# Plugin optimizations select automatically under their hardware/model guards.
+# Exercise the independently gated decode-combine path in this correctness run.
 export SGLANG_MUSA_DETERMINISTIC_MOE_COMBINE_DECODE_GRAPH=1
-export SGLANG_MUSA_CUSTOM_AR_FUSED_RMSNORM=1
 
 python tests/run.py --platform musa --device s5000 --scope e2e \
   --model qwen3_6 --case 35b_a3b_tp2_graph --task concurrent
@@ -185,11 +174,25 @@ Historical benchmark detail and previous local checks are preserved in the
 See [the evidence summary](acceptance_20260920.md) for tested identities, C4
 findings, dependency hashes and limits.
 
-`qwen36_perf.env` retains the opt-in runtime controls for reproducing the
-campaign configuration, now without eventfd. Set the model path, visible
-devices, communication interface and isolated patched MATE path separately.
-The explicit environment blacklist replaces the YAML list. Its filename and
-historical origin do not establish current performance acceptance.
+The plugin selects the guarded S5000 MoE/SwiGLU, M4 W13 tile, M4 baseline
+schedule, shared gate-tail and pre-KV M16K workspace without launch-time opt-ins.
+Explicit `0`/`off` overrides remain available for diagnostics; `auto` follows
+the code default. Model/shape/dtype/TP and common dispatch-policy guards still
+apply. Unsupported hardware stays on the existing fallback. S5000 TP2 custom
+all-reduce defaults to 128 MiB; other hardware/group sizes retain 512 MiB.
+Larger inputs use the existing collective fallback, and
+`SGLANG_MUSA_CUSTOM_AR_MAX_SIZE_MB` remains an explicit capacity override.
+The MUSA YAML includes the campaign's native `index`/`mul` exclusions, so no
+explicit blacklist is needed. An environment blacklist still replaces that list.
+Decode-graph combine remains off by default, matching the performance profile;
+the correctness command above enables it only to exercise that separate path.
+
+`qwen36_perf.env` now retains only compatibility/deployment settings for the
+pinned vendor core and MATE. Set the model path, visible devices, communication
+interface and isolated patched MATE path separately. Source it only when
+reproducing that runtime; it is not required to enable plugin optimizations.
+These new defaults require S5000 revalidation just like the dispatch refactor;
+the filename and historical origin do not establish current performance acceptance.
 
 On the target image, verify common dispatch preference/per-op/vendor filters
 for `fused_moe`, `shared_expert_gate_tail`, `moe_sum_reduce` and

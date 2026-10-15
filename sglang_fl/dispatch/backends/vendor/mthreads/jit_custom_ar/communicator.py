@@ -21,6 +21,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.environ import envs
+from sglang_fl.dispatch.backends.vendor.mthreads.env import is_s5000
 from sglang_fl.dispatch.backends.vendor.mthreads.jit_custom_ar.fused_rmsnorm import (
     MusaJitCustomAllreduceRMSNorm,
 )
@@ -366,10 +367,9 @@ class CustomAllreduce:
 
 class MusaJitCustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
-    # Keep the broad 512 MiB default for other users/shapes.  The
-    # Qwen3.6-35B-A3B 16K/TP2 experiment opts into a smaller value through the
-    # factory below so this optimization cannot silently shrink unrelated
-    # custom-AR inputs.
+    # S5000 TP2 defaults to the measured 128 MiB bound. Other hardware and
+    # group sizes retain 512 MiB; larger payloads use the existing collective
+    # fallback, or operators can explicitly increase the workspace.
     _MAX_CAR_SIZE = 512 * 1024 * 1024
     _RANK_DATA_WIDTH = 8
     _RANK_DATA_ELEMENT_SIZE = ctypes.sizeof(ctypes.c_int64)
@@ -398,7 +398,7 @@ class MusaJitCustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=_MAX_CAR_SIZE,
+        max_size=None,
     ) -> None:
         self.disabled = True
         self.original_disabled = True
@@ -445,6 +445,18 @@ class MusaJitCustomAllreduce:
 
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
+        if max_size is None:
+            max_size = (
+                128 * 1024 * 1024
+                if self.world_size == 2 and is_s5000(device)
+                else self._MAX_CAR_SIZE
+            )
+        self.max_size = max_size
+        logger.info(
+            "MUSA JIT custom allreduce workspace max_size_bytes=%d world_size=%d",
+            max_size,
+            self.world_size,
+        )
         if self.world_size not in self._SUPPORTED_WORLD_SIZES:
             return
 
@@ -1183,9 +1195,7 @@ _MUSA_CUSTOM_AR_MAX_SIZE_MB = 512
 def _musa_custom_ar_max_size_from_env() -> Optional[int]:
     """Return an explicit MUSA custom-AR workspace bound, if configured.
 
-    The class default intentionally remains broad because this communicator is
-    also used by workloads whose payloads exceed the Qwen3.6 16K bound.  The
-    smaller workspace is therefore an opt-in factory setting.  Parse the
+    An absent override defers to the hardware/group-specific class policy. Parse the
     environment without trimming or accepting signs/decimal/Unicode digits so
     malformed values fail before a communicator allocates either workspace.
     """
@@ -1218,26 +1228,21 @@ def _musa_custom_ar_max_size_from_env() -> Optional[int]:
 def musa_custom_allreduce_factory():
     """Return the MUSA custom-AR constructor with its validated workspace.
 
-    An absent environment variable returns the class itself, preserving the
-    communicator's 512 MiB default.  An explicit value returns a partial with
+    An absent environment variable returns the class itself, selecting 128 MiB
+    on S5000 TP2 and 512 MiB otherwise. An explicit value returns a partial with
     the validated byte bound.  Logging the effective bytes makes the selected
     capacity visible in startup provenance without logging arbitrary input.
     """
 
     max_size = _musa_custom_ar_max_size_from_env()
     if max_size is None:
-        max_size = MusaJitCustomAllreduce._MAX_CAR_SIZE
-        source = "class-default"
-        constructor = MusaJitCustomAllreduce
-    else:
-        source = f"env:{_MUSA_CUSTOM_AR_MAX_SIZE_MB_ENV}"
-        constructor = partial(MusaJitCustomAllreduce, max_size=max_size)
+        return MusaJitCustomAllreduce
     logger.info(
         "MUSA JIT custom allreduce workspace max_size_bytes=%d source=%s",
         max_size,
-        source,
+        f"env:{_MUSA_CUSTOM_AR_MAX_SIZE_MB_ENV}",
     )
-    return constructor
+    return partial(MusaJitCustomAllreduce, max_size=max_size)
 
 
 def dispatch_custom_allreduce():

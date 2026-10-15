@@ -15,8 +15,9 @@ import triton.language as tl
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe as _core
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
+from ..env import enabled as _enabled
+from ..env import is_s5000
 from .kernels import invoke_fused_moe_kernel
 
 if TYPE_CHECKING:
@@ -118,11 +119,11 @@ def _maybe_select_musa_m4_w13_bn64_config(
     fused_moe_sum_all_reduce: bool,
     grad_disabled: bool,
 ) -> Dict[str, Any]:
-    """Return an opt-in M4 W13 tile copy without changing the down config.
+    """Return the guarded M4 W13 tile copy without changing the down config.
 
     The selector is deliberately stricter than the kernel's general dtype and
-    routing contract.  It is a source-only diagnostic for the exact BF16
-    Qwen M4 shape; all unsupported features retain the resolver's object.
+    routing contract. It targets the exact BF16 Qwen M4 shape; all unsupported
+    features retain the resolver's object.
     Only ``BLOCK_SIZE_N`` is changed in the returned copy, so explicit or
     implicit warp/stage values and any future config keys survive unchanged.
     """
@@ -189,12 +190,12 @@ def maybe_preallocate_musa_m16k_moe_down_workspace(
     The persistent allocation follows the same lifetime ordering used by
     upstream workspace managers: account for process-lifetime scratch before
     the large KV backing allocation, then reuse a fixed-address tensor across
-    sequential MoE layers and graph replays.  Keep the experiment opt-in and
-    exact-model gated while its capacity and graph contracts are validated.
+    sequential MoE layers and graph replays. The S5000/model/TP2/BF16 guards
+    scope the default allocation; an explicit environment override disables it.
     """
     global _MUSA_M16K_MOE_DOWN_WORKSPACE
 
-    if not get_bool_env_var(_MUSA_M16K_MOE_DOWN_WORKSPACE_ENV):
+    if not _enabled(_MUSA_M16K_MOE_DOWN_WORKSPACE_ENV, default=True):
         return False
 
     text_config = getattr(model_config, "hf_text_config", None)
@@ -206,6 +207,7 @@ def maybe_preallocate_musa_m16k_moe_down_workspace(
     )
     matches = (
         _is_musa
+        and is_s5000(device)
         and not is_draft_worker
         and tp_size == 2
         and moe_ep_size == 1
@@ -833,7 +835,7 @@ def _fused_moe_kernel_sequence(
     if use_fused_swiglu_epilogue:
         up_config = dict(config)
         up_config["BLOCK_SIZE_K"] = _MUSA_FUSED_SWIGLU_UP_BLOCK_SIZE_K
-    elif _is_musa and num_tokens == 4 and get_bool_env_var(_MUSA_M4_W13_BN64_ENV):
+    elif _is_musa and num_tokens == 4 and _enabled(_MUSA_M4_W13_BN64_ENV, default=True):
         up_config = _maybe_select_musa_m4_w13_bn64_config(
             config,
             enabled=True,
@@ -1215,7 +1217,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        ), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
