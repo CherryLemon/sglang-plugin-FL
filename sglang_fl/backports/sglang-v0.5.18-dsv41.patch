@@ -17387,10 +17387,20 @@ index 4ecce20b63..e35ab05267 100644
  
          else:
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-index 9939f37508..ae5f42be39 100644
+index 9939f37508..2f692e3387 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-@@ -138,6 +138,10 @@ class TargetVerifyExecutor:
+@@ -40,6 +40,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
+     VerifyWindow,
+     apply_logits_adjustments_strided,
+ )
++from sglang.srt.speculative.dspark_components.tp_sync import (
++    sync_speculative_decision,
++)
+ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+ from sglang.srt.speculative.spec_utils import (
+     SIMULATE_ACC_METHOD,
+@@ -138,6 +141,10 @@ class TargetVerifyExecutor:
                  bs=bs, dtype=correct_len.dtype, device=correct_len.device
              )
  
@@ -17401,7 +17411,7 @@ index 9939f37508..ae5f42be39 100644
          finalized = FinalizeAcceptLens.execute(
              correct_len=correct_len,
              cap_trim_lens=cap_trim_lens,
-@@ -468,6 +472,7 @@ class CommitInjectCtx(msgspec.Struct):
+@@ -468,6 +475,7 @@ class CommitInjectCtx(msgspec.Struct):
      block_pos_offsets: torch.Tensor
      resolve_pool: object
      resolve_req_to_token: object
@@ -17409,7 +17419,7 @@ index 9939f37508..ae5f42be39 100644
  
  
  class AcceptOuts(msgspec.Struct):
-@@ -518,9 +523,13 @@ class DsparkVerifyEpilogue:
+@@ -518,9 +526,13 @@ class DsparkVerifyEpilogue:
          )
          self.strided_logits: Optional[torch.Tensor] = None
          self.strided_hidden: Optional[torch.Tensor] = None
@@ -17424,7 +17434,7 @@ index 9939f37508..ae5f42be39 100644
              return
          if (
              not isinstance(out, LogitsProcessorOutput)
-@@ -528,6 +537,9 @@ class DsparkVerifyEpilogue:
+@@ -528,6 +540,9 @@ class DsparkVerifyEpilogue:
              or out.hidden_states is None
          ):
              return
@@ -17434,7 +17444,7 @@ index 9939f37508..ae5f42be39 100644
          self(
              compact_logits=out.next_token_logits,
              compact_hidden=out.hidden_states,
-@@ -538,6 +550,7 @@ class DsparkVerifyEpilogue:
+@@ -538,6 +553,7 @@ class DsparkVerifyEpilogue:
          )
  
      def begin_step(self, verify_lens, armed: bool) -> None:
@@ -17442,7 +17452,7 @@ index 9939f37508..ae5f42be39 100644
          if verify_lens is None:
              self.verify_lens_buf.zero_()
          else:
-@@ -547,6 +560,50 @@ class DsparkVerifyEpilogue:
+@@ -547,6 +563,50 @@ class DsparkVerifyEpilogue:
                  self.verify_lens_buf[bs:].zero_()
          self.inject_gate_buf.fill_(1 if armed else 0)
  
@@ -17493,7 +17503,7 @@ index 9939f37508..ae5f42be39 100644
      def read_accept(self, bs: int) -> AcceptOuts:
          return AcceptOuts(
              correct_len=self.correct_len_buf[:bs],
-@@ -598,7 +655,23 @@ class DsparkVerifyEpilogue:
+@@ -598,7 +658,23 @@ class DsparkVerifyEpilogue:
          self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
          verify_lens = self.verify_lens_buf[:bs]
          self._scatter(compact_logits, compact_hidden, verify_lens, bs)
@@ -17518,7 +17528,7 @@ index 9939f37508..ae5f42be39 100644
          if self.folds_commit:
              self._commit_inject(
                  commit_lens, verify_lens, seq_lens, req_pool_indices, bs
-@@ -620,30 +693,27 @@ class DsparkVerifyEpilogue:
+@@ -620,30 +696,27 @@ class DsparkVerifyEpilogue:
              fill_value=0.0,
          )
  
