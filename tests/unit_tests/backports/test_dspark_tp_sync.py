@@ -51,9 +51,14 @@ def test_sync_uses_the_replica_group(source, dp_attention, size):
         attn_tp_group=group("attention"),
         tp_group=group("tensor"),
     )
-    sync = function(source, "tp_sync.py", "sync_speculative_decision", {
-        "get_parallel": lambda: parallel,
-    })
+    sync = function(
+        source,
+        "tp_sync.py",
+        "sync_speculative_decision",
+        {
+            "get_parallel": lambda: parallel,
+        },
+    )
     values = torch.tensor([3, 9])
     assert sync(values) is values
     expected = [("attention" if dp_attention else "tensor", 0)] if size > 1 else []
@@ -134,12 +139,17 @@ def test_accept_sync_precedes_kv_commit(source):
         assert kw["correct_len"].item() == 2
         assert kw["cap_trim_lens"].item() == 5
         commit = kw["correct_len"] + 1
-        return NS(cap_trim_lens=kw["cap_trim_lens"], commit_lens=commit,
-                  new_seq_lens=kw["prefix_lens"] + commit)
+        return NS(
+            cap_trim_lens=kw["cap_trim_lens"],
+            commit_lens=commit,
+            new_seq_lens=kw["prefix_lens"] + commit,
+        )
 
     ns = {
         "sync_speculative_decision": sync,
-        "accept_draft_tokens": lambda **kw: tuple(torch.tensor([x]) for x in [0, 12, 6]),
+        "accept_draft_tokens": lambda **kw: tuple(
+            torch.tensor([x]) for x in [0, 12, 6]
+        ),
         "FinalizeAcceptLens": NS(execute=finalize),
         "BuildOutTokens": NS(execute=lambda **kw: kw["bonus"]),
         "AcceptOuts": NS,
@@ -147,9 +157,16 @@ def test_accept_sync_precedes_kv_commit(source):
     accept = function(source, "dspark_verify.py", "accept_and_finalize", ns)
     output = accept(
         NS(_simulate_acc_len=0, gamma=5, verify_num_draft_tokens=6),
-        folded_accept=False, bs=1, verify_ids_2d=None, target_logits=None,
-        draft_block=None, sampling_info=None, draft_input=None, layout=None,
-        prefix_lens=torch.tensor([100]), draft_tokens=None,
+        folded_accept=False,
+        bs=1,
+        verify_ids_2d=None,
+        target_logits=None,
+        draft_block=None,
+        sampling_info=None,
+        draft_input=None,
+        layout=None,
+        prefix_lens=torch.tensor([100]),
+        draft_tokens=None,
     )
     assert output.bonus.item() == 42
     assert output.commit_lens.item() == 3

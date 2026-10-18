@@ -17174,7 +17174,7 @@ index 5c4f3ff44a..d116dfe10b 100644
              validate_deepseek_v4_mega_moe_token_budget(self)
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
-index 2fd55f221d..3b23bcf9a2 100644
+index 2fd55f221d..41ceb857ac 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 @@ -27,8 +27,13 @@ from sglang.srt.speculative.spec_info import (
@@ -17200,31 +17200,37 @@ index 2fd55f221d..3b23bcf9a2 100644
  
      else:
  
-@@ -134,12 +139,12 @@ def sample_draft_block(
+@@ -134,11 +139,13 @@ def sample_draft_block(
                  exp_noise = torch.empty(
                      step_logits.shape, dtype=torch.float32, device=step_logits.device
                  ).exponential_(1)
 -                return SampleStepTokens.execute(
-+                return sync_speculative_decision(SampleStepTokens.execute(
-                     step_logits=step_logits,
-                     temperatures=temperatures,
-                     greedy_mask=greedy_mask,
-                     exp_noise=exp_noise,
--                )
-+                ))
+-                    step_logits=step_logits,
+-                    temperatures=temperatures,
+-                    greedy_mask=greedy_mask,
+-                    exp_noise=exp_noise,
++                return sync_speculative_decision(
++                    SampleStepTokens.execute(
++                        step_logits=step_logits,
++                        temperatures=temperatures,
++                        greedy_mask=greedy_mask,
++                        exp_noise=exp_noise,
++                    )
+                 )
              else:
                  probs = torch.softmax(
-                     step_logits.float() / temperatures[:, None], dim=-1
-@@ -147,7 +152,7 @@ def sample_draft_block(
+@@ -147,7 +154,9 @@ def sample_draft_block(
                  probs = expect(_DRAFT_PROBS, probs)
                  argmax_tokens = torch.argmax(step_logits, dim=-1)
                  sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
 -                return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
-+                return sync_speculative_decision(torch.where(greedy_mask, argmax_tokens, sampled_tokens))
++                return sync_speculative_decision(
++                    torch.where(greedy_mask, argmax_tokens, sampled_tokens)
++                )
  
      draft_tokens, corrected_logits = markov_head.sample_block(
          base_logits,
-@@ -303,7 +308,7 @@ class DraftBlockProposer:
+@@ -303,7 +312,7 @@ class DraftBlockProposer:
              spec_info=self._draft_block_spec_info,
              capture_hidden_mode=CaptureHiddenMode.NULL,
          )
@@ -17233,16 +17239,15 @@ index 2fd55f221d..3b23bcf9a2 100644
          with torch.inference_mode():
              self.draft_model_runner.forward(idle_batch)
  
-@@ -348,7 +353,7 @@ class DraftBlockProposer:
+@@ -348,7 +357,6 @@ class DraftBlockProposer:
          else:
              raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
  
 -        draft_num_tokens = bs * gamma
-+
          draft_forward_batch = ForwardBatch(
              forward_mode=ForwardMode.TARGET_VERIFY,
              batch_size=bs,
-@@ -363,16 +368,9 @@ class DraftBlockProposer:
+@@ -363,16 +371,9 @@ class DraftBlockProposer:
              spec_algorithm=SpeculativeAlgorithm.DSPARK,
              spec_info=self._draft_block_spec_info,
              capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -17261,7 +17266,7 @@ index 2fd55f221d..3b23bcf9a2 100644
              draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
          with torch.inference_mode():
              draft_out = self.draft_model_runner.forward(draft_forward_batch)
-@@ -388,36 +386,48 @@ class DraftBlockProposer:
+@@ -388,36 +389,48 @@ class DraftBlockProposer:
              can_run_graph=draft_out.can_run_graph,
          )
  
@@ -17339,7 +17344,7 @@ index 2fd55f221d..3b23bcf9a2 100644
 +            ).to(device, non_blocking=True)
 +        return can_run_graph
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
-index 4ecce20b63..2b792edc8e 100644
+index 4ecce20b63..e35ab05267 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
 @@ -11,6 +11,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
@@ -17362,21 +17367,25 @@ index 4ecce20b63..2b792edc8e 100644
  
  
  class DsparkDraftSampler:
-@@ -103,12 +107,12 @@ class DsparkDraftSampler:
+@@ -103,11 +107,13 @@ class DsparkDraftSampler:
                  # In-graph philox noise: each replay advances the generator
                  # and redraws.
                  noise = self.exp_noise[:bs].exponential_()
 -                return SampleStepTokens.execute(
-+                return sync_speculative_decision(SampleStepTokens.execute(
-                     step_logits=step_logits,
-                     temperatures=self.temperatures[:bs],
-                     greedy_mask=self.greedy_mask[:bs],
-                     exp_noise=noise,
--                )
-+                ))
+-                    step_logits=step_logits,
+-                    temperatures=self.temperatures[:bs],
+-                    greedy_mask=self.greedy_mask[:bs],
+-                    exp_noise=noise,
++                return sync_speculative_decision(
++                    SampleStepTokens.execute(
++                        step_logits=step_logits,
++                        temperatures=self.temperatures[:bs],
++                        greedy_mask=self.greedy_mask[:bs],
++                        exp_noise=noise,
++                    )
+                 )
  
          else:
-             sampler = greedy_step_sampler
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 index 9939f37508..ae5f42be39 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
