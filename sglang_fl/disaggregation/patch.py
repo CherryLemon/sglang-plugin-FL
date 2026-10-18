@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ _BACKEND_NAME = "flagcx"
 # Marker attribute set on our wrapper so re-applying is a no-op instead of
 # stacking wrappers on top of each other.
 _PATCH_MARKER = "_sglang_fl_flagcx_patched"
+_native_protocol = False
 
 
 def _inject_enum_member(cls, name: str, value):
@@ -85,6 +87,11 @@ def _flagcx_class_mapping(class_type):
     from sglang.srt.disaggregation.base import KVArgs
     from sglang.srt.disaggregation.utils import KVClassType
 
+    if _native_protocol:
+        from .native import class_mapping
+
+        return class_mapping(class_type)
+
     from sglang_fl.disaggregation import (
         FlagcxKVBootstrapServer,
         FlagcxKVManager,
@@ -132,8 +139,14 @@ def _patch_get_kv_class() -> None:
     logger.debug("flagcx get_kv_class patched on: %s", patched)
 
 
-def apply_disaggregation_patch() -> None:
+def apply_disaggregation_patch(*, native_protocol: bool = False) -> None:
     """Register the FlagCX transfer backend with SGLang. Idempotent."""
+    global _native_protocol
+    _native_protocol = (
+        _native_protocol
+        or native_protocol
+        or os.getenv("SGLANG_FL_FLAGCX_NATIVE_PROTOCOL") == "1"
+    )
     _add_backend_choice()
     _add_enum_member()
     _patch_get_kv_class()

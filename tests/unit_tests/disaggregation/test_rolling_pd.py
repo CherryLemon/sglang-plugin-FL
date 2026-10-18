@@ -6,7 +6,7 @@ import unittest
 
 spec = spec_from_file_location(
     "rolling",
-    Path(__file__).parents[3] / "sglang_fl/dsv41_runtime/flagcx_pd/rolling.py",
+    Path(__file__).parents[3] / "sglang_fl/disaggregation/rolling.py",
 )
 rolling = module_from_spec(spec)
 spec.loader.exec_module(rolling)
