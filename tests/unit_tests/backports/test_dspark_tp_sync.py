@@ -1,7 +1,7 @@
 """CPU contracts for the applied DSpark backport, independent of GPU kernels."""
 
 import ast
-import importlib.util
+from importlib.machinery import PathFinder
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -11,7 +11,7 @@ import torch
 
 @pytest.fixture
 def source():
-    spec = importlib.util.find_spec("sglang")
+    spec = PathFinder.find_spec("sglang")
     if spec is None:
         pytest.skip("SGLang source is required")
     root = Path(spec.origin).parent / "srt/speculative/dspark_components"
