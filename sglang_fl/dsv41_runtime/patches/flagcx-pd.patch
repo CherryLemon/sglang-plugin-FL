@@ -1,53 +1,23 @@
 --- a/sglang/srt/disaggregation/utils.py
 +++ b/sglang/srt/disaggregation/utils.py
-@@ -613,6 +613,7 @@
- 
- class TransferBackend(Enum):
-     MOONCAKE = "mooncake"
+@@ -615,0 +616 @@
 +    FLAGCX = "flagcx"
-     MORI = "mori"
-     NIXL = "nixl"
-     ASCEND = "ascend"
-@@ -657,6 +658,11 @@
-     # Every backend shares the same KVArgs container.
-     if class_type == KVClassType.KVARGS:
-         return KVArgs
+@@ -659,0 +661,5 @@
 +
 +    if transfer_backend == TransferBackend.FLAGCX:
 +        from sglang_fl.dsv41_runtime.flagcx_pd import classes, load_plugin
 +        load_plugin()
 +        return classes(class_type)
- 
-     if transfer_backend == TransferBackend.MOONCAKE:
-         from sglang.srt.disaggregation.mooncake import (
 --- a/sglang/srt/arg_groups/deepseek_v4_hook.py
 +++ b/sglang/srt/arg_groups/deepseek_v4_hook.py
-@@ -265,8 +265,8 @@
-                 "--dsv41-encoder-only-prefill requires --disaggregation-mode "
-                 "prefill or decode"
-             )
+@@ -268,2 +268,2 @@
 -        if cfg.disaggregation_transfer_backend != "mooncake":
 -            raise ValueError("--dsv41-encoder-only-prefill currently requires Mooncake")
 +        if cfg.disaggregation_transfer_backend not in ("mooncake", "flagcx"):
 +            raise ValueError("--dsv41-encoder-only-prefill requires Mooncake or FlagCX")
-         if not getattr(hf_config, "hc_pre_from_prev_sublayer", False):
-             raise ValueError(
-                 "--dsv41-encoder-only-prefill requires the official shifted "
-@@ -407,7 +407,7 @@
- 
-         if (
-             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+@@ -410 +410 @@
 -            or cfg.disaggregation_transfer_backend != "mooncake"
 +            or cfg.disaggregation_transfer_backend not in ("mooncake", "flagcx")
-             or (
-                 (cfg.dp_size != 1 or cfg.enable_dp_attention)
-                 and not allow_decode_config(cfg)
-@@ -417,7 +417,7 @@
-             or cfg.enable_prefill_context_parallel
-         ):
-             raise ValueError(
+@@ -420 +420 @@
 -                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
 +                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or FlagCX, "
-                 "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                 "block size and TP size."
-             )

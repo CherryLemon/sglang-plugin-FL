@@ -2,7 +2,7 @@
   "schema": 1,
   "flag_gems": {
     "repository": "https://github.com/CherryLemon/FlagGems",
-    "revision": "6b9859855b13f2664261c1eac19c5ae57c9466dd",
+    "revision": "6720f4f11c4f345d5866114ea402caa5e7faba83",
     "pull_requests": [
       6631,
       6684
@@ -12,7 +12,8 @@
   "flaggems_sglang": {
     "repository": "https://github.com/CherryLemon/FlagGems-sglang",
     "branch": "feat/dsv41-h100-operators",
-    "pull_request": 161
+    "pull_request": 161,
+    "revision": "077fcb4c9f7f36e3262898cc2484b860ad4bf843"
   },
   "flagcx": {
     "repository": "https://github.com/flagos-ai/FlagCX",

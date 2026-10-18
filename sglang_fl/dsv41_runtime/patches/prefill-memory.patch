@@ -1,9 +1,6 @@
 --- a/sglang/srt/layers/attention/dsv4/indexer.py
 +++ b/sglang/srt/layers/attention/dsv4/indexer.py
-@@ -1129,6 +1129,26 @@
-         )
- 
- 
+@@ -1131,0 +1132,20 @@
 +def _candidate_block_amax(logits: torch.Tensor, block_size: int) -> torch.Tensor:
 +    """Exact block maxima without a token-sized padded copy.
 +
@@ -24,40 +21,19 @@
 +    return torch.cat((full_scores, tail_scores), dim=-1)
 +
 +
- def select_candidate_blocks(
-     logits: torch.Tensor,
-     compress_lens: torch.Tensor | int,
-@@ -1159,8 +1179,7 @@
-         return keep
- 
-     width = logits.size(-1)
+@@ -1162,2 +1182 @@
 -    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
 -    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
 +    scores = _candidate_block_amax(logits, block_size)
-     num_blocks = scores.size(-1)
- 
-     last = (compress_lens - 1) // block_size
-@@ -1188,8 +1207,7 @@
-     sentinel instead of allocating a token-sized boolean visibility mask.
-     """
-     width = logits.size(-1)
+@@ -1191,2 +1210 @@
 -    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
 -    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
 +    scores = _candidate_block_amax(logits, block_size)
-     num_blocks = scores.size(-1)
-     last = (compress_lens - 1) // block_size
-     scores = scores.masked_fill(
 --- a/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -3876,6 +3876,11 @@
-                     raw_indices[token_rows, :k] = torch.where(reach, idx, -1).to(
-                         torch.int32
-                     )
+@@ -3878,0 +3879,5 @@
 +                # Every score consumer has finished enqueueing on this stream.
 +                # Drop this chunk before allocating the next one; assignment
 +                # otherwise retains the previous GiB-sized matrix during RHS
 +                # evaluation. The caching allocator preserves stream ordering.
 +                del scores
-             if masks is not None:
-                 publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
-             row_base += q_len
