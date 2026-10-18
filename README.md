@@ -104,7 +104,7 @@ installing SGLang. The patches are disjoint and can be checked together:
 ```bash
 cd /path/to/sglang  # official v0.5.18 tag
 runtime_patch=/path/to/sglang-plugin-FL/sglang_fl/backports/sglang-v0.5.18-dsv41.patch
-kernel_patch=/path/to/FlagGems-sglang/src/flaggems_sglang_plugin/patches/sglang-v0.5.18-dsv41-kernels.patch
+kernel_patch=/path/to/FlagGems-sglang/src/flaggems_sglang_backport/patches/sglang-v0.5.18-dsv41-kernels.patch
 git apply --check "$runtime_patch" "$kernel_patch"
 git apply "$runtime_patch" "$kernel_patch"
 pip install -e ./python
@@ -112,9 +112,10 @@ pip install --no-deps -e /path/to/sglang-plugin-FL
 ```
 
 The backport adds the V4.1 config, model/vision, cache geometry, DSpark and
-API encoding required by the release. Its kernel imports call FlagGems for
-common numerical operations and FlagGems-sglang for request/candidate layouts;
-install that repository's `dsv41` extra as described in its operator guide.
+API encoding required by the release. Install the separate FlagGems-sglang
+operator backport and TileLang 0.1.12 for native kernel compatibility. H100
+operator optimization is a second, independent change in that repository;
+its `dsv41` extra supplies the pinned common FlagGems integration.
 The kernel patch includes stable Top-K ties and FlagTree 3.6 metadata support.
 FlagCX PD registration and prefill temporary-memory optimizations remain
 runtime Python hooks. The model backport has no dependency on the FlagCX integration PRs.
