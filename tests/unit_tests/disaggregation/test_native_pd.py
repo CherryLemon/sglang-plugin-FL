@@ -47,6 +47,8 @@ class NativePDTests(unittest.TestCase):
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
 
+        uvicorn = self.module("uvicorn._subprocess")
+        uvicorn.subprocess_started = lambda **kwargs: kwargs
         utils = self.module("sglang.srt.disaggregation.utils")
         utils.TransferBackend = Enum("TransferBackend", {"MOONCAKE": "mooncake"})
         utils.KVClassType = Enum(
@@ -123,6 +125,40 @@ class NativePDTests(unittest.TestCase):
         )
         self.bridge = self.load(
             "sglang_fl.disaggregation.patch", "sglang_fl/disaggregation/patch.py"
+        )
+
+    def test_spawn_entry_registers_before_native_http_worker(self):
+        events = []
+        self.bridge._http_worker_original = lambda **kw: events.append("native") or kw
+        cfg = types.SimpleNamespace(app="sglang.srt.entrypoints.http_server:app")
+        with patch.object(
+            self.bridge,
+            "apply_disaggregation_patch",
+            side_effect=lambda: events.append("register"),
+        ):
+            result = self.bridge._flagcx_http_worker_started(
+                cfg, "target", ["socket"], 4
+            )
+        self.assertEqual(events, ["register", "native"])
+        self.assertEqual(result["stdin_fileno"], 4)
+
+    def test_spawn_entry_leaves_other_uvicorn_apps_unchanged(self):
+        self.bridge._http_worker_original = lambda **kw: "native"
+        with patch.object(self.bridge, "apply_disaggregation_patch") as apply:
+            result = self.bridge._flagcx_http_worker_started(
+                types.SimpleNamespace(app="other:app"), None, []
+            )
+        self.assertEqual(result, "native")
+        apply.assert_not_called()
+
+    def test_worker_bootstrap_install_is_idempotent(self):
+        subprocess = self.modules["uvicorn._subprocess"]
+        original = subprocess.subprocess_started
+        self.bridge._patch_http_worker_bootstrap()
+        self.bridge._patch_http_worker_bootstrap()
+        self.assertIs(self.bridge._http_worker_original, original)
+        self.assertIs(
+            subprocess.subprocess_started, self.bridge._flagcx_http_worker_started
         )
 
     def manager(self, role="decode"):
