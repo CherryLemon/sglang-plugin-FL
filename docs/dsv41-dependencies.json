@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "flag_gems": {
+    "repository": "https://github.com/CherryLemon/FlagGems",
+    "revision": "6b9859855b13f2664261c1eac19c5ae57c9466dd",
+    "pull_requests": [
+      6631,
+      6684
+    ],
+    "status": "immutable draft-PR integration, not an upstream release"
+  },
+  "flaggems_sglang": {
+    "repository": "https://github.com/CherryLemon/FlagGems-sglang",
+    "branch": "feat/dsv41-h100-operators",
+    "pull_request": 161
+  },
+  "flagcx": {
+    "repository": "https://github.com/flagos-ai/FlagCX",
+    "revision": "648a6c489d2d54870d173926eda2d0ea0771b39d",
+    "modified": false
+  },
+  "flagtree": {
+    "repository": "https://github.com/flagos-ai/FlagTree",
+    "triton_api_prefill": "3.6.0",
+    "modified": false,
+    "scope": "qualified runtime compatibility; no compiler source delta"
+  }
+}
