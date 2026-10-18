@@ -17174,18 +17174,57 @@ index 5c4f3ff44a..d116dfe10b 100644
              validate_deepseek_v4_mega_moe_token_budget(self)
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
-index 2fd55f221d..0aa3b204cf 100644
+index 2fd55f221d..3b23bcf9a2 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
-@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_info import (
+@@ -27,8 +27,13 @@ from sglang.srt.speculative.spec_info import (
      spec_scale_global_num_tokens,
  )
  from sglang.srt.speculative.spec_utils import draft_tp_context
 +from sglang.srt.utils.common import is_cuda, is_pin_memory_available
  from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
  
++from sglang.srt.speculative.dspark_components.tp_sync import (
++    sync_speculative_decision,
++)
++
  logger = logging.getLogger(__name__)
-@@ -303,7 +304,7 @@ class DraftBlockProposer:
+ 
+ 
+@@ -124,7 +129,7 @@ def sample_draft_block(
+ 
+         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
+-            return torch.argmax(step_logits, dim=-1)
++            return sync_speculative_decision(torch.argmax(step_logits, dim=-1))
+ 
+     else:
+ 
+@@ -134,12 +139,12 @@ def sample_draft_block(
+                 exp_noise = torch.empty(
+                     step_logits.shape, dtype=torch.float32, device=step_logits.device
+                 ).exponential_(1)
+-                return SampleStepTokens.execute(
++                return sync_speculative_decision(SampleStepTokens.execute(
+                     step_logits=step_logits,
+                     temperatures=temperatures,
+                     greedy_mask=greedy_mask,
+                     exp_noise=exp_noise,
+-                )
++                ))
+             else:
+                 probs = torch.softmax(
+                     step_logits.float() / temperatures[:, None], dim=-1
+@@ -147,7 +152,7 @@ def sample_draft_block(
+                 probs = expect(_DRAFT_PROBS, probs)
+                 argmax_tokens = torch.argmax(step_logits, dim=-1)
+                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+-                return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
++                return sync_speculative_decision(torch.where(greedy_mask, argmax_tokens, sampled_tokens))
+ 
+     draft_tokens, corrected_logits = markov_head.sample_block(
+         base_logits,
+@@ -303,7 +308,7 @@ class DraftBlockProposer:
              spec_info=self._draft_block_spec_info,
              capture_hidden_mode=CaptureHiddenMode.NULL,
          )
@@ -17194,7 +17233,7 @@ index 2fd55f221d..0aa3b204cf 100644
          with torch.inference_mode():
              self.draft_model_runner.forward(idle_batch)
  
-@@ -348,7 +349,7 @@ class DraftBlockProposer:
+@@ -348,7 +353,7 @@ class DraftBlockProposer:
          else:
              raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
  
@@ -17203,7 +17242,7 @@ index 2fd55f221d..0aa3b204cf 100644
          draft_forward_batch = ForwardBatch(
              forward_mode=ForwardMode.TARGET_VERIFY,
              batch_size=bs,
-@@ -363,16 +364,9 @@ class DraftBlockProposer:
+@@ -363,16 +368,9 @@ class DraftBlockProposer:
              spec_algorithm=SpeculativeAlgorithm.DSPARK,
              spec_info=self._draft_block_spec_info,
              capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -17222,7 +17261,7 @@ index 2fd55f221d..0aa3b204cf 100644
              draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
          with torch.inference_mode():
              draft_out = self.draft_model_runner.forward(draft_forward_batch)
-@@ -388,36 +382,48 @@ class DraftBlockProposer:
+@@ -388,36 +386,48 @@ class DraftBlockProposer:
              can_run_graph=draft_out.can_run_graph,
          )
  
@@ -17299,11 +17338,61 @@ index 2fd55f221d..0aa3b204cf 100644
 +                pin_memory=pin_memory,
 +            ).to(device, non_blocking=True)
 +        return can_run_graph
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+index 4ecce20b63..2b792edc8e 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+@@ -11,6 +11,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+ from sglang.srt.environ import DsparkFoldedSampling, envs
+ from sglang.srt.utils import get_available_gpu_memory
+ 
++from sglang.srt.speculative.dspark_components.tp_sync import (
++    sync_speculative_decision,
++)
++
+ logger = logging.getLogger(__name__)
+ 
+ # Same free-memory floor init_cuda_graphs requires before draft capture.
+@@ -19,7 +23,7 @@ _CAPTURE_HEADROOM_GB = 1.0
+ 
+ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+     del step_idx
+-    return torch.argmax(step_logits, dim=-1)
++    return sync_speculative_decision(torch.argmax(step_logits, dim=-1))
+ 
+ 
+ class DsparkDraftSampler:
+@@ -103,12 +107,12 @@ class DsparkDraftSampler:
+                 # In-graph philox noise: each replay advances the generator
+                 # and redraws.
+                 noise = self.exp_noise[:bs].exponential_()
+-                return SampleStepTokens.execute(
++                return sync_speculative_decision(SampleStepTokens.execute(
+                     step_logits=step_logits,
+                     temperatures=self.temperatures[:bs],
+                     greedy_mask=self.greedy_mask[:bs],
+                     exp_noise=noise,
+-                )
++                ))
+ 
+         else:
+             sampler = greedy_step_sampler
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-index 9939f37508..ddbe2dd5c7 100644
+index 9939f37508..ae5f42be39 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-@@ -468,6 +468,7 @@ class CommitInjectCtx(msgspec.Struct):
+@@ -138,6 +138,10 @@ class TargetVerifyExecutor:
+                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
+             )
+ 
++        sync_speculative_decision(correct_len)
++        sync_speculative_decision(bonus)
++        sync_speculative_decision(cap_trim_lens)
++
+         finalized = FinalizeAcceptLens.execute(
+             correct_len=correct_len,
+             cap_trim_lens=cap_trim_lens,
+@@ -468,6 +472,7 @@ class CommitInjectCtx(msgspec.Struct):
      block_pos_offsets: torch.Tensor
      resolve_pool: object
      resolve_req_to_token: object
@@ -17311,7 +17400,7 @@ index 9939f37508..ddbe2dd5c7 100644
  
  
  class AcceptOuts(msgspec.Struct):
-@@ -518,9 +519,13 @@ class DsparkVerifyEpilogue:
+@@ -518,9 +523,13 @@ class DsparkVerifyEpilogue:
          )
          self.strided_logits: Optional[torch.Tensor] = None
          self.strided_hidden: Optional[torch.Tensor] = None
@@ -17326,7 +17415,7 @@ index 9939f37508..ddbe2dd5c7 100644
              return
          if (
              not isinstance(out, LogitsProcessorOutput)
-@@ -528,6 +533,9 @@ class DsparkVerifyEpilogue:
+@@ -528,6 +537,9 @@ class DsparkVerifyEpilogue:
              or out.hidden_states is None
          ):
              return
@@ -17336,7 +17425,7 @@ index 9939f37508..ddbe2dd5c7 100644
          self(
              compact_logits=out.next_token_logits,
              compact_hidden=out.hidden_states,
-@@ -538,6 +546,7 @@ class DsparkVerifyEpilogue:
+@@ -538,6 +550,7 @@ class DsparkVerifyEpilogue:
          )
  
      def begin_step(self, verify_lens, armed: bool) -> None:
@@ -17344,7 +17433,7 @@ index 9939f37508..ddbe2dd5c7 100644
          if verify_lens is None:
              self.verify_lens_buf.zero_()
          else:
-@@ -547,6 +556,50 @@ class DsparkVerifyEpilogue:
+@@ -547,6 +560,50 @@ class DsparkVerifyEpilogue:
                  self.verify_lens_buf[bs:].zero_()
          self.inject_gate_buf.fill_(1 if armed else 0)
  
@@ -17395,7 +17484,7 @@ index 9939f37508..ddbe2dd5c7 100644
      def read_accept(self, bs: int) -> AcceptOuts:
          return AcceptOuts(
              correct_len=self.correct_len_buf[:bs],
-@@ -598,7 +651,23 @@ class DsparkVerifyEpilogue:
+@@ -598,7 +655,23 @@ class DsparkVerifyEpilogue:
          self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
          verify_lens = self.verify_lens_buf[:bs]
          self._scatter(compact_logits, compact_hidden, verify_lens, bs)
@@ -17420,7 +17509,7 @@ index 9939f37508..ddbe2dd5c7 100644
          if self.folds_commit:
              self._commit_inject(
                  commit_lens, verify_lens, seq_lens, req_pool_indices, bs
-@@ -620,22 +689,15 @@ class DsparkVerifyEpilogue:
+@@ -620,30 +693,27 @@ class DsparkVerifyEpilogue:
              fill_value=0.0,
          )
  
@@ -17448,9 +17537,13 @@ index 9939f37508..ddbe2dd5c7 100644
 -            cutoff_verify_lens=verify_lens,
 +            cutoff_verify_lens=cutoff_verify_lens,
          )
++        sync_speculative_decision(correct_len)
++        sync_speculative_decision(bonus)
++        sync_speculative_decision(cap_trim_lens)
++
          finalized = finalize_accept_lens_triton(
              correct_len=correct_len,
-@@ -643,7 +705,7 @@ class DsparkVerifyEpilogue:
+             cap_trim_lens=cap_trim_lens,
              prefix_lens=seq_lens[:bs],
          )
          out_tokens = BuildOutTokens.execute(
@@ -17460,10 +17553,21 @@ index 9939f37508..ddbe2dd5c7 100644
              bonus=bonus,
              verify_num_draft_tokens=self.stride,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
-index 666cfd8c0b..e4fdd21230 100644
+index 666cfd8c0b..ed8f542e93 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
-@@ -107,11 +107,24 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -68,6 +68,10 @@ from sglang.srt.speculative.spec_utils import (
+ )
+ from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+ 
++from sglang.srt.speculative.dspark_components.tp_sync import (
++    sync_speculative_decision,
++)
++
+ logger = logging.getLogger(__name__)
+ 
+ _is_npu = is_npu()
+@@ -107,11 +111,24 @@ class DSparkWorkerV2(BaseSpecWorker):
              and self._draft_is_moe
              and ps.attn_tp_size > 1
          ):
@@ -17492,7 +17596,7 @@ index 666cfd8c0b..e4fdd21230 100644
  
          with self._draft_context():
              bundle = build_draft_tp_worker(
-@@ -231,8 +244,14 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -231,8 +248,14 @@ class DSparkWorkerV2(BaseSpecWorker):
              dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
          )
          self._verify_epilogue = None
@@ -17508,7 +17612,7 @@ index 666cfd8c0b..e4fdd21230 100644
              and self._decode_graph_allowed
              and is_cuda()
          ):
-@@ -247,6 +266,7 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -247,6 +270,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                      resolve_req_to_token=lambda: (
                          self.model_runner.req_to_token_pool.req_to_token
                      ),
@@ -17516,7 +17620,15 @@ index 666cfd8c0b..e4fdd21230 100644
                  ),
              )
              self.model_runner.capture_tail_hooks.append(
-@@ -489,15 +509,24 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -447,6 +471,7 @@ class DSparkWorkerV2(BaseSpecWorker):
+         )
+         logits_output = batch_output.logits_output
+         next_token_ids = batch_output.next_token_ids
++        sync_speculative_decision(next_token_ids)
+         batch_output.new_seq_lens = batch.seq_lens
+         if on_publish is not None:
+             on_publish(batch_output.new_seq_lens)
+@@ -489,15 +514,24 @@ class DSparkWorkerV2(BaseSpecWorker):
              final_pos = torch.repeat_interleave(
                  (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
              )
@@ -17542,7 +17654,7 @@ index 666cfd8c0b..e4fdd21230 100644
  
          batch_output.next_draft_input = make_next_draft_input(
              bonus_tokens=next_token_ids,
-@@ -678,6 +707,11 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -678,6 +712,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                      inject_gate=fold_eligible,
                  )
              else:
@@ -17554,7 +17666,7 @@ index 666cfd8c0b..e4fdd21230 100644
                  target_verify = self._verify_executor.run_non_compact(
                      batch=batch,
                      draft_input=draft_input,
-@@ -702,7 +736,11 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -702,7 +741,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                  grammar_mask.apply(logits_output.next_token_logits)
  
          epilogue = self._verify_executor.verify_epilogue
@@ -17567,7 +17679,7 @@ index 666cfd8c0b..e4fdd21230 100644
          accept = self._verify_executor.accept_and_finalize(
              folded_accept=folded_accept,
              bs=bs,
-@@ -715,6 +753,11 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -715,6 +758,11 @@ class DSparkWorkerV2(BaseSpecWorker):
              prefix_lens=prefix_lens,
              draft_tokens=draft_tokens,
          )
@@ -17579,6 +17691,27 @@ index 666cfd8c0b..e4fdd21230 100644
          if batch.return_logprob:
              compute_spec_logprobs(
                  batch,
+diff --git a/python/sglang/srt/speculative/dspark_components/tp_sync.py b/python/sglang/srt/speculative/dspark_components/tp_sync.py
+new file mode 100644
+index 0000000000..a9ae33ab24
+--- /dev/null
++++ b/python/sglang/srt/speculative/dspark_components/tp_sync.py
+@@ -0,0 +1,15 @@
++# Copyright 2026 FlagOS Contributors
++# SPDX-License-Identifier: Apache-2.0
++"""Keep DSpark decisions identical within each attention TP replica."""
++
++from sglang.srt.runtime_context import get_parallel
++
++
++def sync_speculative_decision(values):
++    parallel = get_parallel()
++    group = (
++        parallel.attn_tp_group if parallel.enable_dp_attention else parallel.tp_group
++    )
++    if group.world_size > 1:
++        group.broadcast(values, src=0)
++    return values
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
 index 053f2cdb93..c599c7a7ae 100644
 --- a/python/sglang/srt/utils/common.py
