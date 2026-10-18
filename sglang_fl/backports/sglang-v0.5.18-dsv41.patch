@@ -16522,10 +16522,10 @@ index 0000000000..68cd951a3f
 +"""Vision tower, image preprocessing and VL expert routing for DeepSeek-V4.1."""
 diff --git a/python/sglang/srt/multimodal/dsv41/vl_routing.py b/python/sglang/srt/multimodal/dsv41/vl_routing.py
 new file mode 100644
-index 0000000000..abbe98fd28
+index 0000000000..190344e68d
 --- /dev/null
 +++ b/python/sglang/srt/multimodal/dsv41/vl_routing.py
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,129 @@
 +import torch
 +import torch.nn.functional as F
 +
@@ -16537,6 +16537,12 @@ index 0000000000..abbe98fd28
 +)
 +from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 +from sglang.srt.utils import is_cuda
++from sglang.srt.runtime_context import get_exec
++from sglang.srt.eplb.expert_location_dispatch import (
++    ExpertLocationDispatchInfo,
++    topk_ids_logical_to_physical,
++)
++from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 +
 +
 +def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
@@ -16548,7 +16554,32 @@ index 0000000000..abbe98fd28
 +    return weights
 +
 +
++def _map_and_record_routed_ids(indices, info, num_shared, num_token_non_padded):
++    if info is None:
++        return indices
++    routed = indices[:, :-num_shared] if num_shared else indices
++    # Fused routing already marks padded rows with -1. Preserve that sentinel
++    # across table lookup rather than indexing the final logical expert.
++    physical = topk_ids_logical_to_physical(routed.clamp_min(0), info)
++    physical = physical.masked_fill(routed < 0, -1)
++    _mask_topk_ids_padded_region(physical, num_token_non_padded)
++    get_global_expert_distribution_recorder().on_select_experts(topk_ids=physical)
++    if not num_shared:
++        return physical
++    shared = info.num_physical_experts + torch.arange(
++        num_shared, device=indices.device, dtype=indices.dtype
++    )
++    result = torch.cat([physical, shared.expand(indices.shape[0], -1)], dim=-1)
++    _mask_topk_ids_padded_region(result, num_token_non_padded)
++    return result
++
++
 +def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
++    dispatch_info = (
++        ExpertLocationDispatchInfo.init_new(moe.layer_id)
++        if get_exec().moe.enable_eplb and not moe.is_nextn
++        else None
++    )
 +    config = moe.topk.topk_config
 +    num_fused_shared_experts = config.num_fused_shared_experts
 +    if num_fused_shared_experts:
@@ -16579,6 +16610,9 @@ index 0000000000..abbe98fd28
 +            weights,
 +            num_fused_shared_experts,
 +            config.fused_shared_experts_scaling_factor,
++        )
++        indices = _map_and_record_routed_ids(
++            indices, dispatch_info, num_fused_shared_experts, num_token_non_padded
 +        )
 +        return StandardTopKOutput(weights, indices, logits)
 +    scores = F.softplus(logits.float()).sqrt()
@@ -16617,6 +16651,9 @@ index 0000000000..abbe98fd28
 +    if num_token_non_padded is not None:
 +        _mask_topk_ids_padded_region(indices, num_token_non_padded)
 +        _zero_topk_weights_padded_region(weights, num_token_non_padded)
++    indices = _map_and_record_routed_ids(
++        indices, dispatch_info, num_fused_shared_experts, num_token_non_padded
++    )
 +    return StandardTopKOutput(weights, indices, logits)
 diff --git a/python/sglang/srt/multimodal/processors/deepseek_v41.py b/python/sglang/srt/multimodal/processors/deepseek_v41.py
 new file mode 100644
