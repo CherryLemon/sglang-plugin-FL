@@ -21,15 +21,7 @@ def _candidate_block_amax(logits, block_size):
     return torch.cat((full_scores, tail_scores), dim=-1)
 
 
-def candidate_blocks(original, logits, compress_lens, topk_blocks, block_size):
-    from sglang.srt.layers.attention.dsv4 import indexer
-
-    if (
-        indexer.envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.get()
-        and torch.is_tensor(compress_lens)
-        and logits.dim() == 2
-    ):
-        return original(logits, compress_lens, topk_blocks, block_size)
+def candidate_blocks(logits, compress_lens, topk_blocks, block_size):
     width = logits.size(-1)
     scores = _candidate_block_amax(logits, block_size)
     num_blocks = scores.size(-1)
@@ -90,17 +82,12 @@ def extend_indexer(self, layer, x, q_lora, pos, forward_batch) -> None:
     page_size = table.shape[1] // 68
     req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
     topk = indexer.index_topk
-    compact = not native.envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.get()
     publish = [] if indexer.is_candidate_source else None
-    consume = (
-        (self.prefill_candidate_blocks if compact else self.candidate_masks)
-        if indexer.uses_candidates
-        else None
-    )
+    consume = self.prefill_candidate_blocks if indexer.uses_candidates else None
     empty_mask = torch.empty(
         0,
         0,
-        dtype=torch.int32 if compact else torch.bool,
+        dtype=torch.int32,
         device=pos.device,
     )
     row_base = 0
@@ -120,7 +107,7 @@ def extend_indexer(self, layer, x, q_lora, pos, forward_batch) -> None:
         k = min(topk, lc)
         score_width = (
             consume[b].shape[1] * indexer.candidate_block_size
-            if compact and consume is not None
+            if consume is not None
             else lc
         )
         rows_per_chunk = max(
@@ -133,9 +120,7 @@ def extend_indexer(self, layer, x, q_lora, pos, forward_batch) -> None:
             local_rows = slice(start, stop)
             lens_c = compress_lens[token_rows]
             q_fp8 = native.quantize_bf16_index_queries_fp8(q[token_rows])
-            block_ids = (
-                consume[b][local_rows] if compact and consume is not None else None
-            )
+            block_ids = consume[b][local_rows] if consume is not None else None
             scores = native.fp8_index_logits_prefill(
                 q_fp8,
                 weights[token_rows],
@@ -146,19 +131,13 @@ def extend_indexer(self, layer, x, q_lora, pos, forward_batch) -> None:
             )
             if masks is not None:
                 masks.append(
-                    (
-                        native.select_candidate_block_ids
-                        if compact
-                        else native.select_candidate_blocks
-                    )(
+                    native.select_candidate_block_ids(
                         scores,
                         lens_c[:, None],
                         topk_blocks=indexer.candidate_topk_blocks,
                         block_size=indexer.candidate_block_size,
                     )
                 )
-            elif consume is not None and (not compact):
-                scores.masked_fill_(~consume[b][local_rows], -torch.inf)
             idx = torch.empty(
                 (scores.shape[0], k), dtype=torch.int32, device=scores.device
             )
@@ -202,9 +181,5 @@ def extend_indexer(self, layer, x, q_lora, pos, forward_batch) -> None:
         row_base += q_len
     assert row_base == q.shape[0]
     if publish is not None:
-        if compact:
-            self.prefill_candidate_blocks = publish
-            self.candidate_masks = None
-        else:
-            self.candidate_masks = publish
-            self.prefill_candidate_blocks = None
+        self.prefill_candidate_blocks = publish
+        self.candidate_masks = None

@@ -50,14 +50,15 @@ def apply_dsv41_patches():
     if _registered:
         return
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
     from sglang_fl.disaggregation.patch import apply_disaggregation_patch
 
     from .prefill import candidate_block_ids, candidate_blocks, extend_indexer
 
-    apply_disaggregation_patch(native_protocol=True)
+    apply_disaggregation_patch()
     indexer = "sglang.srt.layers.attention.dsv4.indexer"
     HookRegistry.register(
-        f"{indexer}.select_candidate_blocks", candidate_blocks, HookType.AROUND
+        f"{indexer}.select_candidate_blocks", candidate_blocks, HookType.REPLACE
     )
     HookRegistry.register(
         f"{indexer}.select_candidate_block_ids", candidate_block_ids, HookType.REPLACE

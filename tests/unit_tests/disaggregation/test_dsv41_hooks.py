@@ -3,11 +3,10 @@
 """Model hooks register once and leave the actual transport/configuration intact."""
 
 import importlib.util
-import os
-from pathlib import Path
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).parents[3]
@@ -70,12 +69,13 @@ class ModelHookTests(unittest.TestCase):
             self.assertEqual(self.module._validate_features(original, args), "original")
             self.assertEqual(calls, [args])
 
-    def test_disabled_entry_point_does_not_load_runtime(self):
+    def test_entry_point_installs_hooks_without_environment_configuration(self):
         entry = load("isolated_dsv41_entry", "sglang_fl/dsv41_runtime/__init__.py")
-        with patch.dict(os.environ, {}, clear=True):
-            before = set(sys.modules)
+        hooks = types.ModuleType("isolated_dsv41_entry.patch")
+        hooks.apply_dsv41_patches = unittest.mock.Mock()
+        with patch.dict(sys.modules, {hooks.__name__: hooks}):
             entry.load_plugin()
-            self.assertEqual(set(sys.modules), before)
+        hooks.apply_dsv41_patches.assert_called_once_with()
 
     def test_registration_uses_repository_hook_registry_once(self):
         registry = types.SimpleNamespace(register=unittest.mock.Mock())
@@ -98,7 +98,8 @@ class ModelHookTests(unittest.TestCase):
             self.module.apply_dsv41_patches()
             self.module.apply_dsv41_patches()
         self.assertEqual(registry.register.call_count, 4)
-        native.apply_disaggregation_patch.assert_called_once_with(native_protocol=True)
+        self.assertEqual(registry.register.call_args_list[0].args[2], kinds.REPLACE)
+        native.apply_disaggregation_patch.assert_called_once_with()
         targets = [call.args[0] for call in registry.register.call_args_list]
         self.assertTrue(all(target.startswith("sglang.srt.") for target in targets))
 

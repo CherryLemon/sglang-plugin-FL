@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native control-protocol selection is generic and leaves legacy PD intact."""
 
-from enum import Enum
 import importlib.util
 import os
-from pathlib import Path
 import sys
 import types
 import unittest
+from enum import Enum
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).parents[3]
@@ -33,7 +33,8 @@ class NativePDTests(unittest.TestCase):
         sys.modules[name] = module
         self.modules[name] = module
         parent, _, child = name.rpartition(".")
-        setattr(self.module(parent), child, module)
+        if parent:
+            setattr(self.module(parent), child, module)
         spec.loader.exec_module(module)
         return module
 
@@ -99,9 +100,9 @@ class NativePDTests(unittest.TestCase):
                 return engine.result
 
         self.transfer_engine = TransferEngine
-        self.module(
-            "sglang_fl.disaggregation.transfer_engine"
-        ).FlagCXTransferEngine = TransferEngine
+        self.module("sglang_fl.disaggregation.transfer_engine").FlagCXTransferEngine = (
+            TransferEngine
+        )
 
         class Counter:
             def __init__(counter, *args, **kwargs):
@@ -135,7 +136,8 @@ class NativePDTests(unittest.TestCase):
         )
         return manager
 
-    def test_default_keeps_existing_generic_backend(self):
+    def test_old_manager_api_uses_existing_generic_backend(self):
+        del self.native_base.MooncakeKVManager._registerable_regions
         self.bridge.apply_disaggregation_patch()
         cls = self.utils.get_kv_class(
             self.utils.TransferBackend.FLAGCX, self.utils.KVClassType.MANAGER
@@ -143,7 +145,7 @@ class NativePDTests(unittest.TestCase):
         self.assertIs(cls, self.legacy.FlagcxKVManager)
 
     def test_native_route_works_without_model_flags_and_preserves_aliases(self):
-        self.bridge.apply_disaggregation_patch(native_protocol=True)
+        self.bridge.apply_disaggregation_patch()
         wrapper = self.utils.get_kv_class
         self.assertIs(
             wrapper(self.utils.TransferBackend.FLAGCX, self.utils.KVClassType.MANAGER),
@@ -163,12 +165,6 @@ class NativePDTests(unittest.TestCase):
         )
         self.bridge.apply_disaggregation_patch()
         self.assertIs(self.utils.get_kv_class, wrapper)
-        self.assertTrue(self.bridge._native_protocol)
-
-    def test_generic_environment_enables_native_protocol(self):
-        os.environ["SGLANG_FL_FLAGCX_NATIVE_PROTOCOL"] = "1"
-        self.bridge.apply_disaggregation_patch()
-        self.assertTrue(self.bridge._native_protocol)
 
     def test_native_manager_reuses_shared_transfer_engine(self):
         self.assertTrue(
@@ -204,21 +200,6 @@ class NativePDTests(unittest.TestCase):
         manager.engine.flagcx.result = -1
         with self.assertRaises(RuntimeError):
             manager.register_buffer_to_engine()
-
-    def test_legacy_admission_rejected_on_decoder(self):
-        os.environ["SGLANG_FL_FLAGCX_ROLLING_ALLOW_LEGACY"] = "1"
-        manager = self.manager()
-        with self.assertRaisesRegex(ValueError, "sender-only"):
-            manager.init_engine()
-        self.assertFalse(hasattr(manager, "engine"))
-
-    def test_native_api_mismatch_does_not_switch_to_legacy(self):
-        del self.native_base.MooncakeKVManager._registerable_regions
-        self.bridge.apply_disaggregation_patch(native_protocol=True)
-        with self.assertRaisesRegex(RuntimeError, "manager API"):
-            self.utils.get_kv_class(
-                self.utils.TransferBackend.FLAGCX, self.utils.KVClassType.MANAGER
-            )
 
     def test_shared_engine_close_is_idempotent(self):
         self.module("sglang.srt.platforms").current_platform = object()

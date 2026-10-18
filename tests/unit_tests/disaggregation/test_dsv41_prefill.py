@@ -3,12 +3,12 @@
 """Candidate parity and score lifetime through the model's replacement method."""
 
 import importlib.util
-from pathlib import Path
 import sys
 import types
 import unittest
-from unittest.mock import patch
 import weakref
+from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -19,16 +19,6 @@ spec = importlib.util.spec_from_file_location(
 )
 prefill = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prefill)
-
-
-def indexer_module(enabled=False):
-    return types.SimpleNamespace(
-        envs=types.SimpleNamespace(
-            SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK=types.SimpleNamespace(
-                get=lambda: enabled
-            )
-        )
-    )
 
 
 def mock_native(name, value):
@@ -97,50 +87,47 @@ class PrefillTests(unittest.TestCase):
         )
         generator = torch.Generator().manual_seed(739101)
         cases = 0
-        with mock_native("sglang.srt.layers.attention.dsv4.indexer", indexer_module()):
-            for dtype in (torch.float32, torch.bfloat16):
-                for rows in (1, 3, 8):
-                    for width in sizes:
-                        for block in (4, 8, 16):
-                            for pattern in ("random", "ties", "sentinels", "strided"):
-                                x = torch.randn(
-                                    rows,
-                                    width * (2 if pattern == "strided" else 1),
-                                    dtype=dtype,
-                                    generator=generator,
+        for dtype in (torch.float32, torch.bfloat16):
+            for rows in (1, 3, 8):
+                for width in sizes:
+                    for block in (4, 8, 16):
+                        for pattern in ("random", "ties", "sentinels", "strided"):
+                            x = torch.randn(
+                                rows,
+                                width * (2 if pattern == "strided" else 1),
+                                dtype=dtype,
+                                generator=generator,
+                            )
+                            if pattern == "strided":
+                                x = x[:, ::2]
+                            elif pattern == "ties":
+                                x.zero_()
+                                x[:, ::3] = -0.0
+                            elif pattern == "sentinels":
+                                x[:, ::3] = -torch.inf
+                                x[:, ::7] = torch.inf
+                                x[:, ::11] = torch.nan
+                            lens = torch.tensor(
+                                [(i * 73) % (width + 1) for i in range(rows)],
+                                dtype=torch.int32,
+                            )[:, None]
+                            for count in (1, 3, 16):
+                                mask, ids = reference(x, lens, count, block)
+                                self.assertTrue(
+                                    torch.equal(
+                                        prefill.candidate_blocks(x, lens, count, block),
+                                        mask,
+                                    )
                                 )
-                                if pattern == "strided":
-                                    x = x[:, ::2]
-                                elif pattern == "ties":
-                                    x.zero_()
-                                    x[:, ::3] = -0.0
-                                elif pattern == "sentinels":
-                                    x[:, ::3] = -torch.inf
-                                    x[:, ::7] = torch.inf
-                                    x[:, ::11] = torch.nan
-                                lens = torch.tensor(
-                                    [(i * 73) % (width + 1) for i in range(rows)],
-                                    dtype=torch.int32,
-                                )[:, None]
-                                for count in (1, 3, 16):
-                                    mask, ids = reference(x, lens, count, block)
-                                    self.assertTrue(
-                                        torch.equal(
-                                            prefill.candidate_blocks(
-                                                None, x, lens, count, block
-                                            ),
-                                            mask,
-                                        )
+                                self.assertTrue(
+                                    torch.equal(
+                                        prefill.candidate_block_ids(
+                                            x, lens, count, block
+                                        ),
+                                        ids,
                                     )
-                                    self.assertTrue(
-                                        torch.equal(
-                                            prefill.candidate_block_ids(
-                                                x, lens, count, block
-                                            ),
-                                            ids,
-                                        )
-                                    )
-                                    cases += 1
+                                )
+                                cases += 1
         self.assertEqual(cases, 4536)
 
     def test_aligned_width_never_calls_pad(self):
@@ -153,16 +140,6 @@ class PrefillTests(unittest.TestCase):
             prefill._candidate_block_amax(torch.randn(2, 65), 8)
             self.assertEqual(padding.call_count, 1)
             self.assertEqual(padding.call_args.args[0].shape, (2, 1))
-
-    def test_native_fused_selector_remains_available(self):
-        original = unittest.mock.Mock(return_value="native-fused")
-        x, lens = torch.zeros(1, 8), torch.ones(1, 1)
-        with mock_native(
-            "sglang.srt.layers.attention.dsv4.indexer", indexer_module(True)
-        ):
-            result = prefill.candidate_blocks(original, x, lens, 2, 8)
-        self.assertEqual(result, "native-fused")
-        original.assert_called_once_with(x, lens, 2, 8)
 
     def test_extend_releases_score_before_allocating_next_chunk(self):
         page_indices = torch.empty(4, 2, dtype=torch.int32)
@@ -214,7 +191,6 @@ class PrefillTests(unittest.TestCase):
         native = types.SimpleNamespace(
             torch=torch,
             _as_int_list=list,
-            envs=indexer_module().envs,
             _TORCH_INDEXER_SCORE_BUDGET_BYTES=64,
             unpack_fp4_index_keys_to_fp8=lambda slots, table, page: torch.zeros(
                 len(slots), 128
