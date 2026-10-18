@@ -83,7 +83,13 @@ def _flagcx_class_mapping(class_type):
     select this backend.
     """
     from sglang.srt.disaggregation.base import KVArgs
+    from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
     from sglang.srt.disaggregation.utils import KVClassType
+
+    if hasattr(MooncakeKVManager, "_registerable_regions"):
+        from .native import class_mapping
+
+        return class_mapping(class_type)
 
     from sglang_fl.disaggregation import (
         FlagcxKVBootstrapServer,
