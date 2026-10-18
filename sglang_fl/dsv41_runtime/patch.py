@@ -26,7 +26,13 @@ def _validate_features(original, server_args):
     cfg = resolve(server_args)
     if cfg.disaggregation_transfer_backend != "flagcx":
         return original(server_args)
-    if server_args.get_model_config().hf_config.model_type != "deepseek_v41":
+    model_config_of = original.__globals__.get("model_config_of")
+    model_config = (
+        model_config_of(server_args)
+        if model_config_of is not None
+        else server_args.get_model_config()
+    )
+    if model_config.hf_config.model_type != "deepseek_v41":
         return original(server_args)
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
         from .pd import allow_decode_config

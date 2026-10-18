@@ -70,7 +70,8 @@ def test_transfer_strides_checked_before_write():
             pd.validate_c2_strides([384, 1024], destination)
 
 
-def test_flagcx_validation_preserves_native_feature_checks(monkeypatch):
+@pytest.mark.parametrize("model_api", ["method", "native_resolver"])
+def test_flagcx_validation_preserves_native_feature_checks(monkeypatch, model_api):
     spec = importlib.util.spec_from_file_location(
         "isolated_dsv41_model.patch",
         Path(__file__).parents[3] / "sglang_fl/dsv41_runtime/patch.py",
@@ -102,6 +103,10 @@ def test_flagcx_validation_preserves_native_feature_checks(monkeypatch):
         ),
     )
     scope = {"resolving_view": lambda x: x.config}
+    if model_api == "native_resolver":
+        model = args.get_model_config()
+        del args.get_model_config
+        scope["model_config_of"] = lambda x: model
     exec(
         "def validate(args):\n"
         "    cfg = resolving_view(args)\n"
