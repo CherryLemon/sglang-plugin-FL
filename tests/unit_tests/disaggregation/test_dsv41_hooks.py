@@ -56,11 +56,47 @@ class ModelHookTests(unittest.TestCase):
         ):
             self.module.apply_dsv41_patches()
             self.module.apply_dsv41_patches()
-        self.assertEqual(registry.register.call_count, 4)
+        self.assertEqual(registry.register.call_count, 5)
         self.assertEqual(registry.register.call_args_list[0].args[2], kinds.AROUND)
         native.apply_disaggregation_patch.assert_called_once_with()
         targets = [call.args[0] for call in registry.register.call_args_list]
         self.assertTrue(all(target.startswith("sglang.srt.") for target in targets))
+
+    def test_draft_stats_are_isolated_and_target_stats_restore(self):
+        from contextlib import contextmanager
+
+        class Recorder:
+            disabled = False
+
+            @contextmanager
+            def disable_this_region(recorder):
+                previous = recorder.disabled
+                recorder.disabled = True
+                try:
+                    yield
+                finally:
+                    recorder.disabled = previous
+
+        recorder = Recorder()
+        stats = types.ModuleType("sglang.srt.eplb.expert_distribution")
+        stats.get_global_expert_distribution_recorder = lambda: recorder
+        sentinel = object()
+
+        def native(value):
+            self.assertTrue(recorder.disabled)
+            self.assertIs(value, sentinel)
+            return value
+
+        with patch.dict(sys.modules, {stats.__name__: stats}):
+            self.assertIs(self.module._draft_forward(native, sentinel), sentinel)
+            self.assertFalse(recorder.disabled)
+
+            def fail():
+                raise ValueError("native failure")
+
+            with self.assertRaises(ValueError):
+                self.module._draft_forward(fail)
+            self.assertFalse(recorder.disabled)
 
 
 if __name__ == "__main__":

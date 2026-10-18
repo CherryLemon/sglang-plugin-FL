@@ -57,6 +57,17 @@ def _validate_features(original, server_args):
     return validate(server_args)
 
 
+def _draft_forward(original, *args, **kwargs):
+    # Draft experts have their own fixed placement and no target layer index.
+    # Their warmup/capture must not enter the target model's EPLB statistics.
+    from sglang.srt.eplb.expert_distribution import (
+        get_global_expert_distribution_recorder,
+    )
+
+    with get_global_expert_distribution_recorder().disable_this_region():
+        return original(*args, **kwargs)
+
+
 def apply_dsv41_patches():
     global _registered
     if _registered:
@@ -73,6 +84,11 @@ def apply_dsv41_patches():
     HookRegistry.register(
         "sglang.srt.arg_groups.deepseek_v4_hook.validate_deepseek_v41_features",
         _validate_features,
+        HookType.AROUND,
+    )
+    HookRegistry.register(
+        "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark.forward",
+        _draft_forward,
         HookType.AROUND,
     )
     indexer = "sglang.srt.layers.attention.dsv4.indexer"
