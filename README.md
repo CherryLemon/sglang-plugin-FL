@@ -56,16 +56,12 @@ family. Image/video inputs are rejected; no media processor or encoder is built.
 
 Select `flashmla_sparse` for both DSA prefill and decode to retain per-head
 attention sinks. `HY4_INDEXER_DTYPE` accepts `auto`, `fp8` or `int8`; auto keeps
-FP8 on NVIDIA SM90+ and selects INT8 elsewhere. INT8 needs the additional public
-`flag_gems.fused.int8_sparse_indexer` APIs from
-[FlagGems #7782](https://github.com/flagos-ai/FlagGems/pull/7782). Stock FlagGems
-without that module raises an explicit dependency error when INT8 is selected.
-Install the exact dependency revision listed below.
+FP8 on NVIDIA SM90+ and selects INT8 elsewhere. INT8 requires `flag_gems.fused.int8_sparse_indexer`, which is not published
+by the linked component PRs or stock FlagGems. Explicit INT8 and non-SM90 auto
+selection therefore remain blocked on that operator-library dependency; no
+historical diagnostic patch is offered as a production installation method.
+NVIDIA SM90+ auto selection retains the native FP8 indexer.
 
-```sh
-# Only needed when selecting the INT8 indexer.
-pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@a15441de4a9249485d5f58feff975d48b59f6620"
-```
 
 
 The optional [FlagGems-sglang #228](https://github.com/flagos-ai/FlagGems-sglang/pull/228)
