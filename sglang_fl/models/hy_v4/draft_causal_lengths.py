@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Default-OFF HY4 draft-decode causal metadata; no attention/indexer math.
+"""HY4 draft-decode causal metadata; no attention/indexer math.
 
 Native Eagle supplies the committed prefix L and writes draft step i to L+i.
 Each child therefore reads L+i+1 keys. Preserve native construction/copy APIs
@@ -11,8 +11,6 @@ from copy import copy
 from dataclasses import replace
 from functools import wraps
 from types import SimpleNamespace
-
-_installed = False
 
 
 def causal_backend_type(native_base, build_inner_fb_view, forward_batch_type):
@@ -164,13 +162,7 @@ def causal_backend_type(native_base, build_inner_fb_view, forward_batch_type):
     return HYV4CausalDraftMetadata
 
 
-def install(*, enabled=False):
-    global _installed
-    if _installed:
-        return True
-    if not enabled:
-        return False
-
+def prepare_patches(previous_factory):
     from sglang.srt.layers.attention.dsa_backend import (
         DeepseekSparseAttnMultiStepBackend,
     )
@@ -190,7 +182,6 @@ def install(*, enabled=False):
     Fixed = causal_backend_type(
         DeepseekSparseAttnMultiStepBackend, build_inner_fb_view, ForwardBatch
     )
-    previous_factory = DraftBackendFactory._create_dsa_decode_backend
     previous_execute = EAGLEDraftCudaGraphRunner.execute
     previous_draft_forward = eagle_worker_v2.EagleDraftWorker.draft_forward
     previous_locations = eagle_worker_v2.per_step_draft_out_cache_loc
@@ -248,9 +239,24 @@ def install(*, enabled=False):
             else container.stage_per_step_cache_locs(locations)
         )
 
-    DraftBackendFactory._create_dsa_decode_backend = create_decode
-    EAGLEDraftCudaGraphRunner.execute = execute
-    eagle_worker_v2.EagleDraftWorker.draft_forward = draft_forward
-    eagle_worker_v2.per_step_draft_out_cache_loc = per_step_locations
-    _installed = True
-    return True
+    return [
+        (
+            DraftBackendFactory,
+            "_create_dsa_decode_backend",
+            previous_factory,
+            create_decode,
+        ),
+        (EAGLEDraftCudaGraphRunner, "execute", previous_execute, execute),
+        (
+            eagle_worker_v2.EagleDraftWorker,
+            "draft_forward",
+            previous_draft_forward,
+            draft_forward,
+        ),
+        (
+            eagle_worker_v2,
+            "per_step_draft_out_cache_loc",
+            previous_locations,
+            per_step_locations,
+        ),
+    ]

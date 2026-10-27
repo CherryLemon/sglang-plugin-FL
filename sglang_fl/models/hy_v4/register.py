@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HYV4 registration and narrowly scoped v0.5.18 compatibility hooks."""
+"""HYV4 registration and narrowly scoped text/NextN compatibility hooks."""
 
 import sys
 
@@ -10,15 +10,17 @@ def _hy4(config):
     return getattr(config, "model_type", None) in ("hy_v4", "hy_v4_vl")
 
 
-def _replace_imported_function(module, name, replacement):
+def _function_patches(module, name, replacement):
     previous = getattr(module, name)
-    setattr(module, name, replacement)
+    patches = [(module, name, previous, replacement)]
     for loaded in tuple(sys.modules.values()):
         if loaded is None or not getattr(loaded, "__name__", "").startswith("sglang."):
             continue
         for key, value in tuple(vars(loaded).items()):
             if value is previous:
-                setattr(loaded, key, replacement)
+                patches.append((loaded, key, previous, replacement))
+
+    return patches
 
 
 def register_hy_v4():
@@ -35,22 +37,12 @@ def register_hy_v4():
     from .nextn_utils import configure_hy4_draft, configure_hy4_hidden_shapes
     from .vl_model import HYV4VLForConditionalGeneration
 
-    AutoConfig.register("hy_v4", HYV4Config, exist_ok=True)
-    AutoConfig.register("hy_v4_vl", HYV4VLConfig, exist_ok=True)
-    ModelRegistry.models.update(
-        {
-            "HYV4ForCausalLM": HYV4ForCausalLM,
-            "HYV4VLForConditionalGeneration": HYV4VLForConditionalGeneration,
-            "HYV4ForCausalLMNextN": HYV4ForCausalLMNextN,
-        }
-    )
     previous_draft = mc.ModelConfig._config_draft_model
 
     def config_draft(self):
         previous_draft(self)
         configure_hy4_draft(self)
 
-    mc.ModelConfig._config_draft_model = config_draft
     previous_dsa = mc.is_deepseek_dsa
     previous_skip = mc.dsa_layer_skips_topk
 
@@ -65,8 +57,6 @@ def register_hy_v4():
             )
         return previous_skip(config, layer_id)
 
-    _replace_imported_function(mc, "is_deepseek_dsa", is_dsa)
-    _replace_imported_function(mc, "dsa_layer_skips_topk", skips_topk)
     previous_shapes = mc.ModelConfig._derive_model_shapes
 
     def derive_shapes(self):
@@ -86,7 +76,6 @@ def register_hy_v4():
             self._init_mla_scaling(config.rope_parameters)
             configure_hy4_hidden_shapes(self)
 
-    mc.ModelConfig._derive_model_shapes = derive_shapes
     previous_backend = ATTENTION_BACKENDS["dsa"]
 
     def create_backend(runner):
@@ -96,19 +85,65 @@ def register_hy_v4():
             return HYV4SparseAttnBackend(runner)
         return previous_backend(runner)
 
-    ATTENTION_BACKENDS["dsa"] = create_backend
+    # Construct the sink factory and causal wrapper together. The latter calls
+    # the former, while the published slot has only one final replacement.
+    from .draft_attention_backend import prepare_patches as sink_patches
+    from .draft_causal_lengths import prepare_patches as causal_patches
+
+    sinks = sink_patches()
+    causal = causal_patches(sinks[0][3])
+    causal[0] = (*sinks[0][:3], causal[0][3])
+    patches = [
+        (mc.ModelConfig, "_config_draft_model", previous_draft, config_draft),
+        (mc.ModelConfig, "_derive_model_shapes", previous_shapes, derive_shapes),
+        *_function_patches(mc, "is_deepseek_dsa", is_dsa),
+        *_function_patches(mc, "dsa_layer_skips_topk", skips_topk),
+        sinks[1],
+        *causal,
+    ]
+    # Alias discovery can encounter the defining slot twice.
+    unique = {
+        (id(owner), name): (owner, name, old, new) for owner, name, old, new in patches
+    }
+    patches = list(unique.values())
+    for owner, name, old, _ in patches:
+        if getattr(owner, name) is not old:
+            raise RuntimeError(f"HYV4 compatibility owner changed: {name}")
+
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    configs = {"hy_v4": HYV4Config, "hy_v4_vl": HYV4VLConfig}
+    models = {
+        "HYV4ForCausalLM": HYV4ForCausalLM,
+        "HYV4VLForConditionalGeneration": HYV4VLForConditionalGeneration,
+        "HYV4ForCausalLMNextN": HYV4ForCausalLMNextN,
+    }
+    missing = object()
+    old_configs = {
+        key: CONFIG_MAPPING._extra_content.get(key, missing) for key in configs
+    }
+    old_models = {key: ModelRegistry.models.get(key, missing) for key in models}
+    applied = []
+    try:
+        for key, cls in configs.items():
+            AutoConfig.register(key, cls, exist_ok=True)
+        ModelRegistry.models.update(models)
+        for owner, name, old, new in patches:
+            setattr(owner, name, new)
+            applied.append((owner, name, old))
+        ATTENTION_BACKENDS["dsa"] = create_backend
+    except BaseException:
+        ATTENTION_BACKENDS["dsa"] = previous_backend
+        for owner, name, old in reversed(applied):
+            setattr(owner, name, old)
+        for mapping, originals in (
+            (ModelRegistry.models, old_models),
+            (CONFIG_MAPPING._extra_content, old_configs),
+        ):
+            for key, old in originals.items():
+                if old is missing:
+                    mapping.pop(key, None)
+                else:
+                    mapping[key] = old
+        raise
     _registered = True
-    import os
-    from .mrope_compat import install
-
-    install(enabled=os.environ.get("SGLANG_HY4_MROPE_COMPAT", "0") == "1")
-    from .draft_attention_backend import install as install_draft_sink_backend
-
-    install_draft_sink_backend(
-        enabled=os.environ.get("SGLANG_HY4_DRAFT_SINK_BACKEND", "0") == "1"
-    )
-    from .draft_causal_lengths import install as install_draft_causal_lengths
-
-    install_draft_causal_lengths(
-        enabled=os.environ.get("SGLANG_HY4_DRAFT_CAUSAL_LENGTHS", "0") == "1"
-    )

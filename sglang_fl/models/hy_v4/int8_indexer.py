@@ -154,6 +154,3 @@ def _forward_int8(
 
 def install_int8_indexer(indexer):
     indexer.forward = MethodType(_forward_int8, indexer)
-    from .indexer_mm import install_indexer_mm
-
-    install_indexer_mm(indexer)

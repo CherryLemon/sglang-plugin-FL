@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Registration-time HYV4 draft sink routing; default OFF, no numerical changes.
+"""Registration-time HYV4 draft sink routing; no numerical changes.
 
 Native draft factories bypass the model's attention registry. Preserve their
 container/metadata behavior while selecting the already existing HYV4 backend
@@ -8,16 +8,8 @@ for this model family. Install before model/backend construction and capture.
 
 from functools import wraps
 
-_installed = False
 
-
-def install(*, enabled=False):
-    global _installed
-    if _installed:
-        return True
-    if not enabled:
-        return False
-
+def prepare_patches():
     from sglang.srt.layers.attention.dsa_backend import (
         DeepseekSparseAttnMultiStepBackend,
     )
@@ -80,7 +72,17 @@ def install(*, enabled=False):
             ),
         )
 
-    DraftBackendFactory._create_dsa_decode_backend = create_decode
-    DraftBackendFactory._create_dsa_prefill_backend = create_extend
-    _installed = True
-    return True
+    return [
+        (
+            DraftBackendFactory,
+            "_create_dsa_decode_backend",
+            previous_decode,
+            create_decode,
+        ),
+        (
+            DraftBackendFactory,
+            "_create_dsa_prefill_backend",
+            previous_extend,
+            create_extend,
+        ),
+    ]

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Default-OFF SG routing for the qualified FlagGems-sglang MLA operator.
+"""Policy-selected routing for the FlagGems-sglang MLA operator.
 
 Indices remain native TopK physical KV slots. Policy, metadata qualification,
 and native fallback belong here; numerical kernels belong to FlagGems-sglang.
@@ -14,7 +14,11 @@ def _public_provider():
     import torch
 
     module_name = "flaggems_sglang.ops.sparse_mla_active_split"
-    if torch.cuda.is_current_stream_capturing() and module_name not in sys.modules:
+    if (
+        torch.cuda.is_available()
+        and torch.cuda.is_current_stream_capturing()
+        and module_name not in sys.modules
+    ):
         return None
     try:
         import flaggems_sglang
@@ -22,7 +26,9 @@ def _public_provider():
             metadata,
             sparse_mla_active_split,
         )
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name not in ("flaggems_sglang", "flaggems_sglang.ops", module_name):
+            raise
         return None
     public = getattr(flaggems_sglang, "sparse_mla_active_split", None)
     lookup = getattr(flaggems_sglang, "get_op", None)
@@ -56,6 +62,19 @@ def maybe_run(
 
     if torch.compiler.is_compiling():
         return None
+    from sglang_fl.dispatch import resolve_op
+
+    selected = resolve_op("sparse_mla_active_split")
+    return selected(query, kv_cache, indices, sm_scale, sink, lengths, heads)
+
+
+def _native_route(*args):
+    # The caller retains the native FlashMLA call, including its metadata and
+    # output ownership. A decline occurs before any numerical execution.
+    return None
+
+
+def _library_route(query, kv_cache, indices, sm_scale, sink, lengths, heads):
     resolved = _public_provider()
     if resolved is None:
         return None
@@ -71,3 +90,39 @@ def maybe_run(
         sink=sink,
         lengths=lengths,
     )[0]
+
+
+def register_ops(registry):
+    """Use the shared manager's preference, per-op order and vendor filters.
+
+    Native is the default. Selecting vendor:nvidia or the explicit library
+    implementation opts into the optional provider before any launch.
+    """
+    from sglang_fl.dispatch import BackendImplKind, BackendPriority, OpImpl
+
+    registry.register_many(
+        [
+            OpImpl(
+                "sparse_mla_active_split",
+                "hy4.native",
+                BackendImplKind.DEFAULT,
+                _native_route,
+                priority=BackendPriority.DEFAULT,
+            ),
+            OpImpl(
+                "sparse_mla_active_split",
+                "hy4.reference",
+                BackendImplKind.REFERENCE,
+                _native_route,
+                priority=BackendPriority.REFERENCE,
+            ),
+            OpImpl(
+                "sparse_mla_active_split",
+                "hy4.flaggems",
+                BackendImplKind.VENDOR,
+                _library_route,
+                vendor="nvidia",
+                priority=BackendPriority.VENDOR,
+            ),
+        ]
+    )

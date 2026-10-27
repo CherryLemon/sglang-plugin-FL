@@ -43,10 +43,8 @@ logger = logging.getLogger(__name__)
 
 
 def _hpc_ihc_available(op_name: str, hc_mult: int, hidden_size: int) -> bool:
-    try:
-        from sglang_fl.models.hy_v4.ihc_kernels import _hpc_ihc_op
-    except ImportError:
-        return False
+    from .ihc_kernels import _hpc_ihc_op
+
     return _hpc_ihc_op(op_name, hc_mult, hidden_size) is not None
 
 
@@ -112,7 +110,6 @@ class HYV4HCPreLayer(nn.Module):
         self.hc_base = nn.Parameter(
             torch.empty(2 * config.hc_mult, dtype=torch.float32)
         )
-        self._fused_ihc_pre_disabled = False
 
     def forward(
         self,
@@ -120,29 +117,22 @@ class HYV4HCPreLayer(nn.Module):
         rms_weight: torch.Tensor | None = None,
         rms_eps: float = 0.0,
     ):
-        if hidden_states.is_cuda and (not self._fused_ihc_pre_disabled):
-            try:
-                from sglang_fl.models.hy_v4.ihc_kernels import fused_hy4_ihc_pre
-            except ImportError:
-                pass
-            else:
-                try:
-                    return fused_hy4_ihc_pre(
-                        hidden_states,
-                        self.hc_fn.weight,
-                        self.hc_scale,
-                        self.hc_base,
-                        self.magnitude,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                        rms_weight,
-                        rms_eps,
-                    )
-                except Exception:
-                    self._fused_ihc_pre_disabled = True
-                    logger.warning(
-                        "fused_hy4_ihc_pre failed, disabling fused path", exc_info=True
-                    )
+        if hidden_states.is_cuda and _hpc_ihc_available(
+            "fuse_ihc_pre", self.hc_mult, self.hidden_size
+        ):
+            from .ihc_kernels import fused_hy4_ihc_pre
+
+            return fused_hy4_ihc_pre(
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.magnitude,
+                self.rms_norm_eps,
+                self.hc_eps,
+                rms_weight,
+                rms_eps,
+            )
         shape = hidden_states.shape
         flat = hidden_states.flatten(1).float()
         scale = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_norm_eps)
@@ -182,8 +172,6 @@ class HYV4HCLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.hc_pre = HYV4HCPreLayer(config, f"{prefix}.hc_pre")
-        self._fused_ihc_post_disabled = False
-        self._fused_ihc_post_pre_disabled = False
 
     def prepare_input(self, hidden_states: torch.Tensor):
         if hidden_states.ndim == 3:
@@ -216,57 +204,14 @@ class HYV4HCLayer(nn.Module):
         return (reduced, post, hidden_states)
 
     def post(self, output, residual, post):
-        if output.is_cuda and (not self._fused_ihc_post_disabled):
-            try:
-                from sglang_fl.models.hy_v4.ihc_kernels import fused_hy4_ihc_post
-            except ImportError:
-                pass
-            else:
-                try:
-                    return fused_hy4_ihc_post(output, residual, post)
-                except Exception:
-                    self._fused_ihc_post_disabled = True
-                    logger.warning(
-                        "fused_hy4_ihc_post failed, disabling fused path", exc_info=True
-                    )
+        if output.is_cuda and _hpc_ihc_available(
+            "fuse_ihc_post", self.hc_mult, self.hidden_size
+        ):
+            from .ihc_kernels import fused_hy4_ihc_post
+
+            return fused_hy4_ihc_post(output, residual, post)
         result = post.float().unsqueeze(-1) * output.float().unsqueeze(1)
         return (result + residual.float()).to(output.dtype)
-
-    def post_pre(self, output, residual, post, next_layer, norm):
-        if (
-            output.is_cuda
-            and (not self._fused_ihc_post_pre_disabled)
-            and _hpc_ihc_available("fuse_ihc_post_pre", self.hc_mult, self.hidden_size)
-        ):
-            try:
-                from sglang_fl.models.hy_v4.ihc_kernels import fused_hy4_ihc_post_pre
-            except ImportError:
-                pass
-            else:
-                try:
-                    next_residual, reduced, next_post = fused_hy4_ihc_post_pre(
-                        output,
-                        residual,
-                        post,
-                        next_layer.hc_pre.hc_fn.weight,
-                        next_layer.hc_pre.hc_scale,
-                        next_layer.hc_pre.hc_base,
-                        next_layer.hc_pre.magnitude,
-                        next_layer.hc_pre.rms_norm_eps,
-                        next_layer.hc_pre.hc_eps,
-                        norm.weight,
-                        norm.variance_epsilon,
-                    )
-                    return (reduced, next_post, next_residual)
-                except Exception:
-                    self._fused_ihc_post_pre_disabled = True
-                    logger.warning(
-                        "fused_hy4_ihc_post_pre failed, disabling fused path",
-                        exc_info=True,
-                    )
-        next_residual = self.post(output, residual, post)
-        next_residual = next_layer.prepare_input(next_residual)
-        return next_layer.pre(next_residual, norm)
 
 
 class HYV4HCHeadLayer(nn.Module):
@@ -284,37 +229,23 @@ class HYV4HCHeadLayer(nn.Module):
         self.hc_head_base = nn.Parameter(
             torch.empty(config.hc_mult, dtype=torch.float32)
         )
-        self._fused_ihc_head_disabled = False
 
     def forward(self, hidden_states: torch.Tensor, norm: RMSNorm | None = None):
-        if (
-            hidden_states.is_cuda
-            and (not self._fused_ihc_head_disabled)
-            and _hpc_ihc_available(
-                "fuse_ihc_head", self.config.hc_mult, self.config.hidden_size
-            )
+        if hidden_states.is_cuda and _hpc_ihc_available(
+            "fuse_ihc_head", self.config.hc_mult, self.config.hidden_size
         ):
-            try:
-                from sglang_fl.models.hy_v4.ihc_kernels import fused_hy4_ihc_head
-            except ImportError:
-                pass
-            else:
-                try:
-                    return fused_hy4_ihc_head(
-                        hidden_states,
-                        self.hc_head_fn.weight,
-                        self.hc_head_scale,
-                        self.hc_head_base,
-                        self.config.rms_norm_eps,
-                        self.config.hc_eps,
-                        None if norm is None else norm.weight,
-                        0.0 if norm is None else norm.variance_epsilon,
-                    )
-                except Exception:
-                    self._fused_ihc_head_disabled = True
-                    logger.warning(
-                        "fused_hy4_ihc_head failed, disabling fused path", exc_info=True
-                    )
+            from .ihc_kernels import fused_hy4_ihc_head
+
+            return fused_hy4_ihc_head(
+                hidden_states,
+                self.hc_head_fn.weight,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.config.rms_norm_eps,
+                self.config.hc_eps,
+                None if norm is None else norm.weight,
+                0.0 if norm is None else norm.variance_epsilon,
+            )
         shape = hidden_states.shape
         flat = hidden_states.flatten(1).float()
         scale = torch.rsqrt(
@@ -469,11 +400,6 @@ class HYV4Attention(HYV4MLAForwardMixin, DeepseekV2AttentionMLA):
         self._gate_backend = self._resolve_gate_backend(
             getattr(config, "gating_type", None), self._gate_fallback_backend
         )
-        from .small_m_gate import make_small_m_gate_projector
-
-        self._small_m_gate_projector = make_small_m_gate_projector(
-            self.linear_gate, f"{prefix}.linear_gate"
-        )
 
     def forward_absorb_prepare(
         self,
@@ -611,12 +537,6 @@ class HYV4Attention(HYV4MLAForwardMixin, DeepseekV2AttentionMLA):
     def prepare_attention_output_gate(self, hidden_states, forward_batch=None):
         if self._gate_backend == "hpc":
             return hidden_states
-        if not torch.compiler.is_compiling():
-            projector = self._small_m_gate_projector
-            if projector is not None:
-                projected = projector.maybe_project(hidden_states, forward_batch)
-                if projected is not None:
-                    return projected
         return self.linear_gate(hidden_states)[0]
 
     def apply_attention_output_gate(self, attn_out, gate):
@@ -734,16 +654,10 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
-        from sglang_fl.models.hy_v4.ihc_post_pre import maybe_ihc_post_pre
-
-        fused_boundary = maybe_ihc_post_pre(self, hidden_states, residual, post)
-        if fused_boundary is None:
-            streams = self.hc_attn_layer.post(hidden_states, residual, post)
-            hidden_states, post, residual = self.hc_mlp_layer.pre(
-                streams, self.post_attention_layernorm
-            )
-        else:
-            hidden_states, post, residual = fused_boundary
+        streams = self.hc_attn_layer.post(hidden_states, residual, post)
+        hidden_states, post, residual = self.hc_mlp_layer.pre(
+            streams, self.post_attention_layernorm
+        )
         if isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, forward_batch)
         else:

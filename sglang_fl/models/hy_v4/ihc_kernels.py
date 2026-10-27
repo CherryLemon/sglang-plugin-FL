@@ -18,7 +18,9 @@ _HPC_IHC_HIDDEN_SIZES = (4096, 6144)
 def _hpc_ihc_op(op_name: str, hc_mult: int, hidden_size: int):
     try:
         import hpc
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name != "hpc":
+            raise
         return None
     op = getattr(hpc, op_name, None)
     if op is None:
@@ -91,42 +93,6 @@ def fused_hy4_ihc_post(
             "optional HPC iHC API is unavailable; use model fallback"
         )
     return hpc_op(output, residual, post)
-
-
-def fused_hy4_ihc_post_pre(
-    output: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    magnitude: float,
-    norm_eps: float,
-    hc_eps: float,
-    rms_weight: torch.Tensor | None = None,
-    rms_eps: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    hc_mult = residual.shape[1]
-    hidden_size = output.shape[-1]
-    hpc_op = _hpc_ihc_op("fuse_ihc_post_pre", hc_mult, hidden_size)
-    if hpc_op is None:
-        raise NotImplementedError(
-            "optional HPC iHC API is unavailable; use model fallback"
-        )
-    return hpc_op(
-        output.contiguous(),
-        residual.contiguous(),
-        post.contiguous(),
-        hc_fn.contiguous(),
-        hc_scale.contiguous(),
-        hc_base.contiguous(),
-        norm_eps,
-        hc_eps,
-        magnitude,
-        rms_weight,
-        rms_eps,
-        True,
-    )
 
 
 def fused_hy4_ihc_head(

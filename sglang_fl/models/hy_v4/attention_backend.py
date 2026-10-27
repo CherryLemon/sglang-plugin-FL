@@ -9,7 +9,7 @@ from .attention_policy import freeze_role_policy
 
 class HYV4SparseAttnBackend(DeepseekSparseAttnBackend):
     def __init__(self, model_runner, **kwargs):
-        self._hy4_mla_role, self._hy4_mla_opted_in = freeze_role_policy(model_runner)
+        self._hy4_mla_role = freeze_role_policy(model_runner)
         self._hy4_forward_mode = None
         args = model_runner.server_args
         for name in ("dsa_prefill_backend", "dsa_decode_backend"):
