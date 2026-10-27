@@ -56,11 +56,20 @@ family. Image/video inputs are rejected; no media processor or encoder is built.
 
 Select `flashmla_sparse` for both DSA prefill and decode to retain per-head
 attention sinks. `HY4_INDEXER_DTYPE` accepts `auto`, `fp8` or `int8`; auto keeps
-FP8 on NVIDIA SM90+ and selects INT8 elsewhere. INT8 requires `flag_gems.fused.int8_sparse_indexer`, which is not published
-by the linked component PRs or stock FlagGems. Explicit INT8 and non-SM90 auto
-selection therefore remain blocked on that operator-library dependency; no
-historical diagnostic patch is offered as a production installation method.
-NVIDIA SM90+ auto selection retains the native FP8 indexer.
+FP8 on NVIDIA SM90+ and selects INT8 elsewhere. INT8 uses the published quantize/cache-store/paged-logits APIs in
+[FlagGems #7782](https://github.com/flagos-ai/FlagGems/pull/7782). Install the
+exact public revision when selecting INT8:
+
+```sh
+pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@bfb7b3fab3487a20e37ffb535ee3854eeefcff95"
+```
+
+The API retains finite BF16/FP16/FP32 inputs and the packed cache layout.
+Current-package GPU math, graph replay, strict FP32 power-of-two boundary
+checks and whole-model equivalence remain unqualified. NVIDIA SM90+ auto
+selection retains the native FP8 indexer; API publication does not qualify a
+new device or change the framework's precision policy.
+
 
 
 
