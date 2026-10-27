@@ -748,6 +748,10 @@ def load_plugin():
     if _plugin_loaded:
         return
     _plugin_loaded = True
+    if os.environ.get("SGLANG_HY4_ENABLE", "0") == "1":
+        from sglang_fl.models.hy_v4.register import register_hy_v4
+
+        register_hy_v4()
     if _is_rank0():
         logger.info("sglang_fl plugin loading")
 
