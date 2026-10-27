@@ -714,7 +714,9 @@ def activate_platform() -> str | None:
 
     info = get_device_info()
     if info is None:
-        logger.warning("sglang_fl platform activation failed: DeviceDetector unavailable")
+        logger.warning(
+            "sglang_fl platform activation failed: DeviceDetector unavailable"
+        )
         return None
     logger.info(
         "sglang_fl platform activating: vendor=%s, device=%s",
@@ -733,6 +735,7 @@ _plugin_active = False
 def is_plugin_loaded() -> bool:
     """Return whether SGLang invoked the general plugin entry point."""
     return _plugin_loaded
+
 
 def is_plugin_active() -> bool:
     """Return whether the general plugin completed its initialization."""
