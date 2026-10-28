@@ -143,6 +143,9 @@ def runtime_metadata():
             or key
             in (
                 "SGLANG_PLUGINS",
+                "SGLANG_FL_DIST_BACKEND",
+                "FLAGCX_PATH",
+                "TORCH_MCCL_BLOCKING_WAIT",
                 "USE_FLAGGEMS",
                 "SGLANG_FL_FLAGOS_BLACKLIST",
             )

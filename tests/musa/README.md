@@ -11,12 +11,16 @@ plugin; FlagGems-sglang supplies only Triton operators.
 
 ```bash
 python -m pip install '.[musa]'
-MODEL_PATH=/models/Qwen3.6-35B-A3B bash examples/musa/qwen36_tp2.sh --port 30000
+FLAGCX_PATH=/sgl-workspace/FlagCX MODEL_PATH=/models/Qwen3.6-35B-A3B \
+  bash examples/musa/qwen36_tp2.sh --port 30000
 ```
 
 The example sources the vendor runtime compatibility settings in
 `examples/musa/qwen36_runtime.env`. Set visible cards, communication interface
-and any isolated dependency paths before launching. Add `--disable-cuda-graph`
+and any isolated dependency paths before launching. `FLAGCX_PATH` must point
+to the built FlagCX tree; selecting `flagcx` alone does not load that dependency.
+When FlagCX is unavailable, the MUSA all-reduce hook preserves the upstream
+coordinator's custom-AR/PyMCCL selection, including its graph context. Add `--disable-cuda-graph`
 for eager execution. Normal decode uses the upstream model forward; the
 experimental decode-graph combine path has been removed. Eager long-prefill
 combine and the guarded M4 shared expert/MoE paths select automatically.

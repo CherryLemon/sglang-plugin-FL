@@ -14,7 +14,7 @@
 
 """CommunicatorFL — Full OOT communicator for SGLang plugin.
 
-Wraps FlagCX (when available) or falls back to torch.distributed.
+Wraps FlagCX or the platform fallback; MUSA can retain its native coordinator.
 Created per GroupCoordinator via AROUND hook on __init__.
 
 Why AROUND hooks instead of injecting flagcx as torch.distributed backend:
@@ -28,7 +28,7 @@ Why AROUND hooks instead of injecting flagcx as torch.distributed backend:
 
 import logging
 from collections import namedtuple
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -89,16 +89,16 @@ class CommunicatorFL:
                 )
                 if not self._flagcx_comm.available:
                     logger.warning(
-                        "FlagCX communicator init failed, falling back to torch.distributed"
+                        "FlagCX communicator init failed; retaining platform fallback"
                     )
                     self._flagcx_comm = None
             except Exception as e:
                 logger.warning(
-                    f"FlagCX communicator creation failed: {e}, using torch.distributed"
+                    f"FlagCX communicator creation failed: {e}; retaining platform fallback"
                 )
                 self._flagcx_comm = None
 
-        backend_name = "flagcx" if self._flagcx_comm else "torch.distributed"
+        backend_name = "flagcx" if self._flagcx_comm else "platform fallback"
         logger.info(
             f"CommunicatorFL created: world_size={world_size}, "
             f"rank={rank_in_group}, backend={backend_name}"
@@ -106,18 +106,29 @@ class CommunicatorFL:
 
     # ─── all_reduce ──────────────────────────────────────────────────────────
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        """In-place all-reduce. Returns the input tensor (modified in-place)."""
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        *,
+        native_fallback: Optional[Callable[[], torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Use FlagCX, or preserve MUSA's native coordinator selection.
+
+        The coordinator owns custom-AR and PyMCCL graph contexts. Its fallback
+        must be selected before executing a collective, rather than replacing
+        that selection with torch.distributed's host-waiting MCCL path.
+        """
         if self._flagcx_comm and not self._flagcx_comm.disabled:
             out = self._flagcx_comm.all_reduce(input_)
-            if out is not None:
-                # Device communicators may either return a new result or update
-                # ``input_`` in place.  FlagCX currently does the latter; avoid
-                # launching a redundant device-to-device self-copy in that case.
-                if out is not input_:
-                    input_.copy_(out)
-                return input_
-        # Fallback: torch.distributed
+            if out is None:
+                raise RuntimeError("active FlagCX all-reduce returned no result")
+            # An active collective must never fall through to another backend.
+            if out is not input_:
+                input_.copy_(out)
+            return input_
+        if input_.device.type == "musa" and native_fallback is not None:
+            return native_fallback()
+        # Standalone callers and other devices retain their existing fallback.
         dist.all_reduce(input_, group=self.device_group)
         return input_
 

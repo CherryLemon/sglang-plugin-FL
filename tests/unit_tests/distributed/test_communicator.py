@@ -162,3 +162,98 @@ def test_send_recv_fallback_use_dist_global_ranks(monkeypatch) -> None:
 
     dist_send.assert_called_once_with(tensor, 11, "device-group")
     dist_recv.assert_called_once_with(tensor, 11, "device-group")
+
+
+def test_musa_unavailable_flagcx_preserves_native_coordinator(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang_fl.distributed import communicator as comm_mod
+
+    dist_reduce = Mock()
+    monkeypatch.setattr(comm_mod.dist, "all_reduce", dist_reduce)
+    tensor = SimpleNamespace(device=SimpleNamespace(type="musa"))
+    result = object()
+    native = Mock(return_value=result)
+    for flagcx in (None, SimpleNamespace(disabled=True)):
+        comm = _make_comm(flagcx=flagcx)
+        assert comm.all_reduce(tensor, native_fallback=native) is result
+    assert native.call_count == 2
+    dist_reduce.assert_not_called()
+
+
+def test_cpu_retains_existing_fallback_with_native_callback(monkeypatch):
+    from sglang_fl.distributed import communicator as comm_mod
+
+    dist_reduce, native = Mock(), Mock()
+    monkeypatch.setattr(comm_mod.dist, "all_reduce", dist_reduce)
+    tensor = torch.ones(2)
+    assert _make_comm().all_reduce(tensor, native_fallback=native) is tensor
+    native.assert_not_called()
+    dist_reduce.assert_called_once()
+
+
+def test_active_flagcx_failure_never_retries_native_or_dist(monkeypatch):
+    import pytest
+
+    from sglang_fl.distributed import communicator as comm_mod
+
+    dist_reduce, native = Mock(), Mock()
+    monkeypatch.setattr(comm_mod.dist, "all_reduce", dist_reduce)
+    error = RuntimeError("collective failed after write")
+    tensor = torch.zeros(1)
+
+    def fail(value):
+        value.fill_(9)
+        raise error
+
+    flagcx = _FakeFlagCX()
+    flagcx.all_reduce = fail
+    with pytest.raises(RuntimeError) as caught:
+        _make_comm(flagcx=flagcx).all_reduce(tensor, native_fallback=native)
+    assert caught.value is error
+    assert tensor.item() == 9
+    native.assert_not_called()
+    dist_reduce.assert_not_called()
+
+
+def test_active_flagcx_missing_result_is_an_error(monkeypatch):
+    import pytest
+
+    from sglang_fl.distributed import communicator as comm_mod
+
+    dist_reduce, native = Mock(), Mock()
+    monkeypatch.setattr(comm_mod.dist, "all_reduce", dist_reduce)
+    flagcx = _FakeFlagCX()
+    flagcx.all_reduce = Mock(return_value=None)
+    with pytest.raises(RuntimeError, match="returned no result"):
+        _make_comm(flagcx=flagcx).all_reduce(torch.ones(1), native_fallback=native)
+    native.assert_not_called()
+    dist_reduce.assert_not_called()
+
+
+def test_all_reduce_hook_passes_the_original_coordinator(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import sglang_fl
+
+    hooks = {}
+    module = ModuleType("sglang.srt.plugins.hook_registry")
+    module.HookType = SimpleNamespace(AROUND="around")
+    module.HookRegistry = SimpleNamespace(
+        register=lambda target, fn, kind: hooks.setdefault(target, fn)
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    sglang_fl._setup_communicator_hooks()
+    tensor, expected = object(), object()
+    group = SimpleNamespace()
+    native = Mock(return_value=expected)
+
+    def delegated(value, *, native_fallback):
+        assert value is tensor
+        return native_fallback()
+
+    group.fl_communicator = SimpleNamespace(disabled=False, all_reduce=delegated)
+    hook = hooks["sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce"]
+    assert hook(native, group, tensor) is expected
+    native.assert_called_once_with(group, tensor)

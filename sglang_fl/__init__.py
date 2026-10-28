@@ -518,7 +518,9 @@ def _setup_communicator_hooks():
     def _all_reduce_hook(original_fn, self, input_):
         comm = getattr(self, "fl_communicator", None)
         if comm is not None and not comm.disabled:
-            return comm.all_reduce(input_)
+            return comm.all_reduce(
+                input_, native_fallback=lambda: original_fn(self, input_)
+            )
         return original_fn(self, input_)
 
     # ── reduce_scatter_tensor hook ──

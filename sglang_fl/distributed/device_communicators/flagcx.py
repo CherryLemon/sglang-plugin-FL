@@ -106,7 +106,7 @@ class FlagCXCommunicator:
             ) = _import_flagcx_wrapper()
         except Exception as e:
             logger.warning(
-                f"FlagCX wrapper import failed: {e}. Falling back to torch.distributed."
+                f"FlagCX wrapper import failed: {e}. Communicator unavailable."
             )
             self.disabled = True
             return
