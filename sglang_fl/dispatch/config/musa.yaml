@@ -15,6 +15,19 @@
 # SGLang-FL Dispatch Configuration for MUSA (Moore Threads) platform
 prefer: flagos
 
+# Launch profiles for upstream SGLang/TorchAda kernels. Hardware, dtype and
+# model-shape guards remain in the vendor bridge. SGLANG_FL_CONFIG replaces
+# this section as well; omitted profiles retain the upstream schedule.
+# FlagGems-sglang kernel defaults live in its _mthreads/tune_configs.yaml.
+kernel_tuning:
+  fused_moe:
+    r2_m4_baseline: {BLOCK_SIZE_M: 16, BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 1}
+    decode: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 1, num_warps: 4, num_stages: 1}
+    prefill: {BLOCK_SIZE_M: 32, BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 4, num_warps: 8, num_stages: 1}
+    prefill_m16k: {BLOCK_SIZE_M: 64, BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 4, num_warps: 8, num_stages: 1}
+  topk:
+    qwen36: {num_warps: 1, num_ctas: 1, num_stages: 1}
+
 # FlagGems tag:    v5.3.0
 # FlagGems commit: 98fae44cdf2898f39c7f24f080d7c88b83d7c593
 flagos_blacklist:

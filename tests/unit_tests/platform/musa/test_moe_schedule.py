@@ -41,7 +41,14 @@ def test_s5000_decode_shape_uses_robust_schedule(monkeypatch):
         return_down_config=True,
     )
 
-    assert config == moe_schedule._S5000_DECODE_CONFIG
+    assert config == {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
     assert down_config == config
     assert down_config is not config
     assert max_block_m == 32
@@ -104,7 +111,12 @@ def test_installed_wrapper_keeps_independent_m4_switch_live(monkeypatch):
     wrapped = moe_schedule._wrap_try_get_optimal_moe_config(lambda *a, **kw: sentinel)
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) is sentinel
     monkeypatch.setenv(moe_schedule._R2_M4_BASELINE_ENV, "1")
-    assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == moe_schedule._R2_M4_BASELINE_CONFIG
+    assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+    }
     monkeypatch.setenv(moe_schedule._R2_M4_BASELINE_ENV, "0")
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) is sentinel
 
@@ -129,7 +141,14 @@ def test_s5000_long_prefill_uses_tuned_schedule(monkeypatch):
             tokens,
             return_down_config=True,
         )
-        assert config == moe_schedule._S5000_PREFILL_CONFIG
+        assert config == {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1,
+        }
         assert down_config == config
         assert down_config is not config
         assert max_block_m == 32
@@ -156,7 +175,14 @@ def test_s5000_exact_m16k_prefill_uses_bm64_schedule(monkeypatch):
         return_down_config=True,
     )
 
-    assert config == moe_schedule._S5000_PREFILL_M16K_CONFIG
+    assert config == {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 8,
+        "num_stages": 1,
+    }
     assert config["BLOCK_SIZE_M"] == 64
     assert down_config == config
     assert down_config is not config
@@ -219,7 +245,7 @@ def test_r2_m4_baseline_is_default_and_returns_independent_configs(monkeypatch):
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == expected
     up, down = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4, return_down_config=True)
     assert up == expected and down == (None, None)
-    up['BLOCK_SIZE_N'] = 64
+    up["BLOCK_SIZE_N"] = 64
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) == expected
     monkeypatch.setenv("SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE", "0")
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) is sentinel
@@ -238,7 +264,14 @@ def test_decode_accepts_canonical_intermediate_size_512(monkeypatch):
         w1_512, w2_512, 8, None, 64, return_down_config=True
     )
 
-    assert config == moe_schedule._S5000_DECODE_CONFIG
+    assert config == {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
     assert "enable_backend_opt" not in config
     assert down_config == config
     assert down_config is not config
@@ -267,10 +300,31 @@ def test_backend_opt_stays_on_the_decode_256_config_copy(monkeypatch):
     decode = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 64)
     assert decode["enable_backend_opt"] is True
     # Every branch returns a fresh copy of the module constant.
-    assert decode is not moe_schedule._S5000_DECODE_CONFIG
+    assert decode is not {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
     # Module-level constants must never be mutated by a call.
-    assert "enable_backend_opt" not in moe_schedule._S5000_DECODE_CONFIG
-    assert "enable_backend_opt" not in moe_schedule._S5000_PREFILL_CONFIG
+    assert "enable_backend_opt" not in {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
+    assert "enable_backend_opt" not in {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 8,
+        "num_stages": 1,
+    }
 
     prefill = wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4096)
     assert "enable_backend_opt" not in prefill
@@ -286,10 +340,14 @@ def test_r2_m4_restore_does_not_expand_shape_or_feature_contract(monkeypatch):
     wrapped = moe_schedule._wrap_try_get_optimal_moe_config(lambda *a, **kw: sentinel)
     for batch in (1, 2, 3, 5, 8):
         assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, batch) is sentinel
-    for kwargs in ({'is_marlin': True}, {'per_channel_quant': True}, {'block_shape': [128, 128]}):
+    for kwargs in (
+        {"is_marlin": True},
+        {"per_channel_quant": True},
+        {"block_shape": [128, 128]},
+    ):
         assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4, **kwargs) is sentinel
     assert wrapped(W1_SHAPE, W2_SHAPE, 4, None, 4) is sentinel
-    assert wrapped(W1_SHAPE, W2_SHAPE, 8, 'float32', 4) is sentinel
+    assert wrapped(W1_SHAPE, W2_SHAPE, 8, "float32", 4) is sentinel
     assert wrapped((256, 1024, 2048), (256, 2048, 512), 8, None, 4) is sentinel
     monkeypatch.setattr(moe_schedule, "_device_name", lambda: "MTT S4000")
     assert wrapped(W1_SHAPE, W2_SHAPE, 8, None, 4) is sentinel

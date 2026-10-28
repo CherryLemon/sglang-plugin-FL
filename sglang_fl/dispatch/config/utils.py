@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,6 +44,48 @@ import yaml
 
 # Directory containing config files (config/)
 _CONFIG_DIR = Path(__file__).parent
+
+
+@lru_cache(maxsize=8)
+def _load_kernel_tuning(path: str) -> dict:
+    """Load startup configuration once; file edits require a process restart."""
+    with open(path, encoding="utf-8") as stream:
+        config = yaml.safe_load(stream)
+    if not isinstance(config, dict):
+        raise ValueError("Kernel tuning configuration must be a mapping")
+    tuning = config.get("kernel_tuning", {})
+    if not isinstance(tuning, dict):
+        raise ValueError("kernel_tuning must be a mapping")
+    return tuning
+
+
+def get_kernel_tuning(
+    op_name: str, profile: str, platform: str = "musa"
+) -> Optional[dict]:
+    """Get one upstream-kernel launch profile from the effective platform YAML.
+
+    SGLANG_FL_CONFIG replaces platform defaults, including tuning profiles.
+    A missing profile retains the upstream selector. Invalid selected profiles
+    fail before launch. Copies prevent one caller from changing shared defaults.
+    """
+    path = os.environ.get("SGLANG_FL_CONFIG", "").strip() or get_config_path(platform)
+    if path is None:
+        return None
+    tuning = _load_kernel_tuning(str(path))
+    profiles = tuning.get(op_name, {})
+    if not isinstance(profiles, dict):
+        raise ValueError(f"Kernel tuning profiles for {op_name} must be a mapping")
+    options = profiles.get(profile)
+    if options is None:
+        return None
+    if not isinstance(options, dict):
+        raise ValueError(f"Kernel tuning profile {op_name}/{profile} must be a mapping")
+    for name, value in options.items():
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"Invalid positive integer kernel tuning option: {name}")
+        if name not in {"num_stages", "GROUP_SIZE_M"} and value & (value - 1):
+            raise ValueError(f"Kernel tuning option must be a power of two: {name}")
+    return dict(options)
 
 
 def get_platform_name() -> str:
@@ -54,6 +97,7 @@ def get_platform_name() -> str:
     """
     try:
         import torch
+
         if hasattr(torch, "txda") and torch.txda.is_available():
             return "tsingmicro"
         if hasattr(torch, "npu") and torch.npu.is_available():

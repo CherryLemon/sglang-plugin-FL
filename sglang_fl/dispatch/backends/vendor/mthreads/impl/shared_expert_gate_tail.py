@@ -13,7 +13,6 @@ def shared_expert_gate_tail_musa(block, hidden):
     gate = block.shared_expert_gate
     if (
         getattr(gate, "bias", None) is None
-        and kernel.triton is not None
         and kernel.candidate_guard_reason(
             hidden,
             gate.weight,
@@ -23,15 +22,16 @@ def shared_expert_gate_tail_musa(block, hidden):
         )
         == "eligible"
     ):
+        from flaggems_sglang import fused_shared_expert_gate_tail
+
         # Fixed-shape allocation is graph-owned, as in the measured core path;
         # the kernel receives an explicit output and never allocates implicitly.
         output = torch.empty_like(shared)
-        return kernel.fused_shared_expert_gate_tail(
+        return fused_shared_expert_gate_tail(
             hidden,
             gate.weight,
             shared,
             out=output,
-            enabled=True,
         )
     # Reuse the computed MLP output on a guard miss.
     return torch.sigmoid(gate(hidden)) * shared

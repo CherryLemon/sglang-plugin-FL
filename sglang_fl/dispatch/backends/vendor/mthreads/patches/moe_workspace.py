@@ -18,7 +18,7 @@ _PATCH_MARKER = "_sglang_fl_musa_moe_pre_kv_workspace"
 def _reserve(runner):
     if not is_s5000(runner.device):
         return False
-    from ..moe.fused_moe import maybe_preallocate_musa_m16k_moe_down_workspace
+    from ..moe.workspace import maybe_preallocate_musa_m16k_moe_down_workspace
 
     return maybe_preallocate_musa_m16k_moe_down_workspace(
         runner.model_config,

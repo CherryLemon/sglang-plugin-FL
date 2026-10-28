@@ -47,11 +47,21 @@ from functools import wraps
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
+from sglang_fl.dispatch.config.utils import get_kernel_tuning
+
 logger = logging.getLogger(__name__)
 
 _ENV_NAME = "SGLANG_MUSA_TOPK_SCHEDULE"
 _PATCH_MARKER = "_sglang_fl_musa_topk_schedule"
-_PINNED_OPTION_KWARGS = {"num_warps": 1, "num_ctas": 1, "num_stages": 1}
+
+
+def _pinned_options():
+    options = get_kernel_tuning("topk", "qwen36")
+    if options is not None and set(options) != {"num_warps", "num_ctas", "num_stages"}:
+        raise ValueError("TopK launch profile requires warps, CTAs and stages")
+    return options
+
+
 # Exact inner-JIT parameter names, arity, and order the pinned launcher
 # passes positionally/by keyword.  Validated at startup via
 # ``_inner_jit_abi_ok``; any drift fails closed.
@@ -211,7 +221,7 @@ def _fn_run_signature_ok(fn_run: Any) -> bool:
             K=8,
             BLOCK_K=8,
             BLOCK_WIDTH_SIZE_UP=256,
-            **dict(_PINNED_OPTION_KWARGS),
+            **dict(_pinned_options() or {}),
         )
     except TypeError:
         return False
@@ -246,7 +256,7 @@ def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
     """Verify once at wrapper/application startup; return ctx or None.
 
     Fail-closed checks: exact type identity with the imported standard
-    ``Config``/``Autotuner``/``JITFunction`` (subclasses and look-alikes fail
+    ``Config``/``Autotuner``/``JITFunction`` (subclasses and lookalike objects fail
     closed); the selected config's ``all_kwargs()`` shape; the inner JIT
     parameter names, arity, and order (``_inner_jit_abi_ok``) plus tuner/JIT
     ``arg_names`` consistency; empty reset/restore with no user hooks; and an
@@ -280,7 +290,7 @@ def _verify_pinned_startup(kernel: Any, selected_config: Any) -> Optional[dict]:
             return None
         if not isinstance(all_kwargs, dict):
             return None
-        if dict(all_kwargs) != dict(_PINNED_OPTION_KWARGS):
+        if dict(all_kwargs) != dict(_pinned_options() or {}):
             return None
         if getattr(selected_config, "pre_hook", None) is not None:
             return None
@@ -445,7 +455,10 @@ def apply_musa_topk_schedule_patch() -> bool:
     if getattr(musa_topk.topk_softmax, _PATCH_MARKER, False):
         return True
 
-    selected_config = triton.Config({}, num_warps=1, num_stages=1)
+    options = _pinned_options()
+    if options is None:
+        return False
+    selected_config = triton.Config({}, **options)
     kernel = musa_topk.topk_softmax_triton_kernel
     ctx = _verify_pinned_startup(kernel, selected_config)
     if ctx is None:
@@ -461,6 +474,7 @@ def apply_musa_topk_schedule_patch() -> bool:
     layer_topk.topk_softmax = wrapped
     logger.info(
         "MUSA S5000 softmax TopK schedule enabled for E=256, K=8 graph shapes "
-        "and 1K-16K prefill: warps=1, stages=1"
+        "and 1K-16K prefill: launch_options=%s",
+        options,
     )
     return True

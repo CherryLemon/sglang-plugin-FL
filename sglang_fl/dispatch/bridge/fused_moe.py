@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang_fl.dispatch import call_op
+from sglang_fl.dispatch import resolve_op
 
 
 def fused_moe_bridge(
@@ -30,5 +30,5 @@ def fused_moe_bridge(
     layer: torch.nn.Module,
     dispatch_output,
 ):
-    """SGLang UnquantizedFusedMoEMethod forward → dispatch call_op("fused_moe", ...)."""
-    return call_op("fused_moe", self, layer, dispatch_output)
+    """Select before execution: a MoE failure may follow in-place writes."""
+    return resolve_op("fused_moe")(self, layer, dispatch_output)

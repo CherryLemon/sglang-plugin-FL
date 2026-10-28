@@ -84,29 +84,19 @@ def test_real_topk_guard_launch_and_refreshed_replay(musa_device, monkeypatch, t
         assert pointers == (gating.data_ptr(), weights.data_ptr(), ids.data_ptr())
 
 
-@pytest.mark.parametrize("tokens", [40, 64, 2048])
+@pytest.mark.parametrize("tokens", [2048, 4096])
 def test_real_combine_hit_fallback_and_refreshed_replay(
     musa_device, monkeypatch, tokens
 ):
     from sglang_fl.dispatch.backends.vendor.mthreads.patches import moe_combine
 
     monkeypatch.setenv(moe_combine._ENV_NAME, "auto")
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_DECODE_GRAPH_CANDIDATE_DISABLED", False)
     graph_cls, capture, synchronize = _graph_api(musa_device)
     routed = torch.empty((tokens, 8, 2048), dtype=torch.bfloat16, device=musa_device)
     output = torch.empty((tokens, 2048), dtype=torch.bfloat16, device=musa_device)
     shared = torch.empty_like(output)
     gate = torch.empty((tokens, 1), dtype=torch.bfloat16, device=musa_device)
-    dual_stream = tokens in (40, 64)
-    primary = torch.musa.current_stream()
-    alternate = torch.musa.Stream() if dual_stream else primary
-    context = moe_combine.MoeCombineContext(
-        shared,
-        gate,
-        decode_graph_dual_stream=dual_stream,
-        shared_stream=primary,
-    )
+    context = moe_combine.MoeCombineContext(shared, gate)
     fallback_calls = []
 
     def original(*args):
@@ -119,17 +109,7 @@ def test_real_combine_hit_fallback_and_refreshed_replay(
         context.used = False
         token = moe_combine._ACTIVE_CONTEXT.set(context)
         try:
-            if dual_stream:
-                # graph() selects a capture stream; fork from that current
-                # stream, rather than the pre-capture default stream.
-                current = torch.musa.current_stream()
-                context.shared_stream = current
-                alternate.wait_stream(current)
-                with torch.musa.stream(alternate):
-                    reduction(routed, output, 1.0)
-                current.wait_stream(alternate)
-            else:
-                reduction(routed, output, 1.0)
+            reduction(routed, output, 1.0)
         finally:
             moe_combine._ACTIVE_CONTEXT.reset(token)
 

@@ -25,8 +25,7 @@ operators can disable decode and prefill independently. Patch both resolvers
 because SGLang v0.5.11 carries its own copy while some MUSA integration
 versions call TorchAda's runtime copy directly.
 
-See the MThreads plugin README section "Patch background and equivalence
-notes" for the measured tile numbers and Triton version history.
+Launch parameters are loaded from the platform YAML; see tests/musa/README.md.
 """
 
 from __future__ import annotations
@@ -38,6 +37,7 @@ from functools import wraps
 from typing import Any, Callable
 
 from ..env import enabled as _env_enabled
+from sglang_fl.dispatch.config.utils import get_kernel_tuning
 
 logger = logging.getLogger(__name__)
 
@@ -55,36 +55,19 @@ _r2_m4_match_logged = False
 # The August image's TorchAda table instead selects BM128/G64 at M4.
 # Restore the exact measured shape by default; other table entries are untouched.
 _R2_M4_BASELINE_ENV = "SGLANG_MUSA_M4_R2_BASELINE_SCHEDULE"
-_R2_M4_BASELINE_CONFIG = {
-    "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 32,
-    "BLOCK_SIZE_K": 64,
-    "GROUP_SIZE_M": 1,
-}
-_S5000_DECODE_CONFIG = {
-    "BLOCK_SIZE_M": 32,
-    "BLOCK_SIZE_N": 32,
-    "BLOCK_SIZE_K": 64,
-    "GROUP_SIZE_M": 1,
-    "num_warps": 4,
-    "num_stages": 1,
-}
-_S5000_PREFILL_CONFIG = {
-    "BLOCK_SIZE_M": 32,
-    "BLOCK_SIZE_N": 128,
-    "BLOCK_SIZE_K": 64,
-    "GROUP_SIZE_M": 4,
-    "num_warps": 8,
-    "num_stages": 1,
-}
-_S5000_PREFILL_M16K_CONFIG = {
-    "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 128,
-    "BLOCK_SIZE_K": 64,
-    "GROUP_SIZE_M": 4,
-    "num_warps": 8,
-    "num_stages": 1,
-}
+
+
+def _profile(name):
+    options = get_kernel_tuning("fused_moe", name)
+    if options is None:
+        return None
+    required = {"BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M"}
+    if not required <= options.keys() or options.keys() - required - {
+        "num_warps",
+        "num_stages",
+    }:
+        raise ValueError(f"Invalid fused MoE tuning profile: {name}")
+    return options
 
 
 def _enabled() -> bool:
@@ -215,21 +198,16 @@ def _select_musa_moe_schedule(
     ):
         return None, {}, False
 
-    if (
-        m4_enabled
-        and w2_shape[2] == 256
-        and M == 4
-        and not is_marlin
-    ):
+    if m4_enabled and w2_shape[2] == 256 and M == 4 and not is_marlin:
         if not _r2_m4_match_logged:
             logger.info(
-                "Restored R2 M4 baseline MoE tile BM16/BN32/BK64/G1; "
+                "Selected MUSA M4 baseline MoE profile from platform YAML; "
                 "W13 BN64 is selected separately by the guarded plugin implementation"
             )
             _r2_m4_match_logged = True
         # R2 baseline has no independent down schedule. The core uses the
         # unchanged baseline config for W2, and copies W13 for BN64.
-        return _R2_M4_BASELINE_CONFIG, {}, True
+        return _profile("r2_m4_baseline"), {}, True
     if _enabled() and w2_shape[2] in (256, 512) and M == 64:
         backend_opt = w2_shape[2] == 256 and _backend_opt_enabled()
         additions = {"enable_backend_opt": True} if backend_opt else {}
@@ -244,7 +222,7 @@ def _select_musa_moe_schedule(
                 backend_opt,
             )
             _decode_match_logged = True
-        return _S5000_DECODE_CONFIG, additions, False
+        return _profile("decode"), additions, False
     if _prefill_enabled() and w2_shape[2] == 256 and 2048 <= M <= 8192:
         if not _prefill_match_logged:
             logger.info(
@@ -256,7 +234,7 @@ def _select_musa_moe_schedule(
                 M,
             )
             _prefill_match_logged = True
-        return _S5000_PREFILL_CONFIG, {}, False
+        return _profile("prefill"), {}, False
     if _prefill_enabled() and w2_shape[2] == 256 and M == 16384:
         if not _prefill_m16k_match_logged:
             logger.info(
@@ -267,7 +245,7 @@ def _select_musa_moe_schedule(
                 top_k,
             )
             _prefill_m16k_match_logged = True
-        return _S5000_PREFILL_M16K_CONFIG, {}, False
+        return _profile("prefill_m16k"), {}, False
     return None, {}, False
 
 
@@ -344,9 +322,7 @@ def _patch_resolver(config_module_name: str, fused_moe_module_name: str) -> bool
         logger.debug("MUSA MoE resolver %s unavailable: %s", config_module_name, exc)
         return False
 
-    wrapped = _wrap_try_get_optimal_moe_config(
-        config_module.try_get_optimal_moe_config
-    )
+    wrapped = _wrap_try_get_optimal_moe_config(config_module.try_get_optimal_moe_config)
     config_module.try_get_optimal_moe_config = wrapped
     fused_moe_module.try_get_optimal_moe_config = wrapped
     return True

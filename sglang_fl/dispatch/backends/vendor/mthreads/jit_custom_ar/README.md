@@ -1,11 +1,13 @@
-# MUSA JIT custom all-reduce sources
+# MUSA native custom all-reduce
 
-These Apache-2.0 sources are vendored from the Moore Threads SGLang 0.5.12
-runtime image used for the MTT S5000 comparison.  The Python integration was
-adapted to remain inside `sglang-plugin-FL`; upstream SGLang is monkeypatched at
-runtime and is not modified.
+The framework owns the native communication kernels, JIT compilation,
+communicator, IPC mappings and graph-buffer lifecycle. These remain in the
+plugin; FlagGems-sglang contains only Triton/FlagTree implementations.
 
-The compatibility default uses the explicit-input CUDA/MUSA-graph launcher.
-The newer registered-input recapture protocol is opt-in with
-`SGLANG_MUSA_CUSTOM_AR_GRAPH_REGISTERED_INPUT=1` only when the matching SGLang
-graph-runner handshake is present.
+The original native sources are from SGLang MUSA commit
+`cf872e6886f3f3babd9a942176f1b93b9174fb61`. See [source attribution](csrc/NOTICE)
+and the [original Apache-2.0 license](csrc/LICENSE).
+
+The explicit-input graph launcher is the default. Registered-input recapture
+requires the matching graph-runner handshake and is enabled explicitly with
+`SGLANG_MUSA_CUSTOM_AR_GRAPH_REGISTERED_INPUT=1`.

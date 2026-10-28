@@ -1,0 +1,15 @@
+SGLang MUSA native all-reduce and RMSNorm
+Copyright 2023-2024 SGLang Team
+Apache-2.0; the original LICENSE is included in this directory.
+
+Source: SGLang MUSA branch musa/0.5.12.post1,
+commit cf872e6886f3f3babd9a942176f1b93b9174fb61.
+Original directory: python/sglang/srt/hardware_backend/musa/jit_kernel/csrc/
+Runtime image: registry.mthreads.com/mcconline/inference/sglang
+  v0.5.12.post1-ph1-4.3.5-torch2.9.0-cf872e68
+  manifest sha256:45f364299d75b0df59735feb0e72d54d2ff79b993552902f78ad8aaf8a311e5e
+
+Native sources retain the original algorithm and ABI; attribution headers
+are added. Python integration is adapted for sglang-plugin-FL.
+Native compilation, communicator and IPC/graph buffer ownership remain in
+the framework. FlagGems-sglang supplies Triton/FlagTree implementations only.

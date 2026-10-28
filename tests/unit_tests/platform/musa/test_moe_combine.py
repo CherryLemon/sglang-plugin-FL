@@ -131,15 +131,6 @@ def test_env_auto_is_enabled(monkeypatch):
     assert moe_combine._enabled()
 
 
-def test_decode_graph_env_is_independent_and_off_by_default(monkeypatch):
-    monkeypatch.delenv(moe_combine._DECODE_GRAPH_ENV_NAME, raising=False)
-    assert not moe_combine._decode_graph_enabled()
-    monkeypatch.setenv(moe_combine._DECODE_GRAPH_ENV_NAME, "auto")
-    assert moe_combine._decode_graph_enabled()
-    monkeypatch.setenv(moe_combine._DECODE_GRAPH_ENV_NAME, "off")
-    assert not moe_combine._decode_graph_enabled()
-
-
 def test_model_contract_marker_is_immutable_and_exact():
     marker = moe_combine._model_contract_from_config(_valid_config())
     assert marker.matches
@@ -439,7 +430,6 @@ def test_device_name_cache_is_per_device(monkeypatch):
 
 
 def test_env_off_forces_combine_fallback(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
     monkeypatch.setenv(moe_combine._ENV_NAME, "false")
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     context, (routed, output, _, _) = _context()
@@ -467,7 +457,6 @@ def test_env_off_forces_combine_fallback(monkeypatch):
 
 @pytest.mark.parametrize("invalid_input", ["routed", "output", "shared", "gate"])
 def test_non_tensor_reduction_inputs_keep_original_path(monkeypatch, invalid_input):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
     monkeypatch.setenv(moe_combine._ENV_NAME, "auto")
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     context, (routed, output, shared, gate) = _context()
@@ -499,11 +488,9 @@ def test_non_tensor_reduction_inputs_keep_original_path(monkeypatch, invalid_inp
     assert original_calls == [((inputs["routed"], inputs["output"], 1.0), {})]
     assert not launch_calls
     assert not context.used
-    assert not moe_combine._CANDIDATE_DISABLED
 
 
 def test_non_tensor_hidden_states_do_not_enter_optimization(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     block, _ = _fake_block()
 
@@ -542,19 +529,7 @@ def test_combine_contract_accepts_supported_token_shapes(monkeypatch, tokens):
     assert moe_combine._contract_matches(routed, output, 1.0, context)
 
 
-def test_exact_m16k_combine_uses_large_shape_kernel_geometry():
-    assert moe_combine._candidate_for_tokens(16384) == (1, 2048, 16)
-    with pytest.raises(ValueError, match="unsupported"):
-        moe_combine._candidate_for_tokens(16385)
-
-
-def test_decode_graph_combine_uses_measured_small_shape_geometries():
-    assert moe_combine._candidate_for_tokens(40) == (2, 512, 8)
-    assert moe_combine._candidate_for_tokens(64) == (1, 2048, 16)
-
-
 def test_model_marker_missing_or_reduce_scatter_falls_back(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     block, _ = _fake_block()
     delattr(block, moe_combine._MODEL_CONTRACT_MARKER)
@@ -573,7 +548,6 @@ def test_model_marker_missing_or_reduce_scatter_falls_back(monkeypatch):
 
 
 def test_model_contract_accepts_exact_m16k_and_rejects_adjacent_shape(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     block, _ = _fake_block(tokens=1)
 
@@ -619,46 +593,29 @@ def test_combine_consumed_marks_context(monkeypatch):
     assert not original_calls
 
 
-def test_combine_exception_uses_original_and_does_not_consume(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_SUCCESS_LOGGED", set())
+def test_combine_launch_failure_propagates_without_native_retry(monkeypatch):
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     context, (routed, output, _, _) = _context()
-    original_calls = []
-    launch_calls = []
+    error = RuntimeError("launch failed after output mutation")
+    calls = []
 
-    def launch(*args, **kwargs):
-        launch_calls.append((args, kwargs))
-        raise RuntimeError("compile failure")
+    def launch(*args):
+        calls.append("candidate")
+        raise error
 
-    def original(*args, **kwargs):
-        original_calls.append((args, kwargs))
-        return "baseline"
+    def original(*args):
+        pytest.fail("must not rerun reduction after candidate execution")
 
     monkeypatch.setattr(moe_combine, "_launch_candidate", launch)
-    wrapped = moe_combine._wrap_moe_sum_reduce(original)
     token = moe_combine._ACTIVE_CONTEXT.set(context)
     try:
-        result = wrapped(routed, output, 1.0)
+        with pytest.raises(RuntimeError) as exc:
+            moe_combine._wrap_moe_sum_reduce(original)(routed, output, 1.0)
     finally:
         moe_combine._ACTIVE_CONTEXT.reset(token)
-
-    assert result == "baseline"
-    assert original_calls
+    assert exc.value is error
+    assert calls == ["candidate"]
     assert not context.used
-    assert moe_combine._CANDIDATE_DISABLED
-
-    # Once compilation/launch fails, later layers/requests must not retry the
-    # candidate or emit one warning per layer.
-    context2, (routed2, output2, _, _) = _context()
-    token = moe_combine._ACTIVE_CONTEXT.set(context2)
-    try:
-        result2 = wrapped(routed2, output2, 1.0)
-    finally:
-        moe_combine._ACTIVE_CONTEXT.reset(token)
-    assert result2 == "baseline"
-    assert len(launch_calls) == 1
-    assert len(original_calls) == 2
 
 
 def _fake_qwen_module(capture=False, deepep=False):
@@ -670,12 +627,6 @@ def _fake_qwen_module(capture=False, deepep=False):
         ),
         should_skip_post_experts_all_reduce=lambda **kwargs: True,
         tensor_model_parallel_all_reduce=lambda value: value,
-    )
-
-
-def _decode_forward_batch(is_decode=True):
-    return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: is_decode),
     )
 
 
@@ -763,172 +714,7 @@ def test_capture_and_deepep_are_fallbacks(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("tokens", [40, 64])
-def test_decode_graph_model_contract_is_exact_and_independent(monkeypatch, tokens):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_DECODE_GRAPH_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
-    monkeypatch.setenv(moe_combine._ENV_NAME, "auto")
-    monkeypatch.setenv(moe_combine._DECODE_GRAPH_ENV_NAME, "auto")
-    block, _ = _fake_block(tokens=1)
-    block.alt_stream = _FakeStream("alt")
-    hidden = _FakeTensor((tokens, 2048))
-
-    assert moe_combine._decode_graph_model_contract_matches(
-        _fake_qwen_module(capture=True),
-        block,
-        hidden,
-        _decode_forward_batch(),
-    )
-    assert not moe_combine._model_contract_matches(
-        _fake_qwen_module(capture=True),
-        block,
-        hidden,
-        _decode_forward_batch(),
-    )
-
-
-def test_decode_graph_model_contract_rejects_adjacent_and_non_capture(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_DECODE_GRAPH_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
-    monkeypatch.setenv(moe_combine._ENV_NAME, "auto")
-    monkeypatch.setenv(moe_combine._DECODE_GRAPH_ENV_NAME, "auto")
-    block, _ = _fake_block(tokens=1)
-    block.alt_stream = _FakeStream("alt")
-    hidden = _FakeTensor((39, 2048))
-
-    assert not moe_combine._decode_graph_model_contract_matches(
-        _fake_qwen_module(capture=True),
-        block,
-        hidden,
-        _decode_forward_batch(),
-    )
-    assert not moe_combine._decode_graph_model_contract_matches(
-        _fake_qwen_module(capture=False),
-        block,
-        _FakeTensor((40, 2048)),
-        _decode_forward_batch(),
-    )
-    assert not moe_combine._decode_graph_model_contract_matches(
-        _fake_qwen_module(capture=True),
-        block,
-        _FakeTensor((40, 2048)),
-        _decode_forward_batch(is_decode=False),
-    )
-
-
-def test_decode_graph_reduce_joins_shared_tail_before_launch(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_DECODE_GRAPH_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
-    producer_stream = _FakeStream("primary")
-    consumer_stream = _FakeStream("alt")
-    context, (routed, output, shared, gate) = _context(tokens=40)
-    context.decode_graph_dual_stream = True
-    context.shared_stream = producer_stream
-    launch_calls = []
-    original_calls = []
-    monkeypatch.setattr(
-        moe_combine.torch.musa, "current_stream", lambda: consumer_stream
-    )
-    monkeypatch.setattr(
-        moe_combine,
-        "_launch_candidate",
-        lambda *args: launch_calls.append(args),
-    )
-
-    def original(*args, **kwargs):
-        original_calls.append((args, kwargs))
-
-    wrapped = moe_combine._wrap_moe_sum_reduce(original)
-    token = moe_combine._ACTIVE_CONTEXT.set(context)
-    try:
-        assert wrapped(routed, output, 1.0) is None
-    finally:
-        moe_combine._ACTIVE_CONTEXT.reset(token)
-
-    assert context.used
-    assert len(launch_calls) == 1
-    assert not original_calls
-    assert consumer_stream.waited_for == [producer_stream]
-    assert shared.recorded_streams == [consumer_stream]
-    assert gate.recorded_streams == [consumer_stream]
-
-
-def test_decode_graph_launch_failure_falls_back_without_disabling_eager(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_DECODE_GRAPH_CANDIDATE_DISABLED", False)
-    monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
-    producer_stream = _FakeStream("primary")
-    consumer_stream = _FakeStream("alt")
-    context, (routed, output, _, _) = _context(tokens=64)
-    context.decode_graph_dual_stream = True
-    context.shared_stream = producer_stream
-    original_calls = []
-    monkeypatch.setattr(
-        moe_combine.torch.musa, "current_stream", lambda: consumer_stream
-    )
-    monkeypatch.setattr(
-        moe_combine,
-        "_launch_candidate",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("compile failure")),
-    )
-
-    def original(*args, **kwargs):
-        original_calls.append((args, kwargs))
-        return "baseline"
-
-    wrapped = moe_combine._wrap_moe_sum_reduce(original)
-    token = moe_combine._ACTIVE_CONTEXT.set(context)
-    try:
-        assert wrapped(routed, output, 1.0) == "baseline"
-    finally:
-        moe_combine._ACTIVE_CONTEXT.reset(token)
-
-    assert len(original_calls) == 1
-    assert not context.used
-    assert moe_combine._DECODE_GRAPH_CANDIDATE_DISABLED
-    assert not moe_combine._CANDIDATE_DISABLED
-
-
-def test_decode_graph_forward_preserves_dual_stream_fork_and_join(monkeypatch):
-    qwen_module = _fake_qwen_module(capture=True)
-    block, hidden = _fake_block(tokens=40)
-    primary_stream = _FakeStream("primary")
-    alternate_stream = _FakeStream("alt")
-    block.alt_stream = alternate_stream
-
-    def router(value):
-        context = moe_combine._ACTIVE_CONTEXT.get()
-        assert context is not None
-        assert context.decode_graph_dual_stream
-        assert context.shared_stream is primary_stream
-        context.used = True
-        return torch.zeros_like(value)
-
-    block._forward_router_experts = router
-    monkeypatch.setattr(
-        moe_combine.torch.musa, "current_stream", lambda: primary_stream
-    )
-    monkeypatch.setattr(moe_combine.torch.musa, "stream", lambda stream: nullcontext())
-
-    result = moe_combine._forward_decode_graph_combine(
-        qwen_module,
-        block,
-        hidden,
-        use_reduce_scatter=False,
-        should_allreduce_fusion=False,
-    )
-
-    assert torch.equal(result, torch.zeros_like(hidden))
-    assert alternate_stream.waited_for == [primary_stream]
-    assert primary_stream.waited_for == [alternate_stream]
-    assert moe_combine._ACTIVE_CONTEXT.get() is None
-
-
 def test_eager_alt_stream_handle_does_not_force_fallback(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", False)
     monkeypatch.setattr(moe_combine, "_device_name", lambda tensor: "MTT S5000")
     block, _ = _fake_block()
     block.alt_stream = object()
@@ -957,31 +743,6 @@ def test_model_exception_resets_context(monkeypatch):
     assert moe_combine._ACTIVE_CONTEXT.get() is None
 
 
-def test_model_wrapper_after_candidate_failure_uses_original(monkeypatch):
-    monkeypatch.setattr(moe_combine, "_CANDIDATE_DISABLED", True)
-    qwen_module = _fake_qwen_module()
-    block, hidden = _fake_block()
-    fallback_calls = []
-    launch_calls = []
-
-    def original(*args, **kwargs):
-        fallback_calls.append((args, kwargs))
-        return "baseline"
-
-    monkeypatch.setattr(
-        moe_combine,
-        "_launch_candidate",
-        lambda *args, **kwargs: launch_calls.append((args, kwargs)),
-    )
-    wrapped = moe_combine._make_qwen_forward(qwen_module, original)
-
-    result = wrapped(block, hidden)
-
-    assert result == "baseline"
-    assert len(fallback_calls) == 1
-    assert not launch_calls
-
-
 def test_wrappers_are_idempotent():
     original_reduce = lambda *args, **kwargs: None
     wrapped_reduce = moe_combine._wrap_moe_sum_reduce(original_reduce)
@@ -991,3 +752,26 @@ def test_wrappers_are_idempotent():
     original_forward = lambda *args, **kwargs: None
     wrapped_forward = moe_combine._make_qwen_forward(module, original_forward)
     assert moe_combine._make_qwen_forward(module, wrapped_forward) is wrapped_forward
+
+
+@pytest.mark.parametrize("tokens", [40, 64])
+def test_decode_capture_keeps_original_forward(monkeypatch, tokens):
+    block, hidden = _fake_block(tokens=tokens)
+    calls = []
+
+    def original(*args):
+        calls.append(args)
+        return "native decode"
+
+    monkeypatch.setattr(
+        moe_combine,
+        "_launch_candidate",
+        lambda *a: pytest.fail("decode experiment was removed"),
+    )
+    assert (
+        moe_combine._make_qwen_forward(_fake_qwen_module(capture=True), original)(
+            block, hidden
+        )
+        == "native decode"
+    )
+    assert len(calls) == 1

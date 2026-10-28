@@ -93,7 +93,9 @@ def test_fn_run_signature_bind_rejects_extra_required():
 
 
 def test_verify_pinned_startup_rejects_unknown_fake_kernel():
-    fake_kernel = SimpleNamespace(configs=[object()], fn=SimpleNamespace(run=lambda: None))
+    fake_kernel = SimpleNamespace(
+        configs=[object()], fn=SimpleNamespace(run=lambda: None)
+    )
     assert topk_schedule._verify_pinned_startup(fake_kernel, object()) is None
 
     triton = pytest.importorskip("triton")
@@ -133,7 +135,10 @@ def test_wrapper_falls_back_on_runtime_fn_replacement(monkeypatch):
 
     inner = _FakeInner()
     kernel = SimpleNamespace(configs=configs, fn=inner)
-    ctx = {"inner_fn": inner, "pinned_kwargs": {"num_warps": 1, "num_ctas": 1, "num_stages": 1}}
+    ctx = {
+        "inner_fn": inner,
+        "pinned_kwargs": {"num_warps": 1, "num_ctas": 1, "num_stages": 1},
+    }
     monkeypatch.setattr(topk_schedule, "_is_musa_launch_eligible", lambda *a: True)
 
     seen = []
@@ -144,7 +149,9 @@ def test_wrapper_falls_back_on_runtime_fn_replacement(monkeypatch):
 
     wrapped = topk_schedule._make_topk_wrapper(original, kernel, ctx)
     # Runtime replacement after wrapper creation must fail closed.
-    kernel.fn = SimpleNamespace(run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    kernel.fn = SimpleNamespace(
+        run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run"))
+    )
     weights, ids, gating = _target_tensors()
     result = wrapped(weights, ids, gating)
 
@@ -175,7 +182,9 @@ def test_wrapper_falls_back_for_non_musa_tensors(monkeypatch, tensor_kind):
 
     monkeypatch.setattr(topk_schedule, "_is_musa_launch_eligible", checked_device_guard)
     monkeypatch.setattr(
-        topk_schedule, "_pinned_launch_closed", lambda *a: pytest.fail("must not launch")
+        topk_schedule,
+        "_pinned_launch_closed",
+        lambda *a: pytest.fail("must not launch"),
     )
     wrapped = topk_schedule._make_topk_wrapper(original, kernel, ctx)
     if tensor_kind == "cpu":
@@ -187,7 +196,10 @@ def test_wrapper_falls_back_for_non_musa_tensors(monkeypatch, tensor_kind):
     assert wrapped(weights, ids, gating) == "fallback"
     assert len(guard_calls) == 1
     assert len(seen) == 1
-    assert all(actual is expected for actual, expected in zip(seen[0][:3], (weights, ids, gating)))
+    assert all(
+        actual is expected
+        for actual, expected in zip(seen[0][:3], (weights, ids, gating))
+    )
     assert kernel.configs is configs
 
 
@@ -202,7 +214,9 @@ def test_wrapper_leaves_unmeasured_shape_on_autotuner(monkeypatch):
         seen.append(kernel.configs)
 
     monkeypatch.setattr(
-        topk_schedule, "_is_musa_launch_eligible", lambda *a: pytest.fail("must short-circuit")
+        topk_schedule,
+        "_is_musa_launch_eligible",
+        lambda *a: pytest.fail("must short-circuit"),
     )
     wrapped = topk_schedule._make_topk_wrapper(original, kernel, ctx)
     wrapped(_tensor_shape(65, 8), object(), _tensor_shape(65, 256))
@@ -216,8 +230,16 @@ def test_inner_jit_abi_ok_with_fakes():
     swapped = list(abi_names)
     swapped[0], swapped[1] = swapped[1], swapped[0]
     assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=swapped)) is False
-    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=abi_names[:-1])) is False
-    assert topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=abi_names + ["EXTRA"])) is False
+    assert (
+        topk_schedule._inner_jit_abi_ok(SimpleNamespace(arg_names=abi_names[:-1]))
+        is False
+    )
+    assert (
+        topk_schedule._inner_jit_abi_ok(
+            SimpleNamespace(arg_names=abi_names + ["EXTRA"])
+        )
+        is False
+    )
     assert topk_schedule._inner_jit_abi_ok(SimpleNamespace()) is False
     assert topk_schedule._inner_jit_abi_ok(object()) is False
     assert topk_schedule._inner_jit_abi_ok(None) is False
@@ -248,7 +270,9 @@ def test_wrapper_passthrough_with_mappingproxy_ctx(monkeypatch):
     kernel = SimpleNamespace(configs=configs, fn=inner)
     ctx = {
         "inner_fn": inner,
-        "pinned_kwargs": MappingProxyType({"num_warps": 1, "num_ctas": 1, "num_stages": 1}),
+        "pinned_kwargs": MappingProxyType(
+            {"num_warps": 1, "num_ctas": 1, "num_stages": 1}
+        ),
     }
     monkeypatch.setattr(topk_schedule, "_is_musa_launch_eligible", lambda *a: True)
 
@@ -299,7 +323,9 @@ def test_wrapper_falls_back_when_runtime_inner_read_fails(monkeypatch):
     calls = []
     monkeypatch.setattr(topk_schedule, "_is_musa_launch_eligible", lambda *a: True)
     monkeypatch.setattr(
-        topk_schedule, "_pinned_launch_closed", lambda *a: pytest.fail("must not launch")
+        topk_schedule,
+        "_pinned_launch_closed",
+        lambda *a: pytest.fail("must not launch"),
     )
     wrapped = topk_schedule._make_topk_wrapper(
         lambda *args: calls.append(args) or "fallback", Kernel(), ctx
@@ -358,7 +384,7 @@ def _install_fake_triton(monkeypatch):
 
     class Config:
         def __init__(self, all_kwargs=None):
-            self._all_kwargs = dict(all_kwargs or topk_schedule._PINNED_OPTION_KWARGS)
+            self._all_kwargs = dict(all_kwargs or topk_schedule._pinned_options())
             self.pre_hook = None
 
         def all_kwargs(self):
@@ -411,16 +437,14 @@ def test_verify_pinned_startup_rejects_standard_type_subclasses(monkeypatch):
         pass
 
     # Each case changes only the object identity; all other checks stay valid.
-    assert topk_schedule._verify_pinned_startup(
-        valid_kernel, ConfigSubclass()
-    ) is None
+    assert topk_schedule._verify_pinned_startup(valid_kernel, ConfigSubclass()) is None
 
     class AutotunerSubclass(Autotuner):
         pass
 
-    assert topk_schedule._verify_pinned_startup(
-        AutotunerSubclass(), valid_config
-    ) is None
+    assert (
+        topk_schedule._verify_pinned_startup(AutotunerSubclass(), valid_config) is None
+    )
 
     class JITFunctionSubclass(JITFunction):
         pass

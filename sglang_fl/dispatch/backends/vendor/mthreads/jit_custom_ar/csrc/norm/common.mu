@@ -1,3 +1,8 @@
+// Copyright 2023-2024 SGLang Team
+// SPDX-License-Identifier: Apache-2.0
+// From SGLang MUSA cf872e6886f3f3babd9a942176f1b93b9174fb61.
+// See the csrc/NOTICE file for source and license attribution.
+
 template <typename T>
 struct __align__(16) Vec8Storage {
   T elem[8];

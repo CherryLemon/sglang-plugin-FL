@@ -56,7 +56,7 @@ The tables below summarize the current support status of end-to-end verified mod
 | Model | Status | Weights | Reference |
 |-------|--------|---------|-----------|
 | Qwen3.6-27B | Supported | [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | [example](./examples/qwen3_6_27b_offline_inference.py) |
-| Qwen3.6-35B-A3B | Supported | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [example](./examples/qwen3_6_35b_a3b_offline_inference.py) |
+| Qwen3.6-35B-A3B | Supported | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [example](./examples/qwen3_6_35b_a3b_offline_inference.py), [S5000 TP2](./examples/musa/qwen36_tp2.sh) |
 
 ### Supported Chips
 
@@ -64,13 +64,15 @@ The tables below summarize the current support status of end-to-end verified mod
 |-------------|--------|-----------|
 | NVIDIA | Supported | - |
 | Ascend | Supported | - |
-| Moore Threads | Supported | - |
+| Moore Threads MTT S5000 | Qwen3.6-35B-A3B BF16/TP2 integration; see runtime requirements | [example](./examples/musa/qwen36_tp2.sh) |
 | T-Head | Supported | - |
 | Enflame | Supported | - |
 | Hygon | Supported | - |
 | Iluvatar | Supported | - |
 | Kunlunxin | Supported | - |
 | Tsingmicro | Supported | - |
+
+For S5000, use the [MUSA installation and tuning instructions](./tests/musa/README.md).
 
 ## Quick Start
 
