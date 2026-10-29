@@ -2,16 +2,16 @@
 
 This standalone version exposes one FlashAttention implementation for both
 eager execution and standard decode CUDA Graph. SGLang selects the execution
-mode through ``disable_cuda_graph``; this backend has no eager/Graph backend
-selector. It keeps ``TritonAttnBackend`` only for SGLang metadata and Graph
-lifecycle compatibility. Attention prefill and decode never fall back to
-Triton: unsupported configurations and request modes fail fast.
+mode through ``cuda_graph_config`` (eager prefill, full or disabled decode).
+It keeps ``TritonAttnBackend`` only for SGLang metadata and Graph lifecycle
+compatibility. Attention prefill and decode never fall back to Triton:
+unsupported configurations and request modes fail fast.
 
 Lifecycle:
   - __init__ once per worker after model and memory-pool initialization
   - init_forward_metadata once per eager forward
   - init_cuda_graph_state once before standard graph capture
-  - init_forward_metadata_*_cuda_graph during capture and replay
+  - init_forward_metadata_out_graph before capture and replay
   - forward_extend / forward_decode per attention layer
 """
 
@@ -24,37 +24,40 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    is_in_piecewise_cuda_graph,
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
 _PAGE_TABLE_DEBUG_ENV = "SGLANG_HCU_DEBUG_PAGE_TABLE"
 _FLASH_ATTN_SUPPORTED_PAGE_SIZES = frozenset((64, 128, 256))
 _FLASH_ATTN_PAGE_SIZE_DESCRIPTION = "64, 128, or 256"
-_FLASH_ATTN_HEAD_DIM_DESCRIPTION = (
-    "a multiple of 8 from 32 through 224, or exactly 256"
-)
+_FLASH_ATTN_HEAD_DIM_DESCRIPTION = "a multiple of 8 from 32 through 224, or exactly 256"
 
 
 def _is_supported_flash_attn_head_dim(head_dim: int) -> bool:
     """Return whether the validated Hygon FlashAttention kernels support it."""
-    return isinstance(head_dim, int) and head_dim % 8 == 0 and (
-        32 <= head_dim <= 224 or head_dim == 256
+    return (
+        isinstance(head_dim, int)
+        and head_dim % 8 == 0
+        and (32 <= head_dim <= 224 or head_dim == 256)
     )
 
 
@@ -107,14 +110,12 @@ def _validate_flash_attn_page_table(
             f"out_cache_loc={tuple(out_cache_loc.shape)}, batch_size={batch_size}."
         )
 
-    req_indices_cpu = req_pool_indices[:batch_size].detach().to(
-        device="cpu", dtype=torch.int64
+    req_indices_cpu = (
+        req_pool_indices[:batch_size].detach().to(device="cpu", dtype=torch.int64)
     )
-    seq_lens_cpu = seq_lens[:batch_size].detach().to(
-        device="cpu", dtype=torch.int64
-    )
-    page_table_cpu = page_table[:batch_size].detach().to(
-        device="cpu", dtype=torch.int64
+    seq_lens_cpu = seq_lens[:batch_size].detach().to(device="cpu", dtype=torch.int64)
+    page_table_cpu = (
+        page_table[:batch_size].detach().to(device="cpu", dtype=torch.int64)
     )
     out_cache_loc_cpu = (
         out_cache_loc[:batch_size].detach().to(device="cpu", dtype=torch.int64)
@@ -146,8 +147,8 @@ def _validate_flash_attn_page_table(
                 f"{page_table_cpu.shape[1]} columns."
             )
 
-        token_locs = req_to_token[req_idx, :seq_len].detach().to(
-            device="cpu", dtype=torch.int64
+        token_locs = (
+            req_to_token[req_idx, :seq_len].detach().to(device="cpu", dtype=torch.int64)
         )
         expected_page_ids = []
         for logical_page in range(num_pages):
@@ -262,6 +263,10 @@ def _load_flash_attn_varlen_func():
 class HCUAttnBackend(TritonAttnBackend):
     """FlashAttention-only Hygon backend for the controlled Qwen route."""
 
+    # Triton does not need the host mirror, but HCU prefill validates full and
+    # extend lengths on the CPU. Preserve the scheduler-provided mirror.
+    needs_cpu_seq_lens: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -279,14 +284,32 @@ class HCUAttnBackend(TritonAttnBackend):
             kv_indptr_buf=kv_indptr_buf,
         )
 
+        # TritonAttnBackend owns the runner's KV pool in SGLang 0.5.18.
+        # ForwardBatch carries write locations and per-forward metadata only.
         self._flash_attn_input_dtype = model_runner.model_config.dtype
         self._flash_attn_kv_cache_dtype = model_runner.kv_cache_dtype
         self._flash_attn_page_size = model_runner.server_args.page_size
         self._flash_attn_head_dim = model_runner.model_config.head_dim
         self._flash_attn_v_head_dim = model_runner.model_config.v_head_dim
 
+        algorithm = getattr(model_runner.server_args, "speculative_algorithm", None)
+        self._flash_attn_speculative_enabled = bool(algorithm)
+        self._flash_attn_speculative_phase = None
+        self._flash_attn_speculative_batch_contract = None
+        if algorithm and str(algorithm).upper() != "EAGLE":
+            raise RuntimeError(
+                "HCU MTP currently supports EAGLE speculative input only"
+            )
+        if (
+            algorithm
+            and getattr(model_runner.server_args, "speculative_eagle_topk", 1) != 1
+        ):
+            raise RuntimeError(
+                "HCU MTP supports topk=1 only; branching trees are unsupported"
+            )
         self._flash_attn_eager_page_table = None
         self._flash_attn_cuda_graph_page_table = None
+        self._flash_attn_cuda_graph_seq_lens = None
         self._flash_attn_forward_page_table = None
         self._flash_attn_forward_seq_lens = None
         self._flash_attn_prefill_cu_seqlens_q = None
@@ -309,13 +332,27 @@ class HCUAttnBackend(TritonAttnBackend):
         controlled_config_errors = []
         if not getattr(server_args, "disable_radix_cache", False):
             controlled_config_errors.append("disable_radix_cache must be True")
-        if not getattr(server_args, "disable_piecewise_cuda_graph", False):
+        graph_config = server_args.cuda_graph_config
+        if graph_config[Phase.PREFILL].backend != Backend.DISABLED:
             controlled_config_errors.append(
-                "disable_piecewise_cuda_graph must be True"
+                "cuda_graph_config.prefill.backend must be disabled"
             )
-        if getattr(server_args, "enable_breakable_cuda_graph", False):
+        if graph_config[Phase.DECODE].backend not in (Backend.FULL, Backend.DISABLED):
             controlled_config_errors.append(
-                "enable_breakable_cuda_graph must be False"
+                "cuda_graph_config.decode.backend must be full or disabled"
+            )
+        if (
+            self._flash_attn_speculative_enabled
+            and graph_config[Phase.DECODE].backend != Backend.DISABLED
+        ):
+            controlled_config_errors.append(
+                "HCU MTP currently requires eager execution (decode Graph disabled)"
+            )
+        if self._flash_attn_speculative_enabled and not getattr(
+            server_args, "disable_overlap_schedule", False
+        ):
+            controlled_config_errors.append(
+                "HCU MTP currently requires disable_overlap_schedule=True"
             )
         if getattr(server_args, "enable_deterministic_inference", False):
             controlled_config_errors.append(
@@ -350,6 +387,10 @@ class HCUAttnBackend(TritonAttnBackend):
         # The strict backend rejects every unsupported model-wide condition.
         if self.use_mla:
             return "MLA is not supported"
+        if self.dcp_size != 1:
+            return "decode context parallelism is not supported"
+        if self._translate_kv_loc is not None:
+            return "unified KV pools with virtual cache locations are not supported"
         if self._flash_attn_page_size not in _FLASH_ATTN_SUPPORTED_PAGE_SIZES:
             return (
                 f"page_size={self._flash_attn_page_size} is not supported; "
@@ -411,7 +452,7 @@ class HCUAttnBackend(TritonAttnBackend):
             and getattr(forward_batch, "global_forward_mode", None)
             in (None, ForwardMode.EXTEND)
             and forward_batch.spec_info is None
-            and not is_in_piecewise_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
             and not is_in_breakable_cuda_graph()
             and all(int(prefix_len) >= 0 for prefix_len in prefix_lens)
             and all(int(extend_len) > 0 for extend_len in extend_lens_cpu)
@@ -421,10 +462,7 @@ class HCUAttnBackend(TritonAttnBackend):
             and seq_lens.numel() >= batch_size
             and seq_lens_cpu is not None
             and seq_lens_cpu.numel() >= batch_size
-            and [
-                int(length)
-                for length in seq_lens_cpu[:batch_size].tolist()
-            ]
+            and [int(length) for length in seq_lens_cpu[:batch_size].tolist()]
             == expected_full_lens
             and (
                 not uses_paged_kv
@@ -443,9 +481,7 @@ class HCUAttnBackend(TritonAttnBackend):
         prefix_lens_cpu = [
             int(length) for length in forward_batch.extend_prefix_lens_cpu
         ]
-        extend_lens_cpu = [
-            int(length) for length in forward_batch.extend_seq_lens_cpu
-        ]
+        extend_lens_cpu = [int(length) for length in forward_batch.extend_seq_lens_cpu]
         full_lens_cpu = [
             prefix_len + extend_len
             for prefix_len, extend_len in zip(prefix_lens_cpu, extend_lens_cpu)
@@ -525,15 +561,23 @@ class HCUAttnBackend(TritonAttnBackend):
     ) -> torch.Tensor:
         if target.dtype != torch.int32 or target.ndim != 2:
             raise RuntimeError(
-                "HCU FlashAttention page table must be a two-dimensional int32 "
-                "tensor."
+                "HCU FlashAttention page table must be a two-dimensional int32 tensor."
             )
         batch_size = target.shape[0]
         if batch_size == 0:
             return target
 
         target.fill_(-1)
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        # v0.5.18 assigns each page-block to grid axis 1. A one-dimensional
+        # launch silently leaves sequences beyond the first 4096 tokens stale.
+        create_flashmla_kv_indices_triton[
+            (
+                batch_size,
+                get_num_kv_index_blocks_flashmla(
+                    target.shape[1], self._flash_attn_page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices[:batch_size],
             seq_lens[:batch_size],
@@ -556,7 +600,7 @@ class HCUAttnBackend(TritonAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         """Prepare SGLang base metadata and Hygon FlashAttention metadata."""
-        # Triton metadata remains available for unsupported layers and modes.
+        # Reuse upstream metadata lifecycle; forward kernels remain HCU-only.
         super().init_forward_metadata(forward_batch)
         self._flash_attn_forward_page_table = None
         self._flash_attn_forward_seq_lens = None
@@ -567,6 +611,11 @@ class HCUAttnBackend(TritonAttnBackend):
         self._flash_attn_prefill_page_table = None
         self._flash_attn_prefill_uses_paged_kv = False
         self._flash_attn_prefill_metadata_ready = False
+
+        self._flash_attn_speculative_phase = None
+        self._flash_attn_speculative_batch_contract = None
+        if self._prepare_flash_attn_speculative_metadata(forward_batch):
+            return
 
         if self._should_prepare_flash_attn_metadata(
             forward_batch.forward_mode, forward_batch.spec_info
@@ -581,17 +630,220 @@ class HCUAttnBackend(TritonAttnBackend):
                 page_table,
             )
             self._flash_attn_forward_page_table = page_table
-            # Eager ScheduleBatch sequence lengths are int64, while the Hygon
-            # FlashAttention ABI requires int32. CUDA Graph buffers are already
-            # int32 and are handled separately without changing their address.
-            self._flash_attn_forward_seq_lens = forward_batch.seq_lens[
-                :batch_size
-            ].to(dtype=torch.int32)
+            # ScheduleBatch and SGLang 0.5.18 CUDA Graph sequence lengths
+            # are int64, while the Hygon FlashAttention ABI requires int32.
+            # Graph execution uses a persistent int32 buffer below.
+            self._flash_attn_forward_seq_lens = forward_batch.seq_lens[:batch_size].to(
+                dtype=torch.int32
+            )
             if getattr(self, "_flash_attn_debug_page_table", False):
                 self._debug_validate_flash_attn_metadata(forward_batch, page_table)
 
         if self._should_prepare_flash_attn_prefill_metadata(forward_batch):
             self._prepare_flash_attn_prefill_metadata(forward_batch)
+
+    def _log_flash_attn_speculative_phase(self, phase):
+        logged = getattr(self, "_flash_attn_speculative_logged", None)
+        if logged is None:
+            logged = self._flash_attn_speculative_logged = set()
+        if phase not in logged:
+            logger.info("HCU MTP attention metadata active: phase=%s", phase)
+            logged.add(phase)
+
+    def _record_flash_attn_speculative_batch(self, forward_batch):
+        # EagerRunner.load_batch always makes a dataclasses.replace FB view,
+        # including with SGLANG_EAGER_INPUT_NO_COPY. Registry slots can acquire
+        # new backing tensors, while the non-slot SpecInput stays the same.
+        # Preserve values instead of FB identity or tensor storage addresses.
+        batch_size = forward_batch.batch_size
+        self._flash_attn_speculative_batch_contract = (
+            forward_batch.spec_info,
+            forward_batch.forward_mode,
+            batch_size,
+            forward_batch.seq_lens[:batch_size].clone(),
+            forward_batch.req_pool_indices[:batch_size].clone(),
+        )
+
+    def _get_speculative_batch_contract_error(self, forward_batch):
+        contract = getattr(self, "_flash_attn_speculative_batch_contract", None)
+        if contract is None:
+            return "speculative metadata has not been prepared"
+        spec_info, mode, batch_size, seq_lens, request_indices = contract
+        if forward_batch.spec_info is not spec_info:
+            return "speculative metadata belongs to a different speculative input"
+        if forward_batch.forward_mode != mode or forward_batch.batch_size != batch_size:
+            return "speculative mode or batch size differs from prepared metadata"
+        for field, expected in (
+            ("seq_lens", seq_lens),
+            ("req_pool_indices", request_indices),
+        ):
+            actual = getattr(forward_batch, field, None)
+            if (
+                not isinstance(actual, torch.Tensor)
+                or actual.ndim != 1
+                or actual.numel() < batch_size
+                or not torch.equal(actual[:batch_size], expected)
+            ):
+                return f"speculative {field} differs from prepared metadata"
+        return None
+
+    def _prepare_flash_attn_speculative_metadata(self, forward_batch) -> bool:
+        """Prepare eager EAGLE/MTP metadata without changing scheduler fields."""
+        spec = forward_batch.spec_info
+        if spec is None:
+            return False
+        if not getattr(self, "_flash_attn_speculative_enabled", False):
+            raise RuntimeError("HCU speculative attention requires EAGLE configuration")
+        from sglang_fl.dispatch.backends.vendor.hygon.impl.mtp_metadata import (
+            kv_indices_to_page_table,
+            validate_linear_verify_mask,
+        )
+
+        mode = forward_batch.forward_mode
+        mode_name = getattr(mode, "name", "")
+        input_type = getattr(getattr(spec, "spec_input_type", None), "name", None)
+        batch_size = forward_batch.batch_size
+        if batch_size <= 0:
+            raise RuntimeError(
+                "HCU eager MTP does not accept empty speculative batches"
+            )
+        if mode.is_decode_or_idle():
+            if input_type not in (None, "EAGLE_DRAFT"):
+                raise RuntimeError("HCU MTP decode requires EAGLE draft metadata")
+            ptr = getattr(spec, "kv_indptr", None)
+            indices = getattr(spec, "kv_indices", None)
+            if not isinstance(ptr, torch.Tensor) or not isinstance(
+                indices, torch.Tensor
+            ):
+                raise RuntimeError("HCU draft decode requires per-step KV indices")
+            if ptr.numel() != batch_size + 1:
+                raise RuntimeError(
+                    "HCU draft decode KV indptr does not match batch size"
+                )
+            table = self._get_eager_page_table(batch_size, self.max_context_len)
+            table, lengths = kv_indices_to_page_table(
+                ptr,
+                indices,
+                page_size=self._flash_attn_page_size,
+                max_pages=table.shape[1],
+                out=table,
+            )
+            # The multi-step container prepares all children before the draft
+            # loop selects out_cache_loc[i]. Validate writes at forward time.
+            self._flash_attn_speculative_decode_writes = indices[
+                ptr[1:].to(torch.long) - 1
+            ]
+            self._flash_attn_forward_page_table = table
+            self._flash_attn_forward_seq_lens = lengths
+            self._record_flash_attn_speculative_batch(forward_batch)
+            self._flash_attn_speculative_phase = "draft_decode"
+            self._log_flash_attn_speculative_phase("draft_decode")
+            return True
+
+        if mode_name == "TARGET_VERIFY":
+            if input_type not in (None, "EAGLE_VERIFY"):
+                raise RuntimeError("HCU target verify requires EAGLE verify metadata")
+            if getattr(spec, "topk", 1) != 1:
+                raise RuntimeError("HCU MTP supports topk=1 only")
+            width = int(spec.draft_token_num)
+            if width <= 0:
+                raise RuntimeError("HCU target verify requires a positive draft width")
+            prefix = forward_batch.seq_lens[:batch_size].tolist()
+            extend = [width] * batch_size
+            full = [p + width for p in prefix]
+            verify_mask = getattr(self, "_verify_mask", None)
+            validate_linear_verify_mask(
+                getattr(spec, "custom_mask", None),
+                prefix,
+                width,
+                mask_mode=getattr(verify_mask, "mode", None),
+            )
+            positions = getattr(spec, "positions", None)
+            if positions is not None:
+                expected_positions = torch.cat(
+                    [
+                        torch.arange(p, p + width, device=positions.device)
+                        for p in prefix
+                    ]
+                )
+                if not torch.equal(positions.reshape(-1), expected_positions):
+                    raise RuntimeError("HCU MTP requires consecutive chain positions")
+            phase = "target_verify"
+        elif mode_name in ("EXTEND", "DRAFT_EXTEND", "DRAFT_EXTEND_V2"):
+            if input_type not in (None, "EAGLE_DRAFT_EXTEND"):
+                raise RuntimeError(
+                    "HCU draft extend requires EAGLE draft-extend metadata"
+                )
+            prefix = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            extend = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if prefix is None or extend is None:
+                raise RuntimeError(
+                    "HCU draft extend requires scheduler prefix/extend lengths"
+                )
+            prefix, extend = list(map(int, prefix)), list(map(int, extend))
+            full = forward_batch.seq_lens[:batch_size].tolist()
+            if full != [p + n for p, n in zip(prefix, extend)]:
+                raise RuntimeError(
+                    "HCU draft extend full lengths differ from prefix + query window"
+                )
+            if mode_name == "DRAFT_EXTEND_V2":
+                width = int(spec.num_tokens_per_req)
+                if extend != [width] * batch_size:
+                    raise RuntimeError(
+                        "HCU draft extend requires the complete static draft window"
+                    )
+            phase = "draft_extend"
+        else:
+            raise RuntimeError("HCU MTP does not support this speculative forward mode")
+
+        if len(prefix) != batch_size or len(extend) != batch_size:
+            raise RuntimeError("HCU MTP sequence lengths do not match batch size")
+        if any(p < 0 or n <= 0 for p, n in zip(prefix, extend)):
+            raise RuntimeError(
+                "HCU MTP requires non-negative prefixes and positive query lengths"
+            )
+        token_map = self.req_to_token
+        if max(full) > token_map.shape[1]:
+            raise RuntimeError("HCU MTP full sequence exceeds the request token map")
+        requests = forward_batch.req_pool_indices[:batch_size].tolist()
+        if len(requests) != batch_size:
+            raise RuntimeError("HCU MTP request indices do not match batch size")
+        indices = torch.cat([token_map[r, :n] for r, n in zip(requests, full)])
+        ptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=indices.device)
+        full_device = torch.tensor(full, dtype=torch.int32, device=indices.device)
+        ptr[1:] = torch.cumsum(full_device, dim=0)
+        table = self._get_eager_page_table(batch_size, max(full))
+        table, _ = kv_indices_to_page_table(
+            ptr,
+            indices,
+            page_size=self._flash_attn_page_size,
+            max_pages=table.shape[1],
+            out=table,
+        )
+        expected_writes = torch.cat(
+            [token_map[r, p : p + n] for r, p, n in zip(requests, prefix, extend)]
+        )
+        if not torch.equal(expected_writes, forward_batch.out_cache_loc.reshape(-1)):
+            raise RuntimeError("HCU MTP writes do not match the complete query window")
+        self._flash_attn_speculative_prefill_writes = expected_writes.clone()
+        cu_q = torch.zeros_like(ptr)
+        cu_q[1:] = torch.cumsum(
+            torch.tensor(extend, dtype=torch.int32, device=indices.device), dim=0
+        )
+        self._flash_attn_prefill_cu_seqlens_q = cu_q
+        self._flash_attn_prefill_cu_seqlens_k = ptr
+        self._flash_attn_prefill_max_seq_len = max(extend)
+        self._flash_attn_prefill_max_k_seq_len = max(full)
+        self._flash_attn_prefill_page_table = table
+        self._flash_attn_prefill_uses_paged_kv = True
+        self._flash_attn_prefill_metadata_ready = True
+        self._flash_attn_speculative_prefix_lens = prefix
+        self._flash_attn_speculative_extend_lens = extend
+        self._flash_attn_speculative_full_lens = full
+        self._record_flash_attn_speculative_batch(forward_batch)
+        self._flash_attn_speculative_phase = phase
+        self._log_flash_attn_speculative_phase(phase)
+        return True
 
     def _debug_validate_flash_attn_metadata(
         self, forward_batch, page_table: torch.Tensor
@@ -648,6 +900,12 @@ class HCUAttnBackend(TritonAttnBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        # SGLang 0.5.18 DecodeInputBuffers owns int64 seq_lens. FlashAttention
+        # requires int32 and records this pointer during capture; allocate the
+        # conversion destination once rather than replacing it on replay.
+        self._flash_attn_cuda_graph_seq_lens = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
 
     def _prepare_flash_attn_cuda_graph_metadata(
         self,
@@ -655,9 +913,12 @@ class HCUAttnBackend(TritonAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> None:
-        if self._flash_attn_cuda_graph_page_table is None:
+        if (
+            self._flash_attn_cuda_graph_page_table is None
+            or self._flash_attn_cuda_graph_seq_lens is None
+        ):
             raise RuntimeError(
-                "HCU FlashAttention CUDA Graph page-table buffer was not initialized."
+                "HCU FlashAttention CUDA Graph metadata buffers were not initialized."
             )
         if bs > self._flash_attn_cuda_graph_page_table.shape[0]:
             raise RuntimeError(
@@ -671,66 +932,31 @@ class HCUAttnBackend(TritonAttnBackend):
             req_pool_indices[:bs], seq_lens[:bs], page_table
         )
         self._flash_attn_forward_page_table = page_table
-        self._flash_attn_forward_seq_lens = seq_lens[:bs]
+        graph_seq_lens = self._flash_attn_cuda_graph_seq_lens[:bs]
+        graph_seq_lens.copy_(seq_lens[:bs])
+        self._flash_attn_forward_seq_lens = graph_seq_lens
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ) -> None:
-        super().init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-        self._flash_attn_forward_page_table = None
-        self._flash_attn_forward_seq_lens = None
-        if self._should_prepare_flash_attn_metadata(forward_mode, spec_info):
-            self._prepare_flash_attn_cuda_graph_metadata(
-                bs, req_pool_indices, seq_lens
+        """Refresh address-stable HCU metadata before graph capture or replay."""
+        if not self._should_prepare_flash_attn_metadata(
+            forward_batch.forward_mode, forward_batch.spec_info
+        ):
+            raise RuntimeError(
+                "Strict HCU FlashAttention CUDA Graph supports only normal decode."
             )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ) -> None:
-        super().init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        self._prepare_flash_attn_cuda_graph_metadata(
+            forward_batch.batch_size,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
         )
-        self._flash_attn_forward_page_table = None
-        self._flash_attn_forward_seq_lens = None
-        if self._should_prepare_flash_attn_metadata(forward_mode, spec_info):
-            self._prepare_flash_attn_cuda_graph_metadata(
-                bs, req_pool_indices, seq_lens
-            )
-            if not getattr(self, "_flash_attn_cuda_graph_replay_logged", False):
-                logger.info(
-                    "HCU FlashAttention CUDA Graph replay metadata path is active"
-                )
-                self._flash_attn_cuda_graph_replay_logged = True
+        if not in_capture and not self._flash_attn_cuda_graph_replay_logged:
+            logger.info("HCU FlashAttention CUDA Graph replay metadata path is active")
+            self._flash_attn_cuda_graph_replay_logged = True
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Return the Triton-compatible padding value for graph sequence lengths."""
@@ -746,59 +972,75 @@ class HCUAttnBackend(TritonAttnBackend):
         save_kv_cache,
         sinks,
     ) -> Optional[str]:
-        if forward_batch.forward_mode != ForwardMode.EXTEND:
-            return "only ordinary EXTEND mode is supported"
-        global_forward_mode = getattr(forward_batch, "global_forward_mode", None)
-        if global_forward_mode not in (None, ForwardMode.EXTEND):
-            return "the global forward mode is not ordinary EXTEND"
-        if is_in_piecewise_cuda_graph():
+        if is_in_tc_piecewise_cuda_graph():
             return "piecewise CUDA Graph prefill has not been validated"
         if is_in_breakable_cuda_graph():
             return "breakable CUDA Graph prefill has not been validated"
-        if forward_batch.spec_info is not None:
-            return "speculative prefill is not supported"
         if getattr(forward_batch, "attn_cp_metadata", None) is not None:
             return "context-parallel prefill is not supported"
-        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-        if prefix_lens is None:
-            return "CPU prefix lengths are unavailable"
-        if len(prefix_lens) != forward_batch.batch_size:
-            return "prefix lengths do not match the batch size"
-        if any(int(prefix_len) < 0 for prefix_len in prefix_lens):
-            return "negative prefix lengths are not supported"
-        uses_paged_kv = any(int(prefix_len) > 0 for prefix_len in prefix_lens)
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is None:
-            return "CPU extend lengths are unavailable"
-        if len(extend_lens) != forward_batch.batch_size:
-            return "extend lengths do not match the batch size"
-        if any(int(extend_len) <= 0 for extend_len in extend_lens):
-            return "non-positive extend lengths are not supported"
-        extend_lens_device = getattr(forward_batch, "extend_seq_lens", None)
-        if not isinstance(extend_lens_device, torch.Tensor):
-            return "device extend lengths are unavailable"
-        if extend_lens_device.numel() < forward_batch.batch_size:
-            return "device extend lengths are smaller than the batch size"
-        seq_lens = getattr(forward_batch, "seq_lens", None)
-        if not isinstance(seq_lens, torch.Tensor):
-            return "full device sequence lengths are unavailable"
-        if seq_lens.numel() < forward_batch.batch_size:
-            return "full device sequence lengths are smaller than the batch size"
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        if not isinstance(seq_lens_cpu, torch.Tensor):
-            return "full CPU sequence lengths are unavailable"
-        if seq_lens_cpu.numel() < forward_batch.batch_size:
-            return "full CPU sequence lengths are smaller than the batch size"
-        expected_full_lens = [
-            int(prefix_len) + int(extend_len)
-            for prefix_len, extend_len in zip(prefix_lens, extend_lens)
-        ]
-        actual_full_lens = [
-            int(length)
-            for length in seq_lens_cpu[: forward_batch.batch_size].tolist()
-        ]
-        if actual_full_lens != expected_full_lens:
-            return "full sequence lengths do not match prefix plus extend lengths"
+        speculative_phase = getattr(self, "_flash_attn_speculative_phase", None)
+        if speculative_phase in ("target_verify", "draft_extend"):
+            contract_error = self._get_speculative_batch_contract_error(forward_batch)
+            if contract_error is not None:
+                return contract_error
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            if not isinstance(out_cache_loc, torch.Tensor) or not torch.equal(
+                self._flash_attn_speculative_prefill_writes,
+                out_cache_loc.reshape(-1),
+            ):
+                return "speculative prefill writes differ from prepared metadata"
+            prefix_lens = self._flash_attn_speculative_prefix_lens
+            extend_lens = self._flash_attn_speculative_extend_lens
+            expected_full_lens = self._flash_attn_speculative_full_lens
+            uses_paged_kv = True
+        else:
+            if forward_batch.forward_mode != ForwardMode.EXTEND:
+                return "only ordinary EXTEND mode is supported"
+            global_forward_mode = getattr(forward_batch, "global_forward_mode", None)
+            if global_forward_mode not in (None, ForwardMode.EXTEND):
+                return "the global forward mode is not ordinary EXTEND"
+            if forward_batch.spec_info is not None:
+                return "speculative prefill is not supported"
+            prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            if prefix_lens is None:
+                return "CPU prefix lengths are unavailable"
+            if len(prefix_lens) != forward_batch.batch_size:
+                return "prefix lengths do not match the batch size"
+            if any(int(prefix_len) < 0 for prefix_len in prefix_lens):
+                return "negative prefix lengths are not supported"
+            uses_paged_kv = any(int(prefix_len) > 0 for prefix_len in prefix_lens)
+            extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if extend_lens is None:
+                return "CPU extend lengths are unavailable"
+            if len(extend_lens) != forward_batch.batch_size:
+                return "extend lengths do not match the batch size"
+            if any(int(extend_len) <= 0 for extend_len in extend_lens):
+                return "non-positive extend lengths are not supported"
+            extend_lens_device = getattr(forward_batch, "extend_seq_lens", None)
+            if not isinstance(extend_lens_device, torch.Tensor):
+                return "device extend lengths are unavailable"
+            if extend_lens_device.numel() < forward_batch.batch_size:
+                return "device extend lengths are smaller than the batch size"
+            seq_lens = getattr(forward_batch, "seq_lens", None)
+            if not isinstance(seq_lens, torch.Tensor):
+                return "full device sequence lengths are unavailable"
+            if seq_lens.numel() < forward_batch.batch_size:
+                return "full device sequence lengths are smaller than the batch size"
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if not isinstance(seq_lens_cpu, torch.Tensor):
+                return "full CPU sequence lengths are unavailable"
+            if seq_lens_cpu.numel() < forward_batch.batch_size:
+                return "full CPU sequence lengths are smaller than the batch size"
+            expected_full_lens = [
+                int(prefix_len) + int(extend_len)
+                for prefix_len, extend_len in zip(prefix_lens, extend_lens)
+            ]
+            actual_full_lens = [
+                int(length)
+                for length in seq_lens_cpu[: forward_batch.batch_size].tolist()
+            ]
+            if actual_full_lens != expected_full_lens:
+                return "full sequence lengths do not match prefix plus extend lengths"
         if uses_paged_kv:
             if self._flash_attn_page_size not in _FLASH_ATTN_SUPPORTED_PAGE_SIZES:
                 return (
@@ -904,7 +1146,6 @@ class HCUAttnBackend(TritonAttnBackend):
                 return page_table_reason
             cache_layout_reason = self._get_paged_prefill_cache_layout_reason(
                 layer,
-                forward_batch,
                 q,
             )
             if cache_layout_reason is not None:
@@ -923,9 +1164,7 @@ class HCUAttnBackend(TritonAttnBackend):
             return "cached-prefix prefill requires a two-dimensional int32 page table"
         if page_table.shape[0] != forward_batch.batch_size:
             return "cached-prefix prefill page-table rows do not match the batch"
-        max_seq_len_k = getattr(
-            self, "_flash_attn_prefill_max_k_seq_len", None
-        )
+        max_seq_len_k = getattr(self, "_flash_attn_prefill_max_k_seq_len", None)
         if max_seq_len_k is None or int(max_seq_len_k) <= 0:
             return "cached-prefix prefill maximum K sequence length is unavailable"
         required_columns = (
@@ -942,10 +1181,9 @@ class HCUAttnBackend(TritonAttnBackend):
     def _get_paged_prefill_cache_layout_reason(
         self,
         layer,
-        forward_batch,
         q: torch.Tensor,
     ) -> Optional[str]:
-        token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        token_to_kv_pool = self.token_to_kv_pool
         if token_to_kv_pool is None:
             return "the token-to-KV pool is unavailable"
         try:
@@ -996,8 +1234,14 @@ class HCUAttnBackend(TritonAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         sinks: Optional[torch.Tensor] = None,
+        score_mod=None,
+        aux_tensors=None,
     ) -> torch.Tensor:
         """Run ordinary prefill/extend with strict Hygon FlashAttention."""
+        if score_mod is not None or aux_tensors is not None:
+            raise RuntimeError(
+                "Strict HCU FlashAttention does not support score_mod or aux_tensors."
+            )
         error_reason = self._get_prefill_error_reason(
             q,
             k,
@@ -1043,9 +1287,7 @@ class HCUAttnBackend(TritonAttnBackend):
         k_view = None
         v_view = None
         if uses_paged_kv:
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             k_view = k_cache.view(
                 -1,
                 self._flash_attn_page_size,
@@ -1060,7 +1302,7 @@ class HCUAttnBackend(TritonAttnBackend):
             )
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer,
                 forward_batch.out_cache_loc,
                 k,
@@ -1068,9 +1310,7 @@ class HCUAttnBackend(TritonAttnBackend):
             )
 
         num_tokens = q.shape[0]
-        q_view = q.contiguous().view(
-            num_tokens, layer.tp_q_head_num, layer.qk_head_dim
-        )
+        q_view = q.contiguous().view(num_tokens, layer.tp_q_head_num, layer.qk_head_dim)
         if uses_paged_kv:
             assert k_view is not None and v_view is not None
             if not getattr(self, "_flash_attn_prefill_paged_logged", False):
@@ -1148,8 +1388,22 @@ class HCUAttnBackend(TritonAttnBackend):
             return "K and V are required when saving the KV cache"
         if not forward_batch.forward_mode.is_decode_or_idle():
             return "the forward mode is not normal decode"
-        if forward_batch.spec_info is not None:
-            return "speculative decoding is not supported"
+        speculative_phase = getattr(self, "_flash_attn_speculative_phase", None)
+        if forward_batch.spec_info is not None or speculative_phase == "draft_decode":
+            if speculative_phase != "draft_decode":
+                return "speculative decode metadata has not been prepared"
+            contract_error = self._get_speculative_batch_contract_error(forward_batch)
+            if contract_error is not None:
+                return contract_error
+        if speculative_phase == "draft_decode":
+            if not save_kv_cache:
+                return "HCU draft decode requires saving the current KV token"
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            if out_cache_loc is None or not torch.equal(
+                self._flash_attn_speculative_decode_writes,
+                out_cache_loc.reshape(-1),
+            ):
+                return "HCU draft decode writes do not match per-step KV tails"
         if getattr(layer, "is_cross_attention", False):
             return "cross attention is not supported"
         if getattr(layer, "attn_type", AttentionType.DECODER) != AttentionType.DECODER:
@@ -1198,8 +1452,14 @@ class HCUAttnBackend(TritonAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         sinks: Optional[torch.Tensor] = None,
+        score_mod=None,
+        aux_tensors=None,
     ) -> torch.Tensor:
         """Run single-token decode with strict paged Hygon FlashAttention."""
+        if score_mod is not None or aux_tensors is not None:
+            raise RuntimeError(
+                "Strict HCU FlashAttention does not support score_mod or aux_tensors."
+            )
         error_reason = self._get_runtime_error_reason(
             q, k, v, layer, forward_batch, save_kv_cache, sinks
         )
@@ -1223,16 +1483,14 @@ class HCUAttnBackend(TritonAttnBackend):
             )
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer,
                 forward_batch.out_cache_loc,
                 k,
                 v,
             )
 
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-            layer.layer_id
-        )
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         if (
             k_cache.shape[0] % self._flash_attn_page_size != 0
             or v_cache.shape[0] % self._flash_attn_page_size != 0
@@ -1282,3 +1540,63 @@ class HCUAttnBackend(TritonAttnBackend):
             num_splits=1,
         )
         return output.reshape(batch_size, -1)
+
+
+class HCUMultiStepDraftBackend:
+    """Reuse upstream draft address generation with HCU-only attention children.
+
+    The delegated methods construct metadata only. They never instantiate or
+    execute TritonAttnBackend children or its attention kernels.
+    """
+
+    needs_cpu_seq_lens = False
+
+    def __init__(self, model_runner, topk, speculative_num_steps):
+        from sglang.srt.layers.attention.triton_backend import (
+            TritonMultiStepDraftBackend,
+        )
+
+        if topk != 1 or speculative_num_steps < 2:
+            raise RuntimeError(
+                "HCU multi-step MTP requires topk=1 and at least two steps"
+            )
+        self._metadata_backend = TritonMultiStepDraftBackend
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.device = model_runner.device
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.pool_len = self.req_to_token_pool.req_to_token.shape[1]
+        self.page_size = model_runner.server_args.page_size
+        self.kv_indptr = torch.zeros(
+            (speculative_num_steps, self.req_to_token_pool.size + 1),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.attn_backends = [
+            HCUAttnBackend(
+                model_runner, skip_prefill=True, kv_indptr_buf=self.kv_indptr[i]
+            )
+            for i in range(speculative_num_steps - 1)
+        ]
+        self.max_context_len = self.attn_backends[0].max_context_len
+        self.num_head = self.attn_backends[0].num_head
+
+    def common_template(self, forward_batch, kv_indices_buffer, call_fn):
+        return self._metadata_backend.common_template(
+            self, forward_batch, kv_indices_buffer, call_fn
+        )
+
+    def init_forward_metadata(self, forward_batch):
+        return self._metadata_backend.init_forward_metadata(self, forward_batch)
+
+    def init_cuda_graph_state(self, *args, **kwargs):
+        raise RuntimeError("HCU multi-step MTP CUDA Graph is not supported")
+
+    def init_forward_metadata_out_graph(self, *args, **kwargs):
+        raise RuntimeError("HCU multi-step MTP CUDA Graph is not supported")
+
+    def init_forward_metadata_in_graph(self, *args, **kwargs):
+        raise RuntimeError("HCU multi-step MTP CUDA Graph is not supported")
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
