@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native control-protocol selection is generic and leaves legacy PD intact."""
 
+import concurrent.futures
 import importlib.util
 import os
 import sys
+import threading
 import types
 import unittest
 from enum import Enum
@@ -102,9 +104,9 @@ class NativePDTests(unittest.TestCase):
                 return engine.result
 
         self.transfer_engine = TransferEngine
-        self.module("sglang_fl.disaggregation.transfer_engine").FlagCXTransferEngine = (
-            TransferEngine
-        )
+        self.module(
+            "sglang_fl.disaggregation.transfer_engine"
+        ).FlagCXTransferEngine = TransferEngine
 
         class Counter:
             def __init__(counter, *args, **kwargs):
@@ -118,6 +120,10 @@ class NativePDTests(unittest.TestCase):
 
         self.module("prometheus_client").Counter = Counter
         self.load(
+            "sglang_fl.disaggregation.peer_queues",
+            "sglang_fl/disaggregation/peer_queues.py",
+        )
+        self.load(
             "sglang_fl.disaggregation.rolling", "sglang_fl/disaggregation/rolling.py"
         )
         self.native = self.load(
@@ -126,6 +132,153 @@ class NativePDTests(unittest.TestCase):
         self.bridge = self.load(
             "sglang_fl.disaggregation.patch", "sglang_fl/disaggregation/patch.py"
         )
+
+    def queue_modules(self):
+        poll = self.module("sglang.srt.disaggregation.base.conn")
+        poll.KVPoll = types.SimpleNamespace(Failed="failed")
+        common = self.module("sglang.srt.disaggregation.common.utils")
+
+        class Chunk:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        common.TransferKVChunk = Chunk
+        self.utils.DisaggregationMode = types.SimpleNamespace(PREFILL="prefill")
+        trace = self.module("sglang.srt.observability.trace")
+        trace.TraceNullContext = type("TraceNullContext", (), {})
+        return poll.KVPoll, Chunk, trace.TraceNullContext
+
+    def test_balanced_transfer_requires_native_behavior_not_just_signature(self):
+        poll, chunk, null_trace = self.queue_modules()
+
+        def native(
+            self,
+            bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            aux_index=None,
+            state_indices=None,
+            num_kv_tokens=None,
+            trace_ctx=None,
+        ):
+            assert self.disaggregation_mode == "prefill"
+            assert not is_last_chunk or aux_index is not None
+            if (
+                bootstrap_room not in self.request_status
+                or self.check_status(bootstrap_room) == poll.Failed
+            ):
+                return
+            if bootstrap_room not in self.transfer_infos:
+                return
+            queue = sum(
+                int(s.rsplit(":", 1)[1]) for s in self.transfer_infos[bootstrap_room]
+            ) % len(self.transfer_queues)
+            self.transfer_queues[queue].put(
+                chunk(
+                    room=bootstrap_room,
+                    prefill_kv_indices=kv_indices,
+                    index_slice=index_slice,
+                    is_last_chunk=is_last_chunk,
+                    prefill_aux_index=aux_index,
+                    state_indices=state_indices,
+                    num_kv_tokens=num_kv_tokens,
+                    trace_ctx=null_trace() if trace_ctx is None else trace_ctx,
+                )
+            )
+
+        self.native_base.MooncakeKVManager.add_transfer_request = native
+        self.assertTrue(self.native._supports_balanced_transfer())
+        self.assertIs(
+            self.native.class_mapping(self.utils.KVClassType.MANAGER),
+            self.native._BalancedFlagcxNativeKVManager,
+        )
+
+        def incompatible(
+            self,
+            bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            aux_index=None,
+            state_indices=None,
+            num_kv_tokens=None,
+            trace_ctx=None,
+        ):
+            return None
+
+        self.native_base.MooncakeKVManager.add_transfer_request = incompatible
+        self.assertFalse(self.native._supports_balanced_transfer())
+        self.assertIs(
+            self.native.class_mapping(self.utils.KVClassType.MANAGER),
+            self.native.FlagcxNativeKVManager,
+        )
+
+    def test_balanced_transfer_preserves_payload_and_guards(self):
+        poll, _, null_trace = self.queue_modules()
+        manager = self.native._BalancedFlagcxNativeKVManager()
+        manager.disaggregation_mode = "prefill"
+        manager.request_status = {1: "ok", 2: poll.Failed, 3: "ok"}
+        manager.check_status = lambda room: manager.request_status[room]
+        manager.transfer_infos = {
+            1: {"peer:50001": object()},
+            2: {"peer:50003": object()},
+        }
+        queue = []
+        manager.transfer_queues = [types.SimpleNamespace(put=queue.append)]
+        trace, indices, state = object(), object(), object()
+        manager.add_transfer_request(1, indices, slice(2, 4), True, 9, state, 12, trace)
+        self.assertEqual(len(queue), 1)
+        result = queue[0]
+        self.assertIs(result.prefill_kv_indices, indices)
+        self.assertEqual(result.index_slice, slice(2, 4))
+        self.assertEqual(
+            (result.room, result.is_last_chunk, result.prefill_aux_index), (1, True, 9)
+        )
+        self.assertIs(result.state_indices, state)
+        self.assertEqual(result.num_kv_tokens, 12)
+        self.assertIs(result.trace_ctx, trace)
+        manager.add_transfer_request(1, indices, slice(0, 1), False)
+        self.assertIsInstance(queue[1].trace_ctx, null_trace)
+        manager.add_transfer_request(2, indices, slice(0, 1), False)
+        manager.add_transfer_request(3, indices, slice(0, 1), False)
+        manager.add_transfer_request(99, indices, slice(0, 1), False)
+        self.assertEqual(len(queue), 2)
+        with self.assertRaises(AssertionError):
+            manager.add_transfer_request(1, indices, slice(0, 1), True)
+
+    def test_concurrent_first_use_keeps_peer_groups_stable(self):
+        self.queue_modules()
+        manager = self.native._BalancedFlagcxNativeKVManager()
+        manager.disaggregation_mode = "prefill"
+        manager.request_status = {n: "ok" for n in range(8)}
+        manager.check_status = lambda room: "ok"
+        manager.transfer_infos = {
+            n: {f"peer:{50001 + 2 * n}": object()} for n in range(8)
+        }
+        items = [[] for _ in range(4)]
+        lock = threading.Lock()
+
+        def put(which, chunk):
+            with lock:
+                items[which].append(chunk.room)
+
+        manager.transfer_queues = [
+            types.SimpleNamespace(put=lambda item, n=n: put(n, item)) for n in range(4)
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            list(
+                pool.map(
+                    lambda n: manager.add_transfer_request(
+                        n % 8, None, slice(0, 1), False
+                    ),
+                    range(800),
+                )
+            )
+        self.assertEqual(sum(map(len, items)), 800)
+        self.assertEqual(sorted(map(len, items)), [200] * 4)
+        for n in range(8):
+            self.assertEqual(sum(n in q for q in items), 1)
 
     def test_spawn_entry_registers_before_native_http_worker(self):
         events = []
