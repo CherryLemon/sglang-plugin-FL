@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Register model-specific hooks before worker initialization and Graph capture."""
 
+import os
 from types import FunctionType
 
 _registered = False
@@ -74,6 +75,20 @@ def _draft_forward(original, *args, **kwargs):
         return original(*args, **kwargs)
 
 
+def _register_indexer_hooks(registry, hook_type, producer, compact):
+    from sglang_fl import _build_config, _get_oot_filters, _oot_enabled_for, _parse_bool
+
+    if _parse_bool(os.environ.get("SGLANG_FL_OOT_ENABLED", "1"), default=True):
+        _, whitelist, blacklist = _get_oot_filters(_build_config())
+        backend = "sglang.srt.layers.attention.deepseek_v4_backend"
+        for op_name, target, hook in (
+            ("dsv41_indexer_producer", "fp4_index_logits_req_to_token", producer),
+            ("dsv41_indexer_compact", "fp4_index_logits_candidate_blocks", compact),
+        ):
+            if _oot_enabled_for(op_name, whitelist, blacklist):
+                registry.register(f"{backend}.{target}", hook, hook_type.AROUND)
+
+
 def apply_dsv41_patches():
     global _registered
     if _registered:
@@ -82,8 +97,9 @@ def apply_dsv41_patches():
 
     from sglang_fl.disaggregation.patch import apply_disaggregation_patch
 
-    from .prefill import candidate_block_ids, candidate_blocks, extend_indexer
+    from .indexer import compact, producer
     from .pd import install_native_layout_hooks
+    from .prefill import candidate_block_ids, candidate_blocks, extend_indexer
 
     apply_disaggregation_patch()
     install_native_layout_hooks()
@@ -97,6 +113,7 @@ def apply_dsv41_patches():
         _draft_forward,
         HookType.AROUND,
     )
+    _register_indexer_hooks(HookRegistry, HookType, producer, compact)
     indexer = "sglang.srt.layers.attention.dsv4.indexer"
     HookRegistry.register(
         f"{indexer}.select_candidate_blocks", candidate_blocks, HookType.REPLACE

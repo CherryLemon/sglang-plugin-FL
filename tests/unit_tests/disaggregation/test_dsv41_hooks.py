@@ -41,6 +41,9 @@ class ModelHookTests(unittest.TestCase):
         prefill = types.ModuleType("isolated_dsv41_hooks.prefill")
         for name in ("candidate_block_ids", "candidate_blocks", "extend_indexer"):
             setattr(prefill, name, lambda *args: None)
+        indexer = types.ModuleType("isolated_dsv41_hooks.indexer")
+        indexer.producer = lambda *args: None
+        indexer.compact = lambda *args: None
         layout = types.ModuleType("isolated_dsv41_hooks.pd")
         layout.install_native_layout_hooks = unittest.mock.Mock()
         with patch.dict(
@@ -51,16 +54,34 @@ class ModelHookTests(unittest.TestCase):
                 ),
                 "sglang_fl.disaggregation.patch": native,
                 "isolated_dsv41_hooks.prefill": prefill,
+                "isolated_dsv41_hooks.indexer": indexer,
                 "isolated_dsv41_hooks.pd": layout,
             },
         ):
             self.module.apply_dsv41_patches()
             self.module.apply_dsv41_patches()
-        self.assertEqual(registry.register.call_count, 5)
+        self.assertEqual(registry.register.call_count, 7)
         self.assertEqual(registry.register.call_args_list[0].args[2], kinds.AROUND)
         native.apply_disaggregation_patch.assert_called_once_with()
         targets = [call.args[0] for call in registry.register.call_args_list]
         self.assertTrue(all(target.startswith("sglang.srt.") for target in targets))
+
+    def test_indexer_respects_oot_disable_and_filters(self):
+        registry = types.SimpleNamespace(register=unittest.mock.Mock())
+        kinds = types.SimpleNamespace(AROUND="around")
+        hook = lambda *args: None
+        config = {"oot_whitelist": [], "oot_blacklist": []}
+        with patch("sglang_fl._build_config", return_value=config):
+            with patch.dict("os.environ", {"SGLANG_FL_OOT_ENABLED": "0"}):
+                self.module._register_indexer_hooks(registry, kinds, hook, hook)
+            registry.register.assert_not_called()
+            with patch.dict("os.environ", {"SGLANG_FL_OOT_ENABLED": "1"}):
+                config["oot_whitelist"] = ["dsv41_indexer_compact"]
+                self.module._register_indexer_hooks(registry, kinds, hook, hook)
+        self.assertEqual(registry.register.call_count, 1)
+        self.assertTrue(
+            registry.register.call_args.args[0].endswith("candidate_blocks")
+        )
 
     def test_draft_stats_are_isolated_and_target_stats_restore(self):
         from contextlib import contextmanager
