@@ -29,7 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["sglang==0.5.18"]
 dsv41 = [
-    "flaggems_sglang[dsv41] @ git+https://github.com/CherryLemon/FlagGems-sglang.git@254d380b67a77c262f00b369fb283c501d5ef4af",
+    "flaggems_sglang[dsv41] @ git+https://github.com/CherryLemon/FlagGems-sglang.git@56aa24f9cb22dae126565af1b6c879516418d828",
 ]
 
 [project.entry-points."sglang.srt.platforms"]
